@@ -16,9 +16,12 @@ fired during recon):
   5. Poll until the clip renders (vision), then export/download the vid as mp4.
 
 Quota gate: when the monthly pool is spent, Vids shows a limit message → Wall("rate_limit")
-so the runner cools it (ideally until the 1st; see learn.py note in memory). EXPORT/DOWNLOAD
-path (File -> Download) is NOT yet mapped against a finished render — same posture as
-TensorArt: submit proven, download pending the first finished gen.
+so the runner cools it (ideally until the 1st; see learn.py note in memory).
+
+DOWNLOAD (fixed 2026-09-26): the finished Veo clip is served from *.usercontent.google.com
+(?...&filename=video.mp4) — 720x1280 9:16 h264 WITH audio. We capture that URL off the wire
+(like Krea/Leonardo) and fetch it directly. This replaced the old File->Download->MP4 project
+export, which renders the whole vid server-side (1080x1920) but flaked on the download event.
 """
 
 import os
@@ -39,11 +42,25 @@ class GoogleVids(SiteAdapter):
     # text-based selectors so they survive class-name churn; CONFIRMED live 2026-09-23.
     prompt_sel = "textarea, [contenteditable='true']"     # AI-clip panel prompt box (1 match)
     generate_sel = "[aria-label='Generate' i]"            # send arrow; disabled until prompt non-empty
-    download_sel = ("[aria-label*='download' i], a[download], "
-                    "button:has-text('Download')")        # NOT yet confirmed — export flow pending
 
     _QUOTA = re.compile(r"(reached|out of|no more|limit).{0,40}"
                         r"(credit|generation|clip|quota|limit)", re.I)
+
+    # ---- passive capture of the rendered clip URL (gstatic.com/docs/... are promo decoys) ----
+    def _watch(self, session):
+        if getattr(self, "_watching", False):
+            return
+        self._mp4 = []
+
+        def note(u):
+            u = (u or "").split("#")[0]
+            if "usercontent.google.com" in u and ("video.mp4" in u or "/download?" in u):
+                self._mp4.append(u)
+
+        session.page.on("response", lambda r: note(r.url))
+        session.page.on("request", lambda q: note(q.url))
+        self._watching = True
+
 
     @staticmethod
     def _click_text(session, *texts, timeout=6000):
@@ -71,6 +88,7 @@ class GoogleVids(SiteAdapter):
             return False
 
     def submit(self, session, prompt: str):
+        self._watch(session)
         session.goto(self.home)
         time.sleep(6)
         self._guard(session)                     # vision: bail on login/captcha wall
@@ -132,52 +150,29 @@ class GoogleVids(SiteAdapter):
             pass
         return "rendering"                      # keep looping (runner bounds via POLL_TIMEOUT)
 
-    @staticmethod
-    def _menu_box(pg, pat):
-        """Center xy of the visible [role=menuitem] whose text matches `pat` (compiled).
-        Google nested menus are flaky under locator hover; we locate by live box + click."""
-        for o in pg.evaluate("""() => [...document.querySelectorAll('[role=menuitem]')].map(e=>{
-                const r=e.getBoundingClientRect();
-                return {t:(e.innerText||'').replace(/\\s+/g,' ').trim(),
-                        x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2), vis:r.width>0&&r.height>0};
-              }).filter(o=>o.t && o.vis)"""):
-            if pat.search(o["t"]):
-                return o["x"], o["y"]
-        return None
-
-    def download(self, session, dest: str, timeout: float = 300.0) -> str:
-        """CONFIRMED live: 1) Insert the finished clip into the scene, 2) File -> Download ►
-        -> 'MP4 video (.mp4)'. The whole-vid export IS the single 9:16 clip (1080x1920 h264).
-        Clicking the Download PARENT (not hover) opens the submenu reliably in headless."""
+    def download(self, session, dest: str) -> str:
+        """Fetch the finished Veo clip straight off the wire (720x1280 9:16 h264+audio),
+        the URL passively captured by _watch during the render. Robust vs. the old
+        File->Download->MP4 project export (which flaked on the download event)."""
         pg = session.page
-        # 1) add the rendered clip to the scene
-        try:
-            ins = pg.get_by_role("button", name="Insert", exact=True).first
-            if ins.count() and ins.is_visible():
-                ins.click(timeout=5000); time.sleep(5)
-        except Exception:
-            pass
-        pg.keyboard.press("Escape"); time.sleep(0.5)          # drop any promo popup
-        # 2) File menu -> Download submenu -> MP4
-        pg.get_by_text(re.compile(r"^File$")).first.click(timeout=6000); time.sleep(1.2)
-        dl = self._menu_box(pg, re.compile(r"^Download\b(?!.*\bas\b)", re.I))   # 'Download ►'
-        if not dl:
-            raise Wall("selector", "Vids File->Download item not found — confirm live UI")
-        pg.mouse.click(*dl); time.sleep(1.8)                  # open submenu
-        mp4 = self._menu_box(pg, re.compile(r"MP4", re.I))
-        if not mp4:
-            raise Wall("selector", "Vids 'MP4 video (.mp4)' export item not found")
-        dls = []
-        pg.on("download", lambda d: dls.append(d))
-        pg.mouse.click(*mp4)
-        deadline = time.time() + timeout
-        while time.time() < deadline and not dls:
-            time.sleep(1)
-        if not dls:
-            raise Wall("block", "Vids MP4 export did not deliver a download in time")
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        dls[0].save_as(dest)
+        url = next(iter(reversed(getattr(self, "_mp4", []))), None)
+        if not url:                              # fallback: the result-panel <video> src
+            vids = pg.evaluate("""() => {const o=[];document.querySelectorAll('video').forEach(v=>{
+              if(v.currentSrc)o.push(v.currentSrc);if(v.src)o.push(v.src);});return o;}""")
+            url = next((v for v in vids if "usercontent.google.com" in v), None)
+        if not url:
+            raise Wall("selector", "no finished Vids clip URL on the wire — confirm live UI")
+        resp = pg.request.get(url)               # runs in-context, carries session cookies
+        if resp.status != 200:
+            raise Wall("block", f"Vids clip download HTTP {resp.status}")
+        body = resp.body()
+        if len(body) < 100_000:
+            raise Wall("block", f"Vids clip only {len(body)}B — not a real render")
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(body)
         return dest
 
 
 ADAPTER = GoogleVids()
+
