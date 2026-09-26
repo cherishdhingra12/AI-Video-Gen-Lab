@@ -33,6 +33,8 @@ class GoogleVids(SiteAdapter):
     home = "https://vids.google.com/"
     credit_cost = 1                          # 1 AI-clip gen; ~50/month
     aspect = "9:16"
+    needs_cookie_refresh = True              # Google session cookies rotate fast — re-import
+    cookie_keywords = ["google"]             # each run (same class as Flow; expired -> account chooser)
 
     # text-based selectors so they survive class-name churn; CONFIRMED live 2026-09-23.
     prompt_sel = "textarea, [contenteditable='true']"     # AI-clip panel prompt box (1 match)

@@ -5,7 +5,8 @@ STATUS 2026-09-23 — the old "9:16 unsettable / 578cu" verdict was WRONG (it wa
 MiniMax H3 with the aspect Radix popover that wouldn't open headless). Re-probed with the
 **LTX-2** model the user asked for:
   - free workspace balance = ~100 credits/DAY (account menu reads "N Credits remaining";
-    daily reset). LTX-2 costs **34** ⇒ ~2 clips/day.
+    daily reset). LTX-2 19B costs **35** ⇒ ~2 clips/day.  (2026-09-26: card relabeled
+    "LTX-2" → "LTX-2 19B", cost 34 → 35.)
   - LTX-2 is free-accessible (LTX-2.5 Pro is Pro-gated; MiniMax H3=578, others >100/day).
   - 9:16 IS settable: the aspect control is an ICON (not a "16:9" text pill). Click it →
     "Aspect Ratio" menu with Landscape / Portrait tiles. Picking Portrait flips the composer
@@ -32,7 +33,7 @@ _DECOY = ("/preset", "showcase", "tutorial", "onboarding", "/sample", "example",
 class Krea(SiteAdapter):
     name = "krea"
     home = "https://www.krea.ai/video"
-    credit_cost = 34          # LTX-2; free daily bucket ~100 ⇒ ~2 gens/day
+    credit_cost = 35          # LTX-2 19B; free daily bucket ~100 ⇒ ~2 gens/day
     aspect = "9:16"
     daily_cap = 100           # free credits/day (daily reset)
 
@@ -82,27 +83,37 @@ class Krea(SiteAdapter):
             return r.y>490&&r.y<540&&r.x>1080&&r.x<1175&&/^[\\d ]{1,6}$/.test(t);});
           return el?parseInt(el.innerText.replace(/\\s+/g,''),10):null;}""")
 
-    # ---- select LTX-2 via the model modal ----
+    # ---- select LTX-2 19B via the model modal ----
     def _pick_ltx2(self, session):
         pg = session.page
-        pg.mouse.click(395, 558); time.sleep(1.8)            # open model modal
-        pg.mouse.click(975, 150); time.sleep(0.5)            # search box
-        pg.keyboard.type("LTX-2", delay=35); time.sleep(1.8)
-        pg.mouse.wheel(0, 250); time.sleep(0.8)              # bring card fully on-screen
+        # 2026-09-26: the model chip moved from the composer (~395,558) to the TOP header.
+        # Locate it by text (a 'Model <name>' control near the top) instead of fixed coords.
+        chip = pg.evaluate("""() => {const c=[...document.querySelectorAll('button,[role=button],div,span')]
+          .map(e=>{const t=(e.innerText||'').replace(/\\s+/g,' ').trim();const r=e.getBoundingClientRect();return {e,t,r};})
+          .filter(o=>o.r.y<80&&o.r.x<700&&o.r.width>60&&o.r.width<320&&o.r.height>14&&o.r.height<44
+                     &&/(MiniMax|LTX|Wan|Veo|Hailuo|Kling|Seedance|Turbo|Fast|Pro|\\dB)/i.test(o.t))
+          .sort((a,b)=>b.r.width-a.r.width)[0];
+          if(!c)return null;const r=c.e.getBoundingClientRect();
+          return{x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};}""")
+        if not chip:
+            raise Wall("selector", "model chip not found in top header — confirm live UI")
+        pg.mouse.click(chip["x"], chip["y"]); time.sleep(1.8)   # open model modal
+        # the modal lists every model; find the LTX-2 19B card directly (no blind search box).
         loc = pg.evaluate("""() => {const el=[...document.querySelectorAll('*')]
           .filter(e=>{const t=(e.innerText||'').replace(/\\s+/g,' ').trim();const r=e.getBoundingClientRect();
-            return t==='LTX-2'&&r.width>40&&r.width<400&&r.height>12&&r.height<70;})
+            return t==='LTX-2 19B'&&r.width>40&&r.width<420&&r.height>12&&r.height<70;})
           .sort((a,b)=>a.getBoundingClientRect().width-b.getBoundingClientRect().width)[0];
-          if(!el)return null;const r=el.getBoundingClientRect();
+          if(!el)return null;el.scrollIntoView({block:'center'});const r=el.getBoundingClientRect();
           return{x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};}""")
         if not loc:
-            raise Wall("selector", "LTX-2 card not found in model modal")
-        pg.mouse.click(loc["x"], max(loc["y"] - 110, 120)); time.sleep(2.5)   # click card body
+            raise Wall("selector", "LTX-2 19B card not found in model modal")
+        time.sleep(0.6)
+        pg.mouse.click(loc["x"], loc["y"]); time.sleep(2.5)   # click the card
         hdr = pg.evaluate("""() => {const b=[...document.querySelectorAll('*')]
-          .find(e=>/^Model\\s+LTX-2/i.test((e.innerText||'').replace(/\\s+/g,' ').trim()));
+          .find(e=>/^Model\\s+LTX-2 19B/i.test((e.innerText||'').replace(/\\s+/g,' ').trim()));
           return !!b;}""")
         if not hdr:
-            raise Wall("selector", "LTX-2 not selected (no 'Model LTX-2' header)")
+            raise Wall("selector", "LTX-2 19B not selected (no 'Model LTX-2 19B' header)")
 
     # ---- set 9:16 via the aspect icon; POSITIVE gate = composer icon rect flips to h>w ----
     def _set_portrait(self, session):
