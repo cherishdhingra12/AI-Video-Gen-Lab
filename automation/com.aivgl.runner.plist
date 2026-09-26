@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent: resume the render loop automatically.
+
+  It runs runner.py at login/wake and then every 5 minutes while there is queued
+  or mid-flight work. runner.loop() resumes anything a shutdown interrupted, drains
+  the queue, backs off cooling sites, and exits when nothing is left to do — so the
+  5-min RunAtLoad+StartInterval combo means "keep the fleet moving whenever the Mac
+  is on", which is exactly the always-on-but-crash-safe behavior asked for.
+
+  Install (paths are already absolute for this machine):
+    cp automation/com.aivgl.runner.plist ~/Library/LaunchAgents/
+    launchctl load  ~/Library/LaunchAgents/com.aivgl.runner.plist
+  Stop:
+    launchctl unload ~/Library/LaunchAgents/com.aivgl.runner.plist
+
+  headless by default; logs to automation/runner.out / runner.err.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.aivgl.runner</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/cherish/Documents/AI Video Gen Lab/automation/runner.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/cherish/Documents/AI Video Gen Lab</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/cherish/Documents/AI Video Gen Lab/automation/runner.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/cherish/Documents/AI Video Gen Lab/automation/runner.err</string>
+</dict>
+</plist>

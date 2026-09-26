@@ -1,0 +1,14 @@
+.env
+_smoke/
+projects/
+clips/
+profiles/
+state.db
+state.db-wal
+state.db-shm
+accounts.json
+__pycache__/
+*.pyc
+automation/import_*.png
+clip.mp4
+.DS_Store
