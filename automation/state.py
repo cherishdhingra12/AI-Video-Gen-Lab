@@ -66,6 +66,22 @@ CREATE TABLE IF NOT EXISTS lessons (
   cooldown_until REAL NOT NULL DEFAULT 0,  -- skip (site,account) until this epoch
   created REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS craft_lessons (
+  id INTEGER PRIMARY KEY,
+  slug     TEXT NOT NULL UNIQUE,          -- stable id, e.g. 'caption-safe-area'
+  title    TEXT NOT NULL,
+  why      TEXT,                          -- why it matters (for the judgment checklist)
+  tier     TEXT NOT NULL DEFAULT 'auto',  -- 'auto' (code can check) | 'judgment' (needs eyes)
+  check_id TEXT,                          -- key into qc.CHECKS for auto lessons; NULL for judgment
+  severity TEXT NOT NULL DEFAULT 'block', -- 'block' | 'publish-gate' | 'warn'
+  source   TEXT,                          -- where it came from (owner correction + date)
+  created  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reel_identity (
+  reel    TEXT PRIMARY KEY,               -- project name of a shipped reel
+  fp      TEXT NOT NULL,                  -- json fingerprint of its distinctive craft choices
+  created REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS ix_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS ix_lessons_site ON lessons(site, account);
 """
@@ -190,6 +206,41 @@ class State:
     def close(self):
         self.db.close()
 
+    # ---- craft lessons (reel quality) — the project's own "brain" of what the owner taught.
+    # Separate from the anti-ban `lessons` table on purpose: these are keyed by a stable slug and
+    # carry a check_id/severity, not a (site,account) cooldown. qc.py runs the checks over them.
+    def learn_lesson(self, slug: str, title: str, why: str = None, tier: str = "auto",
+                     check_id: str = None, severity: str = "block", source: str = None):
+        """Absorb a lesson (owner correction or confirmed good practice). Upsert by slug so
+        re-teaching the same thing refines the row instead of duplicating it."""
+        self.db.execute(
+            "INSERT INTO craft_lessons(slug,title,why,tier,check_id,severity,source,created) "
+            "VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(slug) DO UPDATE SET title=excluded.title, why=excluded.why, "
+            "tier=excluded.tier, check_id=excluded.check_id, severity=excluded.severity, "
+            "source=excluded.source",
+            (slug, title, why, tier, check_id, severity, source, time.time()))
+        self.db.commit()
+
+    def craft_lessons(self, tier: str = None) -> list:
+        if tier:
+            return self.db.execute(
+                "SELECT * FROM craft_lessons WHERE tier=? ORDER BY id", (tier,)).fetchall()
+        return self.db.execute("SELECT * FROM craft_lessons ORDER BY id").fetchall()
+
+    # ---- reel identity fingerprints (so a new reel can't silently reuse an old one's look) ----
+    def record_identity(self, reel: str, fp: str):
+        self.db.execute(
+            "INSERT INTO reel_identity(reel,fp,created) VALUES(?,?,?) "
+            "ON CONFLICT(reel) DO UPDATE SET fp=excluded.fp, created=excluded.created",
+            (reel, fp, time.time()))
+        self.db.commit()
+
+    def other_identities(self, reel: str) -> list:
+        """Fingerprints of every OTHER shipped reel — to detect a repeated look."""
+        return self.db.execute(
+            "SELECT reel, fp FROM reel_identity WHERE reel!=?", (reel,)).fetchall()
+
 
 # escalating backoff: repeat the same wall -> wait longer each time (step back,
 # come back later). Capped so it always eventually retries.
@@ -222,4 +273,21 @@ if __name__ == "__main__":
     assert st.cooldown_left("kling", "a1") > 250, "captcha must cool the pair down"
     assert backoff_seconds(0) == 300 and backoff_seconds(3) == 2400, "backoff escalates"
     assert st.recent_lessons("kling", "a1", kind="captcha"), "lesson must be recallable"
+
+    # craft lessons: absorb, refine (upsert by slug), query by tier
+    st.learn_lesson("caption-safe-area", "Captions out of the bottom/right UI zone",
+                    why="the app paints handle/CTA there", check_id="caption-safe-area")
+    st.learn_lesson("style-consistency", "No photoreal<->animated drift", tier="judgment")
+    st.learn_lesson("caption-safe-area", "Captions in the top-safe strip",   # re-teach = refine
+                    why="platform UI covers the bottom ~18%", check_id="caption-safe-area")
+    all_l = st.craft_lessons()
+    assert len(all_l) == 2, f"upsert by slug must not duplicate: {len(all_l)}"
+    assert [l["slug"] for l in all_l if l["slug"] == "caption-safe-area"][0]
+    assert st.craft_lessons(tier="judgment")[0]["slug"] == "style-consistency"
+
+    # identity fingerprints: only OTHER reels count as a collision surface
+    st.record_identity("reel_a", '{"opener":"reveal","font":"Didot"}')
+    st.record_identity("reel_b", '{"opener":"quote","font":"Snell"}')
+    assert {r["reel"] for r in st.other_identities("reel_a")} == {"reel_b"}, "exclude self"
     print("OK: jobs resume, credits gate the scheduler, lessons cool sites down + escalate")
+    print("OK: craft lessons upsert-by-slug + tier query, identity fingerprints recorded")

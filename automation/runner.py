@@ -124,6 +124,23 @@ def stitch_done_projects(st: State):
             paths = [c["video_path"] for c in clips]
             stitcher.stitch(paths, final, xfade=0.4)
             print(f"STITCHED {project} -> {final} ({len(paths)} clips)")
+            _gate(st, os.path.dirname(final))
+
+
+def _gate(st: State, project_dir: str):
+    """Run the craft gate over a finished reel and log the verdict. Advisory in the
+    autonomous loop (never crashes the drain); block/gate items mean don't hand off / go_live."""
+    try:
+        import qc
+        v = qc.run(project_dir, st)
+        for b in v["block"]:
+            print(f"  QC BLOCK: {b}")
+        for g in v["gate"]:
+            print(f"  QC PUBLISH-GATE: {g}")
+        print(f"  QC {project_dir}: {'PASS' if v['ok'] else 'HELD'} "
+              f"({len(v['block'])} block, {len(v['gate'])} gate, {len(v['checklist'])} to eyeball)")
+    except Exception as e:
+        print(f"  QC skipped ({e})")
 
 
 def loop(once: bool = False, headless: bool = True):

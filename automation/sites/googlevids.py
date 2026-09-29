@@ -48,8 +48,11 @@ class GoogleVids(SiteAdapter):
 
     # ---- passive capture of the rendered clip URL (gstatic.com/docs/... are promo decoys) ----
     def _watch(self, session):
-        if getattr(self, "_watching", False):
-            return
+        # Reset + rebind EVERY render: the ADAPTER is a singleton reused across scenes (runner
+        # loops, render_*.py batches), and each scene is a fresh Session/page. A one-time guard
+        # here left later scenes with no listeners and a stale _mp4 → download() re-saved the
+        # PREVIOUS scene's clip (byte-identical dupes). Clear per submit so each scene captures
+        # only its own finished clip.
         self._mp4 = []
 
         def note(u):
@@ -59,7 +62,6 @@ class GoogleVids(SiteAdapter):
 
         session.page.on("response", lambda r: note(r.url))
         session.page.on("request", lambda q: note(q.url))
-        self._watching = True
 
 
     @staticmethod
@@ -175,4 +177,19 @@ class GoogleVids(SiteAdapter):
 
 
 ADAPTER = GoogleVids()
+
+
+if __name__ == "__main__":  # self-check: capture state must reset + rebind every render
+    class _FakePage:
+        def __init__(self): self.bound = 0
+        def on(self, *_a, **_k): self.bound += 1
+    class _FakeSession:
+        def __init__(self): self.page = _FakePage()
+
+    a = GoogleVids()
+    s1 = _FakeSession(); a._watch(s1); a._mp4.append("stale-from-scene-1")
+    s2 = _FakeSession(); a._watch(s2)                 # next scene, fresh page
+    assert a._mp4 == [], "download would re-save the previous scene's clip"
+    assert s2.page.bound == 2, "listeners not rebound to the new scene's page"
+    print("googlevids _watch reset ok")
 
