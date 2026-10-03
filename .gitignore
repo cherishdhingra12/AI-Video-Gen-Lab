@@ -12,3 +12,4 @@ __pycache__/
 automation/import_*.png
 clip.mp4
 .DS_Store
+automation/.harvest_cursors.json

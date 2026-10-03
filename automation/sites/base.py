@@ -18,7 +18,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from vision import read_state, STATES  # noqa: E402  (shared perception)
+from vision import read_state, find_control, STATES  # noqa: E402  (shared perception + self-heal)
 
 
 class Wall(Exception):
@@ -57,6 +57,92 @@ class SiteAdapter:
         if st["state"] in ("captcha", "rate_limited", "login"):
             kind = {"rate_limited": "rate_limit"}.get(st["state"], st["state"])
             raise Wall(kind, st["reason"])
+
+    # ---- self-heal: when the saved selector misses because the UI drifted, use vision to find
+    # the control NOW and keep running. Vision corrects the stale map; it never takes over. -------
+    _CANDIDATES_JS = (
+        "() => [...document.querySelectorAll('button,[role=button],a,[contenteditable],"
+        "input,textarea,[tabindex],[role=menuitem],[role=option]')].map(e=>{"
+        "const r=e.getBoundingClientRect();return {"
+        "t:(e.innerText||e.getAttribute('aria-label')||e.placeholder||'').replace(/\\s+/g,' ').trim(),"
+        "x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),"
+        "w:Math.round(r.width),h:Math.round(r.height)};})"
+        ".filter(o=>o.w>8&&o.h>8&&o.x>=0&&o.y>=0&&o.w<1400&&o.h<900)")
+
+    def _candidates(self, session) -> list:
+        try:
+            raw = session.page.evaluate(self._CANDIDATES_JS)
+        except Exception:
+            return []
+        return [{"i": i, "text": o["t"], "x": o["x"], "y": o["y"], "w": o["w"], "h": o["h"]}
+                for i, o in enumerate(raw)]
+
+    def heal_click(self, session, what: str):
+        """A scripted click just missed (UI drift). Vision-locate the control and click it so
+        the run continues on its own. Returns the {'x','y'} clicked, or None. Records the heal so
+        the brain learns the drift (fail-open; the adapter stays otherwise side-effect-free)."""
+        hit = find_control(session.screenshot(), self._candidates(session), what)
+        if not hit:
+            return None
+        try:
+            session.page.mouse.click(hit["x"], hit["y"])
+        except Exception:
+            return None
+        print(f"[self-heal] {self.name}: '{what}' relocated by vision -> ({hit['x']},{hit['y']})")
+        self._record_heal(what)
+        return hit
+
+    def click_or_heal(self, session, fast_fn, what: str) -> bool:
+        """Try the fast scripted click; if it misses, self-heal via vision. Never raises on drift."""
+        try:
+            if fast_fn():
+                return True
+        except Exception:
+            pass
+        return bool(self.heal_click(session, what))
+
+    def _record_heal(self, what: str):
+        """Tell the brain a UI drift was healed (so recurring drift surfaces as a candidate rule).
+        A 'selector' lesson with NO cooldown — we healed, we don't back off."""
+        try:
+            from state import State
+            st = State()
+            st.record_lesson(self.name, kind="selector", detail=f"healed via vision: {what}", cooldown_s=0)
+            st.close()
+        except Exception:
+            pass
+
+
+# ---- offline self-check: prove click_or_heal falls back to a vision heal and clicks the coords ---
+if __name__ == "__main__":
+    class _Pg:
+        def __init__(self): self.clicked = None
+        def evaluate(self, js): return []
+        class _M:
+            def __init__(s, pg): s.pg = pg
+            def click(s, x, y): s.pg.clicked = (x, y)
+        @property
+        def mouse(self): return _Pg._M(self)
+
+    class _Sess:
+        def __init__(self): self.page = _Pg()
+        def screenshot(self): return b"\x89PNG\r\n\x1a\n"
+
+    ad = SiteAdapter()
+    ad._record_heal = lambda what: None            # don't touch the real brain in the self-check
+    _orig = find_control
+    try:
+        globals()["find_control"] = lambda png, cands, what: {"x": 321, "y": 123}
+        s = _Sess()
+        assert ad.click_or_heal(s, lambda: True, "x") is True and s.page.clicked is None, "fast path wins, no heal"
+        assert ad.click_or_heal(s, lambda: False, "the generate button") is True, "miss -> heal"
+        assert s.page.clicked == (321, 123), f"heal clicked vision coords: {s.page.clicked}"
+        assert ad.click_or_heal(s, lambda: (_ for _ in ()).throw(RuntimeError()), "x") is True, "raise -> heal"
+        globals()["find_control"] = lambda png, cands, what: None
+        assert ad.click_or_heal(_Sess(), lambda: False, "absent") is False, "no control found -> False (caller walls)"
+        print("OK: click_or_heal uses fast path, else self-heals via vision and clicks the coords")
+    finally:
+        globals()["find_control"] = _orig
 
 
 assert set(STATES)  # keep the import used; STATES is the poll vocabulary

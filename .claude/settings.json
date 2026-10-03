@@ -1,0 +1,58 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"/Users/cherish/Documents/AI Video Gen Lab/brain.py\" observe",
+            "timeout": 15,
+            "suppressOutput": true,
+            "statusMessage": "brain: sensing"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Edit|Write|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"/Users/cherish/Documents/AI Video Gen Lab/brain.py\" observe fail",
+            "timeout": 15,
+            "suppressOutput": true,
+            "statusMessage": "brain: sensing a failure"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"/Users/cherish/Documents/AI Video Gen Lab/brain.py\" reflect",
+            "timeout": 30,
+            "statusMessage": "brain: reflecting on the session"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"/Users/cherish/Documents/AI Video Gen Lab/brain.py\" harvest",
+            "timeout": 60,
+            "async": true,
+            "suppressOutput": true,
+            "statusMessage": "brain: learning from the conversation"
+          }
+        ]
+      }
+    ]
+  }
+}

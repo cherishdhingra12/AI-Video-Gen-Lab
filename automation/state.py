@@ -82,8 +82,28 @@ CREATE TABLE IF NOT EXISTS reel_identity (
   fp      TEXT NOT NULL,                  -- json fingerprint of its distinctive craft choices
   created REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS brain_log (
+  id INTEGER PRIMARY KEY,
+  ts      REAL NOT NULL,
+  session TEXT,                           -- groups events from one work session
+  kind    TEXT NOT NULL,                  -- 'edit'|'write'|'bash'|'session'|'note'|...
+  detail  TEXT,                           -- concise what-happened
+  processed INTEGER NOT NULL DEFAULT 0     -- 1 once reflect() has distilled it
+);
+CREATE TABLE IF NOT EXISTS candidate_lessons (
+  id INTEGER PRIMARY KEY,
+  slug     TEXT NOT NULL UNIQUE,
+  title    TEXT NOT NULL,
+  why      TEXT,
+  evidence TEXT,                          -- the pattern/count that triggered it
+  hits     INTEGER NOT NULL DEFAULT 1,    -- times the miner has seen this pattern
+  status   TEXT NOT NULL DEFAULT 'pending',  -- pending | accepted | dismissed
+  created  REAL NOT NULL,
+  updated  REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS ix_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS ix_lessons_site ON lessons(site, account);
+CREATE INDEX IF NOT EXISTS ix_brainlog_session ON brain_log(session, processed);
 """
 
 
@@ -241,6 +261,58 @@ class State:
         return self.db.execute(
             "SELECT reel, fp FROM reel_identity WHERE reel!=?", (reel,)).fetchall()
 
+    # ---- brain activity log: the always-on sense stream (hooks append here as the session works;
+    # reflect() distills the unprocessed rows into durable knowledge at session end). ----
+    def log_event(self, kind: str, detail: str = None, session: str = None):
+        self.db.execute(
+            "INSERT INTO brain_log(ts,session,kind,detail,processed) VALUES(?,?,?,?,0)",
+            (time.time(), session, kind, detail))
+        self.db.commit()
+
+    def events(self, session: str = None, processed: bool = None, limit: int = 1000) -> list:
+        sql, args = "SELECT * FROM brain_log WHERE 1=1", []
+        if session is not None:
+            sql += " AND session=?"; args.append(session)
+        if processed is not None:
+            sql += " AND processed=?"; args.append(1 if processed else 0)
+        sql += " ORDER BY ts LIMIT ?"; args.append(limit)
+        return self.db.execute(sql, args).fetchall()
+
+    def mark_processed(self, session: str):
+        """Mark a session's raw events distilled — keep the 'session' summary rows unprocessed."""
+        self.db.execute(
+            "UPDATE brain_log SET processed=1 WHERE session=? AND kind!='session'", (session,))
+        self.db.commit()
+
+    # ---- candidate lessons: the brain PROPOSES rules from patterns; the owner vets them.
+    # These never reach craft_lessons (the QC gate) until promote() copies an accepted one over. ----
+    def propose_lesson(self, slug: str, title: str, why: str = None, evidence: str = None):
+        """File/refresh a candidate. Upsert by slug; a candidate the owner already accepted or
+        dismissed is left frozen (the WHERE guard), so the miner can't re-nag about it."""
+        now = time.time()
+        self.db.execute(
+            "INSERT INTO candidate_lessons(slug,title,why,evidence,hits,status,created,updated) "
+            "VALUES(?,?,?,?,1,'pending',?,?) "
+            "ON CONFLICT(slug) DO UPDATE SET title=excluded.title, why=excluded.why, "
+            "evidence=excluded.evidence, hits=candidate_lessons.hits+1, updated=excluded.updated "
+            "WHERE candidate_lessons.status='pending'",
+            (slug, title, why, evidence, now, now))
+        self.db.commit()
+
+    def candidates(self, status: str = "pending") -> list:
+        if status:
+            return self.db.execute(
+                "SELECT * FROM candidate_lessons WHERE status=? ORDER BY hits DESC, updated DESC",
+                (status,)).fetchall()
+        return self.db.execute("SELECT * FROM candidate_lessons ORDER BY updated DESC").fetchall()
+
+    def resolve_candidate(self, slug: str, status: str):
+        self.db.execute("UPDATE candidate_lessons SET status=?, updated=? WHERE slug=?",
+                        (status, time.time(), slug))
+        self.db.commit()
+        return self.db.execute("SELECT * FROM candidate_lessons WHERE slug=?", (slug,)).fetchone()
+
+
 
 # escalating backoff: repeat the same wall -> wait longer each time (step back,
 # come back later). Capped so it always eventually retries.
@@ -289,5 +361,26 @@ if __name__ == "__main__":
     st.record_identity("reel_a", '{"opener":"reveal","font":"Didot"}')
     st.record_identity("reel_b", '{"opener":"quote","font":"Snell"}')
     assert {r["reel"] for r in st.other_identities("reel_a")} == {"reel_b"}, "exclude self"
+
+    # brain log: events accrue unprocessed, reflect marks them, session summaries persist
+    st.log_event("edit", "touched build.py", session="s1")
+    st.log_event("bash", "ran assemble", session="s1")
+    assert len(st.events(session="s1", processed=False)) == 2, "raw events are unprocessed"
+    st.log_event("session", "s1 summary", session="s1")       # a distilled summary row
+    st.mark_processed("s1")
+    assert not st.events(session="s1", processed=False, limit=10) or \
+        all(e["kind"] == "session" for e in st.events(session="s1", processed=False)), \
+        "mark_processed clears raw rows but keeps the session summary"
+
+    # candidate lessons: propose (upsert bumps hits), owner dismiss freezes it against re-nag
+    st.propose_lesson("wall-kling-captcha", "kling keeps hitting captcha", evidence="count=3")
+    st.propose_lesson("wall-kling-captcha", "kling keeps hitting captcha", evidence="count=4")
+    assert st.candidates()[0]["hits"] == 2, "re-proposing the same slug bumps hits, not duplicates"
+    st.resolve_candidate("wall-kling-captcha", "dismissed")
+    st.propose_lesson("wall-kling-captcha", "x", evidence="count=5")   # must NOT revive it
+    assert not st.candidates(status="pending"), "a dismissed candidate stays dismissed (no re-nag)"
+    assert st.candidates(status="dismissed")[0]["hits"] == 2, "frozen hits unchanged after dismiss"
     print("OK: jobs resume, credits gate the scheduler, lessons cool sites down + escalate")
     print("OK: craft lessons upsert-by-slug + tier query, identity fingerprints recorded")
+    print("OK: brain log senses events + reflect marks them processed")
+    print("OK: candidate lessons upsert + freeze on owner decision (vetting gate holds)")

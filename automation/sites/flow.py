@@ -27,6 +27,7 @@ import re
 import time
 
 from base import SiteAdapter, Wall
+from vision import read_state
 
 
 class Flow(SiteAdapter):
@@ -114,26 +115,31 @@ class Flow(SiteAdapter):
         session.goto(self.home)
         time.sleep(9)
         # Signed out: flow.google.com serves the /about marketing shell ("Create with Google
-        # Flow", no "New project"). Google session cookies rotate fast, so a snapshot import
-        # only authenticates for a short window — re-run import_login.py right before each run.
-        if ("/about" in pg.url
-                or re.search(r"Create with Google Flow", self._body(session), re.I)
-                or not self._role_present(session, "New project")):
+        # Flow"). Google session cookies rotate fast, so a snapshot import only authenticates for a
+        # short window — re-run import_login.py right before each run. NOTE: a missing "New project"
+        # by itself is NOT treated as signed-out any more — the UI drifts, so that step self-heals
+        # via vision below; only the /about shell or the marketing headline means truly logged out.
+        if "/about" in pg.url or re.search(r"Create with Google Flow", self._body(session), re.I):
             raise Wall("login", "flow signed out; re-run: import_login.py flow a1 --browser chrome --keyword google")
         self._guard(session)
         if self._QUOTA.search(self._body(session)):
             raise Wall("rate_limit", "Google Flow daily credits spent — refreshes next day")
 
-        if not self._click_role(session, "New project"):
-            raise Wall("selector", "Flow 'New project' not found — confirm live UI")
+        if not self.click_or_heal(session, lambda: self._click_role(session, "New project"),
+                                  "the 'New project' button or tile that starts a new video project"):
+            raise Wall("selector", "Flow 'New project' not found — not even via vision self-heal")
         time.sleep(9)
 
         # config panel: aspect 9:16 (Flow defaults 16:9 — REQUIRED) + single output.
-        if not self._click_role(session, "Settings trigger"):
-            raise Wall("selector", "Flow 'Settings trigger' (config panel) not found")
+        self.click_or_heal(session, lambda: self._click_role(session, "Settings trigger"),
+                           "the settings / tune / gear icon that opens the generation options panel "
+                           "(aspect ratio, number of outputs)")
         time.sleep(1.5)
-        self._click_text(session, r"videocam Video|\bVideo\b", fallback=(817, 627)); time.sleep(0.8)
-        if not self._click_text(session, r"9:16", fallback=(859, 669)):
+        self.click_or_heal(session, lambda: self._click_text(session, r"videocam Video|\bVideo\b", fallback=(817, 627)),
+                           "the 'Video' output-type option in the generation settings panel")
+        time.sleep(0.8)
+        if not self.click_or_heal(session, lambda: self._click_text(session, r"9:16", fallback=(859, 669)),
+                                  "the 9:16 vertical / portrait aspect-ratio option"):
             raise Wall("selector", "Flow 9:16 aspect not settable — refusing (output must be vertical)")
         time.sleep(0.8)
         try:                                          # x1 = one output, conserves credits
@@ -143,13 +149,16 @@ class Flow(SiteAdapter):
         pg.keyboard.press("Escape"); time.sleep(1)    # close panel or cdk-overlay eats the click
 
         box = pg.locator("div.ProseMirror[contenteditable=true]").last
-        if not box.count():
-            raise Wall("selector", "Flow prompt box (ProseMirror) not found")
-        box.click(); time.sleep(0.5)
+        if box.count():
+            box.click()
+        elif not self.heal_click(session, "the main prompt text box where the video description is typed"):
+            raise Wall("selector", "Flow prompt box (ProseMirror) not found — not even via vision self-heal")
+        time.sleep(0.5)
         pg.keyboard.type(prompt, delay=14); time.sleep(1)
 
-        if not self._click_role(session, "Start generation"):
-            raise Wall("selector", "Flow 'Start generation' not found / disabled")
+        if not self.click_or_heal(session, lambda: self._click_role(session, "Start generation"),
+                                  "the 'Start generation' / generate / create button that submits the prompt"):
+            raise Wall("selector", "Flow 'Start generation' not found — not even via vision self-heal")
         time.sleep(4)
         if self._QUOTA.search(self._body(session)):
             raise Wall("rate_limit", "Google Flow daily credits spent — refreshes next day")
@@ -160,7 +169,8 @@ class Flow(SiteAdapter):
         if self._QUOTA.search(body):
             return "rate_limited"
         if self._FAIL.search(body):
-            return "error"
+            v = read_state(session.screenshot()).get("state")   # vision double-check before giving up
+            return v if v in ("rendering", "done", "rate_limited") else "error"
         if "%" in body:                               # progress indicator still up
             return "rendering"
         return "done" if self._poster_box(pg) else "rendering"

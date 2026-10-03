@@ -101,7 +101,41 @@ def check_caption_safe_area(reel):
     return probs
 
 
-CHECKS = {"playable": check_playable, "caption-safe-area": check_caption_safe_area}
+def check_realism(reel):
+    """Vision review of the FINISHED reel: sample frames across it and have the brain's eyes
+    (vision.review_frame) flag realism defects / AI artifacts — bodies merging, extra/missing
+    limbs, duplicated objects, garbled baked-in text, style drift — BEFORE it reaches the owner.
+    If the vision gateway is down it says so (does NOT silently pass)."""
+    if not reel.final:
+        return []
+    import vision
+    d = _duration(reel.final)
+    if d <= 0:
+        return []
+    seen, answered = {}, 0
+    for frac in (0.08, 0.18, 0.30, 0.42, 0.54, 0.66, 0.78, 0.90):
+        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{d * frac:.3f}", "-i", reel.final,
+                            "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+                           capture_output=True)
+        if not r.stdout:
+            continue
+        res = vision.review_frame(r.stdout)
+        if res is None:                               # gateway failed on this frame
+            continue
+        answered += 1
+        for df in res:
+            seen.setdefault(df["type"], []).append((round(d * frac, 1), df["detail"]))
+    if answered == 0:
+        return ["visual review could NOT run (vision gateway unavailable) — eyeball before go_live"]
+    probs = []
+    for t, hits in seen.items():
+        ts = ", ".join(f"{tt}s" for tt, _ in hits[:3])
+        probs.append(f"{t} @ {ts}: {hits[0][1]}")
+    return probs
+
+
+CHECKS = {"playable": check_playable, "caption-safe-area": check_caption_safe_area,
+          "realism": check_realism}
 
 
 # ---- canonical craft lessons: the owner's memory rules, absorbed into state.db --------------
@@ -114,6 +148,12 @@ LESSONS = [
     dict(slug="caption-safe-area", check_id="caption-safe-area", severity="block",
          title="On-screen text clears the bottom 15% and far-right edge",
          why="the IG app paints the handle, caption, audio row and action buttons there"),
+    dict(slug="visual-realism", check_id="realism", severity="publish-gate",
+         title="The finished reel passes a vision realism review (no body-merge, extra limbs, "
+               "duplicated objects, garbled baked text, or style drift)",
+         why="AI reels ship artifacts the owner should not have to catch (a figure walking INTO "
+             "another, meaningless baked Hindi text) — the brain reviews every reel by eye (vision) "
+             "before hand-off, using its past-artifact knowledge"),
     dict(slug="unique-reel-identity", tier="judgment", severity="block",
          title="A fresh identity every reel — opener, fonts, transitions, quote, structure",
          why="repeating an old reel's look is the flaw the owner caught before"),
@@ -238,35 +278,57 @@ if __name__ == "__main__":
         im = Image.new("RGBA", (720, 1280), (0, 0, 0, 0))
         im.paste((255, 255, 255, 255), (100, 1200, 620, 1260))   # text in the bottom 15%
         im.save(os.path.join(d, "caption_bad.png"))
-        v = run(d, st)
-        assert any("frozen still" in b for b in v["block"]), v["block"]
-        assert any("no audio" in b for b in v["block"]), v["block"]
-        assert any("bottom-15%" in b for b in v["block"]), v["block"]
-        assert not v["ok"], "a frozen silent reel with a bad caption must be HELD"
 
-        # identity collision: a second reel that reuses an existing look must block
-        st.record_identity("reel_a", json.dumps(
-            {"opener": "reveal", "font": "Didot", "quote": "Ibn Battuta", "structure": "hero-hold"}))
-        d2 = tempfile.mkdtemp()
-        json.dump({"opener": "reveal", "font": "Didot", "quote": "Ibn Battuta", "structure": "grid"},
-                  open(os.path.join(d2, "identity.json"), "w"))
-        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=2",
-                        "-f", "lavfi", "-i", "sine=frequency=440:d=2", "-pix_fmt", "yuv420p",
-                        "-shortest", os.path.join(d2, "final_veo.mp4")], check=True, capture_output=True)
-        v2 = run(d2, st)
-        assert any("unique-reel-identity" in b and "reel_a" in b for b in v2["block"]), v2["block"]
+        # realism is a LIVE vision call in production (8 sampled frames x gateway failover x
+        # 90s each). Stub the gateway so --selfcheck stays OFFLINE, then prove both directions:
+        # a down gateway must NOT silently pass, and a reported defect must gate the reel.
+        import vision
+        _orig_review = vision.review_frame
+        try:
+            vision.review_frame = lambda png: None                # gateway unavailable
+            v = run(d, st)
+            assert any("frozen still" in b for b in v["block"]), v["block"]
+            assert any("no audio" in b for b in v["block"]), v["block"]
+            assert any("bottom-15%" in b for b in v["block"]), v["block"]
+            assert any("visual review could NOT run" in g for g in v["gate"]), \
+                "a down vision gateway must say so, not silently pass"
+            assert not v["ok"], "a frozen silent reel with a bad caption must be HELD"
 
-        # a clean, distinct reel passes the auto checks
-        d3 = tempfile.mkdtemp()
-        json.dump({"opener": "typewriter", "font": "Snell", "quote": "Rumi", "structure": "montage"},
-                  open(os.path.join(d3, "identity.json"), "w"))
-        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=2",
-                        "-f", "lavfi", "-i", "sine=frequency=440:d=2", "-pix_fmt", "yuv420p",
-                        "-shortest", os.path.join(d3, "final_veo.mp4")], check=True, capture_output=True)
-        v3 = run(d3, st)
-        assert v3["ok"] and not v3["block"], v3
+            vision.review_frame = lambda png: [{"type": "body-merge",
+                                                "detail": "her torso overlaps his shoulder"}]
+            v = run(d, st)
+            assert any("body-merge" in g for g in v["gate"]), v["gate"]
+            assert not v["ok"], "a reel with a vision-reported defect must be HELD"
+
+            vision.review_frame = lambda png: []                  # every frame reviews clean
+            # identity collision: a second reel that reuses an existing look must block
+            st.record_identity("reel_a", json.dumps(
+                {"opener": "reveal", "font": "Didot", "quote": "Ibn Battuta", "structure": "hero-hold"}))
+            d2 = tempfile.mkdtemp()
+            json.dump({"opener": "reveal", "font": "Didot", "quote": "Ibn Battuta", "structure": "grid"},
+                      open(os.path.join(d2, "identity.json"), "w"))
+            subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=2",
+                            "-f", "lavfi", "-i", "sine=frequency=440:d=2", "-pix_fmt", "yuv420p",
+                            "-shortest", os.path.join(d2, "final_veo.mp4")],
+                           check=True, capture_output=True)
+            v2 = run(d2, st)
+            assert any("unique-reel-identity" in b and "reel_a" in b for b in v2["block"]), v2["block"]
+
+            # a clean, distinct reel passes the auto checks
+            d3 = tempfile.mkdtemp()
+            json.dump({"opener": "typewriter", "font": "Snell", "quote": "Rumi", "structure": "montage"},
+                      open(os.path.join(d3, "identity.json"), "w"))
+            subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=2",
+                            "-f", "lavfi", "-i", "sine=frequency=440:d=2", "-pix_fmt", "yuv420p",
+                            "-shortest", os.path.join(d3, "final_veo.mp4")],
+                           check=True, capture_output=True)
+            v3 = run(d3, st)
+            assert v3["ok"] and not v3["block"], v3
+        finally:
+            vision.review_frame = _orig_review
         st.close()
-        print("OK: auto checks catch frozen/silent/off-safe-area + identity reuse; clean reel passes")
+        print("OK: auto checks catch frozen/silent/off-safe-area + identity reuse; "
+              "realism gates on a vision defect / reports a down gateway; clean reel passes")
     elif "--seed" in sys.argv:
         st = State(); seed(st)
         print(f"seeded {len(st.craft_lessons())} craft lessons into state.db"); st.close()
