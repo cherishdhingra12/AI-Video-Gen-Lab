@@ -208,8 +208,19 @@ if __name__ == "__main__":
         assert runner.process_job(st, br, st.next_queued(), headless=True) == "done"
         clip = st.project_clips("selftest")[0]
         assert clip["status"] == "done" and os.path.exists(clip["video_path"])
-        runner.stitch_done_projects(st)
-        assert os.path.exists(os.path.join(ROOT, "projects", "selftest", "final.mp4"))
+
+        # the craft gate's realism check makes LIVE vision calls (8 frames per reel), but this
+        # self-check promises no network — stub the gateway, then prove the gate still runs.
+        # A stale final.mp4 from a previous run would skip the stitch+gate, so clear it first.
+        import shutil, vision
+        shutil.rmtree(os.path.join(ROOT, "projects", "selftest"), ignore_errors=True)
+        _orig_review = vision.review_frame
+        vision.review_frame = lambda png: []
+        try:
+            runner.stitch_done_projects(st)
+            assert os.path.exists(os.path.join(ROOT, "projects", "selftest", "final.mp4"))
+        finally:
+            vision.review_frame = _orig_review
         print("OK: loop walls->cools->requeues, then succeeds->done->stitches final.mp4")
     else:
         loop(once="--once" in sys.argv, headless="--headed" not in sys.argv)
