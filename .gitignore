@@ -13,3 +13,6 @@ automation/import_*.png
 clip.mp4
 .DS_Store
 automation/.harvest_cursors.json
+automation/.brain_state.json
+automation/.brain_transcripts/
+automation/.brain_hook.log

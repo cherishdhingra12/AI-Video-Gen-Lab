@@ -111,10 +111,25 @@ class State:
     def __init__(self, path: str = DB_PATH):
         self.db = sqlite3.connect(path, timeout=30)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")     # survive a mid-write crash
-        self.db.execute("PRAGMA synchronous=NORMAL")
-        self.db.executescript(_SCHEMA)
-        self.db.commit()
+        # PRAGMA journal_mode does NOT honour sqlite's busy timeout, and the brain's hooks are
+        # legitimately concurrent (several tools finish at once -> several brain.py processes).
+        # A fresh writer that meets another one mid-commit gets an immediate 'database is locked'
+        # — and a lost insert would silently blind the sense stream. Back off and retry; the
+        # lock only lives for one commit, so this resolves in milliseconds.
+        last = None
+        for attempt in range(25):
+            try:
+                self.db.execute("PRAGMA journal_mode=WAL")     # survive a mid-write crash
+                self.db.execute("PRAGMA synchronous=NORMAL")
+                self.db.executescript(_SCHEMA)
+                self.db.commit()
+                return
+            except sqlite3.OperationalError as e:
+                last = e
+                if "locked" not in str(e).lower():
+                    raise
+                time.sleep(0.04 * (attempt + 1))
+        raise last
 
     # ---- jobs ----
     def add_job(self, project: str, idx: int, prompt: str, first_png: str = None) -> int:

@@ -43,8 +43,8 @@ outside (a re-login, a credit reset, an owner review). It reports all of that it
   old look.
 
 ## How it learns on its own (two autonomous loops + an owner-vetted one)
-The brain is always sensing — `observe` fires on every change (PostToolUse) **and on every tool
-failure** (PostToolUseFailure, logged as a `*_fail` event) — and reflects at each session end
+The brain is always sensing — `observe` fires on every change **and on every tool
+failure** (logged as a `*_fail` event) — and reflects at each session end
 (`reflect`). On top of that:
 
 - **Conversation self-learning (autonomous, no approval).** A `Stop` hook runs `harvest` after
@@ -62,6 +62,28 @@ failure** (PostToolUseFailure, logged as a `*_fail` event) — and reflects at e
 
 Craft lessons live in `craft_lessons` (what the QC gate surfaces); `reel_identity` fingerprints keep
 each reel's look distinct.
+
+## How the hooks are wired (two front doors, one brain)
+The brain has no thread into the editor — each tool calls it out of process with a JSON payload on
+stdin (`{"tool_name","tool_input","session_id"}` / `{"session_id"}` / `{"transcript_path"}`).
+Both supported editors are wired, so sensing never depends on which one drives the session:
+
+| brain call | Claude Code — `.claude/settings.json` | opencode — `.opencode/plugins/brain.js` |
+|------------|---------------------------------------|-----------------------------------------|
+| `observe` | PostToolUse on Edit\|Write\|Bash | `message.part.updated`, tool state `completed` |
+| `observe fail` | PostToolUseFailure | the same event, tool state `error` |
+| `harvest` | Stop (async, after every turn) | `session.idle` → the SDK exports the session as JSONL |
+| `reflect` | SessionEnd | `session.idle` debounced by a 5-min quiet period, plus a catch-up reflect for an abandoned session when the next one starts |
+
+opencode ships no declarative hooks — its hooks are plugin callbacks — so the plugin translates tool
+names (`edit`→`Edit`, `apply_patch`→`Edit`, `bash`→`Bash`) and arg keys (`filePath`→`file_path`) into
+brain.py's vocabulary: **one sensing code path, both editors**. It has no session-end event, so a
+session counts as over once no tool has run for 5 minutes.
+
+Everything is fail-open — a brain that hangs, errors or is missing must never block a turn. A brain
+error lands in `automation/.brain_hook.log` (capped) instead of vanishing. Concurrent hooks used to
+lose events on `database is locked` (`PRAGMA journal_mode` ignores SQLite's busy timeout), so
+`State.__init__` now backs off and retries: a silently dropped sensed event blinds the brain.
 
 ## Mother-brain seam (defined, NOT wired yet — on purpose)
 The central brain does not exist yet, so there is no transport, daemon, or registration here
