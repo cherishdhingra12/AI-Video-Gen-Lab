@@ -22,6 +22,7 @@
  */
 import fs from "node:fs"
 import path from "node:path"
+import { spawn } from "node:child_process"
 
 // opencode's mutating tools -> the tool_name brain.observe() understands (Claude's matcher was
 // Edit|Write|NotebookEdit|Bash; opencode has no notebooks, and apply_patch writes files too).
@@ -70,24 +71,40 @@ export default async ({ directory, worktree, client }) => {
     }
   }
 
+  // Which interpreter runs the brain. opencode's app PATH is not your shell's PATH, so resolve a
+  // real file rather than trusting `python3` — brain.py's chain is stdlib-only, so any of these
+  // can sense/reflect/harvest (numpy/PIL are only needed by `brain.py review`, a human command).
+  const PYTHON =
+    process.env.PYTHON ||
+    [
+      "/usr/local/bin/python3",
+      "/opt/homebrew/bin/python3",
+      "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+      "/usr/bin/python3",
+    ].find((p) => fs.existsSync(p)) ||
+    "python3"
+
   const brain = (cmd, argv, payload) => {
     if (!ready) return
     try {
-      const p = Bun.spawn(["python3", brainPy, cmd, ...(argv || [])], {
+      // node:child_process — NOT Bun.spawn: opencode's desktop app runs plugins under Node,
+      // where the Bun global does not exist (that silently killed every sensed event).
+      const p = spawn(PYTHON, [brainPy, cmd, ...(argv || [])], {
         cwd: projectRoot,
-        stdin: "pipe",
-        stdout: "ignore",
-        stderr: "pipe",
+        stdio: ["pipe", "ignore", "pipe"],
       })
-      p.stdin.write(JSON.stringify(payload || {}))
-      p.stdin.end()
-      new Response(p.stderr)
-        .text()
-        .then((err) => err && err.trim() && log(`brain.py ${cmd}: ${err}`))
-        .catch(() => {})
-      p.exited.catch(() => {})
+      p.stdin.on("error", () => {}) // brain may exit before stdin drains
+      p.stdin.end(JSON.stringify(payload || {}))
+      let err = ""
+      p.stderr.on("data", (d) => (err += d))
+      p.on("close", (code) => {
+        const e = err.trim()
+        if (e) log(`brain.py ${cmd} (exit ${code}): ${e}`) // success prints nothing
+      })
+      p.on("error", (e) => log(`spawn ${cmd} failed: ${e && e.message}`))
+      p.unref?.() // sensing never holds the app open
     } catch (e) {
-      log(`spawn ${cmd} failed: ${e && e.message}`)
+      log(`spawn ${cmd} threw: ${e && e.message}`)
     }
   }
 
