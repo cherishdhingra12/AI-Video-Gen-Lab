@@ -17,7 +17,8 @@ It does NOT re-implement the organs — it is the cortex that ties them together
     planning    automation/agents.py   idea -> script -> per-clip prompts
 
     python3 brain.py                   # this brain's self-report (health, budget, work, knowledge)
-    python3 brain.py review <project>  # run the craft gate on a reel
+    python3 brain.py review <project>  # run the craft gate on a reel (verdict saved to state.db)
+    python3 brain.py reels             # every finished reel + its gate verdict (pass/held/unchecked)
     python3 brain.py --selfcheck       # offline: prove the report aggregates correctly
 
 Mother-brain seam (defined, NOT wired — YAGNI until the central brain exists):
@@ -25,6 +26,7 @@ Mother-brain seam (defined, NOT wired — YAGNI until the central brain exists):
   directive(cmd)  -> the COMMAND port; stubbed to read-only ops. Wire a transport
                      here when there's something on the other end. Contract: BRAIN.md.
 """
+import glob
 import json
 import os
 import re
@@ -38,6 +40,15 @@ from state import State      # noqa: E402
 import qc                    # noqa: E402
 
 PROJECTS = os.path.join(ROOT, "projects")
+
+
+def _final(project_dir: str):
+    """Newest finished cut in a project dir — `final.mp4` from the runner/stitch path or
+    `final_veo.mp4` from the craft path — or None. Same rule qc.Reel uses, so the brain and
+    the gate never disagree about what 'the reel' is (a runner-built reel used to be invisible)."""
+    found = [os.path.join(project_dir, f) for f in qc.Reel.FINALS
+             if os.path.exists(os.path.join(project_dir, f))]
+    return max(found, key=os.path.getmtime) if found else None
 
 # pattern-mining thresholds: how many times a failure must recur before the brain proposes a rule
 WALL_MIN = 3     # same (site, wall-kind) this many times -> candidate lesson
@@ -61,8 +72,11 @@ class LocalBrain:
         self.st.learn_lesson(**kw)
 
     def review(self, project: str):
-        """Judgment: run the craft gate on a reel dir (delegates to qc.run)."""
+        """Judgment: run the craft gate on a reel dir (delegates to qc.run; the verdict is
+        saved to state.db so HELD stays visible in report() / `reels`)."""
         d = project if os.path.isdir(project) else os.path.join(PROJECTS, project)
+        if not os.path.isdir(d):
+            raise SystemExit(f"no such project: {d}")
         return qc.run(d, st=self.st)
 
     # ---- the self-report: read port for a human AND the future mother brain ----
@@ -71,9 +85,12 @@ class LocalBrain:
         work = {r["status"]: r["n"]
                 for r in db.execute("SELECT status, COUNT(*) n FROM jobs GROUP BY status")}
         budget, depleted, cooling = [], [], []
-        for c in db.execute("SELECT site,account,remaining,resets_at FROM credits"):
+        for c in db.execute("SELECT site,account,remaining,resets_at,updated,source FROM credits"):
             cd = self.st.cooldown_left(c["site"], c["account"], now)
-            it = {"site": c["site"], "account": c["account"], "remaining": c["remaining"]}
+            it = {"site": c["site"], "account": c["account"], "remaining": c["remaining"],
+                  "source": c["source"] or "manual"}
+            if it["source"] == "observed":
+                it["read_ago_min"] = round((now - c["updated"]) / 60)   # age of the live read
             if cd > 0:
                 cooling.append({**it, "cooldown_min": round(cd / 60, 1)})
             elif c["remaining"] > 0 or (c["resets_at"] and c["resets_at"] <= now):
@@ -84,14 +101,44 @@ class LocalBrain:
         gating = sum(1 for l in cl if l["severity"] in ("block", "publish-gate"))
         reels = db.execute("SELECT COUNT(*) n FROM reel_identity").fetchone()["n"]
         pending = len(self.st.candidates(status="pending"))
-        finals = [p for p in sorted(os.listdir(PROJECTS))
-                  if os.path.exists(os.path.join(PROJECTS, p, "final_veo.mp4"))] \
-            if os.path.isdir(PROJECTS) else []
+        # finished reels = either final name, each with its persisted craft-gate verdict
+        qcs = {q["project"]: q for q in self.st.qc_verdicts()}
+        out = []
+        if os.path.isdir(PROJECTS):
+            for p in sorted(os.listdir(PROJECTS)):
+                fin = _final(os.path.join(PROJECTS, p))
+                if not fin:
+                    continue
+                q = qcs.get(p)
+                out.append({"project": p, "final": os.path.relpath(fin, ROOT),
+                            "qc": ("pass" if q and q["ok"] else "held" if q else "unchecked"),
+                            "block": q["block_n"] if q else 0,
+                            "gate": q["gate_n"] if q else 0})
+        held = [x["project"] for x in out if x["qc"] == "held"]
         needs = []
         if work.get("failed"):
             needs.append(f"{work['failed']} job(s) failed — inspect last_error")
         if (work.get("queued") or self.st.resume()) and not budget:
             needs.append("work pending but every source is depleted or cooling — wait for reset / re-login")
+        # A reel is locked to ONE source (one look), so if that source is dry or cooling the reel
+        # WAITS — correctly. But when other sites still have credit the check above stays quiet and
+        # the reel stalls with no way to notice. Name the reel and the source it is waiting on.
+        stuck = []
+        for r in db.execute("SELECT DISTINCT project FROM jobs "
+                            "WHERE status IN ('queued','submitting','rendering','downloading')"):
+            site = self.st.project_site(r["project"])
+            if not site:
+                continue                       # not shot yet — free to start anywhere
+            ok = any(c["remaining"] > 0 and self.st.cooldown_left(site, c["account"], now) <= 0
+                     for c in db.execute("SELECT account,remaining FROM credits WHERE site=?", (site,)))
+            if not ok:
+                stuck.append(f"{r['project']} (locked to {site})")
+        if stuck:
+            needs.append("reel(s) waiting on their one source — top it up or re-login: "
+                         + ", ".join(stuck))
+        if held:
+            needs.append(f"{len(held)} finished reel(s) HELD by the craft gate — "
+                         f"brain.py review <project>: {', '.join(held)}")
         if pending:
             needs.append(f"{pending} proposed lesson(s) await review — brain.py candidates")
         return {
@@ -101,7 +148,7 @@ class LocalBrain:
             "budget_now": budget, "depleted": depleted, "cooling": cooling,
             "knowledge": {"craft_lessons": len(cl), "gating": gating,
                           "reels_fingerprinted": reels, "candidates_pending": pending},
-            "deliverables": finals, "needs": needs,
+            "deliverables": [x["project"] for x in out], "reels": out, "needs": needs,
         }
 
     # ---- mother-brain COMMAND port (defined, not wired) ----
@@ -177,6 +224,102 @@ class LocalBrain:
         """The brain's episodic memory: the most recent distilled session notes."""
         rows = [e for e in self.st.events(limit=5000) if e["kind"] == "session"]
         return rows[-limit:]
+
+    # ---- the continuous self-learning loop: every finished output TEACHES the brain --------
+    #
+    # The owner taught "captions / VO / moral / score / one style" several times and the brain
+    # still shipped reels without them, because knowing a rule and ENFORCING it were different
+    # systems. This closes that loop: after every generation the brain re-audits the artifact it
+    # just produced, writes what it actually did into durable state, and files a candidate when
+    # the reel is missing a layer it has been told to ship. Continuous, not a one-time fix.
+
+    def _layers(self, project_dir):
+        """What craft layers this reel actually SHIPS, measured from the artifacts on disk —
+        not from what the project claims. A card that exists but sits in the IG UI zone counts
+        as present here (the safe-area gate owns that) — this asks 'did we even build it?'."""
+        d = os.path.abspath(project_dir)
+        name = os.path.basename(d.rstrip("/"))
+        # Narration is NOT a folder any more. The house rule (WAVELENGTH.md §3) is that speech is
+        # spoken inside the generated scenes, so the evidence is the source clips' own audio — a
+        # `vo/` dir is not evidence of anything. This is the same measurement qc.craft-layers makes.
+        clips = sorted(glob.glob(os.path.join(qc._CLIPS_ROOT, name, "clip_*.mp4")))
+        return {
+            "captions": sorted(os.path.basename(p) for p in glob.glob(os.path.join(d, "caption_*.png"))),
+            "narration": [os.path.basename(c) for c in clips if qc._has_audio(c)],
+            "clips": len(clips),
+            "score": bool(glob.glob(os.path.join(d, "music_raw.mp3"))),
+            "moral": bool(glob.glob(os.path.join(d, "*moral*.png"))),
+            "identity": bool(glob.glob(os.path.join(d, "identity.json"))),
+        }
+
+    _LAYER_RULES = {
+        "identity": ("reel-needs-identity",
+                     "Every reel carries its own art direction (identity.json) — opener, type, "
+                     "quote, structure — and it must not repeat a shipped reel's look",
+                     "a reel with no identity drifts back to the house default look, and two "
+                     "reels that share a fingerprint are the same film twice"),
+        "narration": ("reel-needs-narration",
+                      "The recurring character SPEAKS inside the generated scenes — no narration "
+                      "laid over the top at assembly",
+                      "the owner's rule: the clip's own voice is the narration, so lip and line "
+                      "agree; a track added afterwards is the thing that was banned"),
+        "moral": ("reel-needs-moral",
+                  "Every reel lands a moral card — the takeaway is what earns shares and comments",
+                  "a story without a stated moral gets scrolled past; the moral IS the viral beat"),
+        "score": ("reel-needs-score",
+                  "Every reel carries a background score that fits its essence, ducked under the "
+                  "clips' own audio",
+                  "silent footage feels amateur on a phone; the bed carries the emotion — "
+                  "automation/music.py measures the fit rather than guessing from a filename"),
+    }
+
+    def absorb(self, project: str) -> dict:
+        """Called after EVERY generation (a stitched final, a craft-path build). Audits the
+        artifact, records what actually shipped, and files a candidate for any layer the brain
+        has been told to include but that is missing. Fail-open: never breaks a build."""
+        d = project if os.path.isdir(project) else os.path.join(PROJECTS, project)
+        if not os.path.isdir(d):
+            return {"ok": False, "reason": "no such project"}
+        name = os.path.basename(d.rstrip("/"))
+        try:
+            lay = self._layers(d)
+            reel = qc.Reel(d)
+            final = reel.final
+            # the facts of this generation, durable — so the brain remembers what it shipped
+            fact = {"when": time.strftime("%Y-%m-%d %H:%M"), "reel": name, "layers": lay,
+                    "final": os.path.basename(final) if final else None,
+                    "qc": (self.st.qc_verdicts(name)[0]["ok"] if self.st.qc_verdicts(name) else None)}
+            self.st.log_event("generation", json.dumps(fact, ensure_ascii=False))
+            filed = []
+            for key, (slug, title, why) in self._LAYER_RULES.items():
+                if key == "narration":
+                    # clips swept after publish means there is nothing to inspect. qc's
+                    # craft-layers makes the same call, and without it every old reel would
+                    # become a permanent gap the day its clips were cleaned up.
+                    present = bool(lay["narration"]) or not lay["clips"]
+                else:
+                    present = lay[key] if isinstance(lay[key], list) else bool(lay[key])
+                if present:
+                    continue
+                # missing layer the owner has already asked for -> file it as a candidate with
+                # this reel as the evidence, so the pattern is visible and promotable
+                ev = f"reel '{name}' shipped with no {key} (generation {fact['when']})"
+                self.st.propose_lesson(slug, title=title, why=why, evidence=ev)
+                filed.append(slug)
+            if not lay["captions"]:
+                ev = f"reel '{name}' shipped with no caption cards"
+                self.st.propose_lesson("reel-needs-captions",
+                                       title="Every reel ships on-screen captions/headings",
+                                       why="a reel with no on-screen text is unreadable muted "
+                                           "and unreachable for the algorithm",
+                                       evidence=ev)
+                filed.append("reel-needs-captions")
+            out = {"ok": True, "reel": name, "learned": filed}
+            if filed:
+                out["note"] = f"{len(filed)} layer gap(s) filed as candidates"
+            return out
+        except Exception as e:                        # fail-open: a build never dies on bookkeeping
+            return {"ok": False, "error": str(e)[:120]}
 
     # ---- pattern mining: PROPOSE craft lessons from recurring failures. Owner-vetted: a
     # candidate never enters the QC gate until promote() copies an accepted one into craft_lessons. ----
@@ -283,8 +426,8 @@ class LocalBrain:
                 continue
             if txt:
                 turns.append(f"{role.upper()}: {txt[:1600]}")
-        self._cursor(sess, len(lines))
         if not turns:
+            self._cursor(sess, len(lines))      # nothing new to distill — safe to skip ahead
             return {"new": 0}
         existing = ", ".join(l["slug"] for l in self.st.craft_lessons())
         sys_p = (
@@ -301,7 +444,10 @@ class LocalBrain:
                                   {"role": "user", "content": "\n".join(turns[-14:])}],
                                  max_tokens=1200, temperature=0)
         except Exception as e:
+            # cursor NOT advanced: those turns were never distilled, so the next Stop hook
+            # retries them. Fail-open must not become lose-the-lesson (gateways do go down).
             return {"new": len(turns), "error": str(e)[:80]}
+        self._cursor(sess, len(lines))          # the model answered — these turns are spent
         lessons = []
         i, j = txt.find("{"), txt.rfind("}")       # robust: tolerate preamble / truncation
         if i != -1 and j > i:
@@ -322,23 +468,39 @@ class LocalBrain:
 
 
 def _print(r: dict):
+    def src(b):                                 # how fresh is this credit number?
+        if b.get("source") != "observed":
+            return ", manual"                   # entered at signup, never seen on the site
+        age = b.get("read_ago_min")
+        return f", read {age}m ago" if age is not None else ""
+
     print(f"[brain] {r['brain']}  —  {'HEALTHY' if r['healthy'] else 'NEEDS ATTENTION'}")
     print(f"  work:    {r['work'] or 'none'}   (mid-flight to resume: {r['resume_backlog']})")
     print(f"  sources: {len(r['budget_now'])} ready · {len(r['depleted'])} depleted · {len(r['cooling'])} cooling")
     for b in r["budget_now"]:
-        print(f"             ready  {b['site']}/{b['account']}  ({b['remaining']} cr)")
+        print(f"             ready  {b['site']}/{b['account']}  ({b['remaining']} cr{src(b)})")
     for b in r["cooling"]:
-        print(f"             cool   {b['site']}/{b['account']}  ({b['cooldown_min']}m left)")
+        print(f"             cool   {b['site']}/{b['account']}  ({b['cooldown_min']}m left{src(b)})")
     k = r["knowledge"]
     print(f"  learned: {k['craft_lessons']} craft lessons ({k['gating']} gating) · "
           f"{k['reels_fingerprinted']} reels fingerprinted · {k.get('candidates_pending', 0)} proposed")
-    print(f"  reels:   {', '.join(r['deliverables']) or 'none built'}")
+    print("  reels:   " + (", ".join(f"{x['project']}[{x['qc']}]" for x in r.get("reels", []))
+                          or "none built"))
     for n in r["needs"]:
         print(f"  NEEDS:   {n}")
 
 
 def _selfcheck():
+    global PROJECTS
     import tempfile
+    # hermetic: point the report at an empty temp projects dir so assertions don't depend on
+    # whatever reels (or leftover test dirs) happen to be in the workspace.
+    PROJECTS = os.path.join(tempfile.mkdtemp(), "projects")
+    os.makedirs(PROJECTS)
+    # ...and the clips library too: absorb() now reads narration out of the SOURCE CLIPS, so a
+    # fixture that wrote them under the real clips/ would pollute the live library.
+    qc._CLIPS_ROOT = os.path.join(tempfile.mkdtemp(), "clips")
+    os.makedirs(qc._CLIPS_ROOT)
     st = State(os.path.join(tempfile.mkdtemp(), "t.db"))
     b = LocalBrain(st=st)
     r = b.report()
@@ -351,6 +513,24 @@ def _selfcheck():
     assert not r["healthy"], "queued work + no source => needs attention"
     st.set_credits("flow", "a1", remaining=5)                 # now a source is ready
     assert LocalBrain(st=st).report()["healthy"], "ready source clears the flag"
+    # credit numbers say WHERE they came from: manual until a run observes the real one
+    f = next(x for x in LocalBrain(st=st).report()["budget_now"] if x["site"] == "flow")
+    assert f["source"] == "manual", "a hand-entered balance must be labelled manual"
+    st.observe_credits("flow", "a1", 7)
+    f = next(x for x in LocalBrain(st=st).report()["budget_now"] if x["site"] == "flow")
+    assert f["source"] == "observed" and f["remaining"] == 7 and f["read_ago_min"] == 0, f
+    # ONE SOURCE: a reel locks to the site its first clip came from, so a dry lock makes it WAIT
+    # by design. Because OTHER sites still have credit, the generic "every source depleted" flag
+    # stays quiet — the reel would stall forever behind a healthy-looking report. Name it.
+    _lk = st.add_job("locked", 0, "clip one")
+    st.set_status(_lk, "done", site="krea", video_path="/tmp/one.mp4")
+    st.add_job("locked", 1, "clip two")
+    st.set_credits("krea", "a1", remaining=0)
+    rep = b.report()
+    assert any("waiting on their one source" in n and "locked" in n for n in rep["needs"]), rep["needs"]
+    assert not rep["healthy"], "a stalled reel is not a healthy brain"
+    st.set_credits("krea", "a1", remaining=4)
+    assert not any("locked" in n for n in b.report()["needs"]), "topping up the source clears it"
     b.learn(slug="demo-rule", title="t", tier="judgment", severity="warn")
     assert b.report()["knowledge"]["craft_lessons"] == 1
     assert b.directive({"op": "report"})["brain"] == LocalBrain.name
@@ -360,7 +540,7 @@ def _selfcheck():
         pass
     # sensing + reflect: events accrue, reflect distills them into one episodic note
     b.observe({"tool_name": "Edit", "session_id": "S",
-               "tool_input": {"file_path": os.path.join(PROJECTS, "demo", "build.py")}})
+               "tool_input": {"file_path": os.path.join(ROOT, "projects", "demo", "build.py")}})
     b.observe({"tool_name": "Bash", "session_id": "S", "tool_input": {"command": "python3 assemble.py"}})
     r = b.reflect({"session_id": "S"})
     assert r["events"] == 2 and "demo" in r["projects"], r
@@ -385,6 +565,7 @@ def _selfcheck():
     assert any(c["slug"].startswith("cmdfail-") for c in st.candidates()), "the fail candidate is pending"
     # autonomous conversation harvest: new transcript turns -> LLM -> craft lesson self-written
     import tempfile as _tf
+    import subprocess
     import agents as _ag
     _orig_chat = _ag.chat
     tdir = _tf.mkdtemp()
@@ -399,13 +580,110 @@ def _selfcheck():
         assert "blend-captions" in r.get("learned", []), r
         assert any(l["slug"] == "blend-captions" for l in st.craft_lessons()), "harvested lesson is written"
         assert b.harvest({"transcript_path": tp, "session_id": "H"})["new"] == 0, "cursor skips already-seen turns"
+        # a gateway failure must NOT burn those turns: cursor stays put, the next hook retries
+        _ag.chat = lambda msgs, **k: (_ for _ in ()).throw(RuntimeError("gateway down"))
+        err = b.harvest({"transcript_path": tp, "session_id": "H2"})
+        assert "error" in err, err
+        _ag.chat = lambda msgs, **k: ('{"lessons":[{"slug":"retry-lesson",'
+                                      '"title":"Retry works","why":"cursor held on failure"}]}', "stub")
+        ok = b.harvest({"transcript_path": tp, "session_id": "H2"})
+        assert ok.get("new") == 1 and "retry-lesson" in ok.get("learned", []), \
+            f"a failed harvest must be retried, not skipped: {ok}"
     finally:
         _ag.chat = _orig_chat
+    # report() sees BOTH final names; a persisted HELD verdict becomes a need
+    os.makedirs(os.path.join(PROJECTS, "reel-a"))
+    open(os.path.join(PROJECTS, "reel-a", "final.mp4"), "wb").write(b"x")
+    r = b.report()
+    assert [x["project"] for x in r["reels"]] == ["reel-a"] and r["deliverables"] == ["reel-a"], r["reels"]
+    assert r["reels"][0]["qc"] == "unchecked", "a never-gated reel is 'unchecked', not HELD"
+    assert not any("HELD" in n for n in r["needs"]), r["needs"]
+    st.record_qc("reel-a", {"ok": False, "block": ["no audio"], "gate": [],
+                            "warn": [], "checklist": []})
+    r = b.report()
+    assert r["reels"][0]["qc"] == "held" and r["reels"][0]["block"] == 1, r["reels"]
+    assert any("HELD by the craft gate" in n for n in r["needs"]), r["needs"]
+    os.makedirs(os.path.join(PROJECTS, "reel-b"))
+    open(os.path.join(PROJECTS, "reel-b", "final_veo.mp4"), "wb").write(b"x")
+    assert set(b.report()["deliverables"]) == {"reel-a", "reel-b"}, \
+        "both final names (runner + craft path) are deliverables"
+    try:
+        b.review("no-such-reel"); assert False, "reviewing a missing project must fail loudly"
+    except SystemExit:
+        pass
+    # the exact user-facing path: `brain.py review <dir>` -> qc.run -> verdict persisted
+    qc.seed(st)                       # a fresh brain carries the canonical auto checks
+    d = os.path.join(PROJECTS, "reel-c")
+    os.makedirs(d)
+    open(os.path.join(d, "final.mp4"), "wb").write(b"not a real video")
+    v = b.review(d)
+    assert not v["ok"] and any("frozen still" in x for x in v["block"]), v["block"]
+    q = st.qc_verdicts("reel-c")
+    assert q and q[0]["ok"] == 0, "review persists its verdict to state.db"
+    rc = next(x for x in b.report()["reels"] if x["project"] == "reel-c")
+    assert rc["qc"] == "held" and rc["block"] >= 1, rc
+
+    # ---- the continuous self-learning loop: absorb() audits what a reel actually SHIPPED ----
+    bare = os.path.join(PROJECTS, "reel-bare")
+    os.makedirs(bare, exist_ok=True)
+    open(os.path.join(bare, "final.mp4"), "wb").write(b"x")          # a reel with NO craft
+    r = b.absorb(bare)
+    # narration is the one layer that CANNOT be judged from a reel with no clips on disk — the
+    # measurement lives in the clips, so a clip-less project is not evidence of a narration gap
+    assert r["ok"] and set(r["learned"]) == {"reel-needs-captions", "reel-needs-identity",
+                                             "reel-needs-moral", "reel-needs-score"}, r
+    pend = {c["slug"] for c in st.candidates(status="pending")}
+    assert {"reel-needs-captions", "reel-needs-identity", "reel-needs-moral",
+            "reel-needs-score"} <= pend, f"each gap must be filed as evidence: {pend}"
+    gen = [e for e in st.events(limit=2000) if e["kind"] == "generation"]
+    assert gen and "reel-bare" in gen[-1]["detail"], "each generation is written to memory"
+    # a reel that ships EVERY layer must file nothing — the loop must be quiet when there's no gap
+    full = os.path.join(PROJECTS, "reel-full")
+    os.makedirs(full, exist_ok=True)
+    open(os.path.join(full, "final.mp4"), "wb").write(b"x")
+    for _f in ("caption_hook.png", "caption_moral.png", "caption_cta.png", "music_raw.mp3"):
+        open(os.path.join(full, _f), "wb").write(b"x")
+    # identity.json is READ (Reel parses it), so the fixture has to be real JSON, not a stub byte
+    json.dump({"opener": "a held breath", "font": "rounded", "quote": "Kabir",
+               "structure": "bookend"}, open(os.path.join(full, "identity.json"), "w"))
+    # narration now lives in the CLIPS, so the fixture needs clips that carry audio — a vo/ dir
+    # would no longer prove anything, which is exactly the correction this loop absorbed
+    _fullclips = os.path.join(qc._CLIPS_ROOT, "reel-full")
+    os.makedirs(_fullclips, exist_ok=True)
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=3",
+                    "-f", "lavfi", "-i", "sine=frequency=440:d=3", "-pix_fmt", "yuv420p",
+                    "-shortest", os.path.join(_fullclips, "clip_000.mp4")],
+                   check=True, capture_output=True)
+    r2 = b.absorb(full)
+    assert r2["ok"] and r2["learned"] == [], f"a complete reel must file nothing: {r2}"
+    # ...but the SAME reel with silent clips is a real gap: the scenes ship no speech at all
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=3",
+                    "-pix_fmt", "yuv420p", os.path.join(_fullclips, "clip_000.mp4")],
+                   check=True, capture_output=True)
+    assert b.absorb(full)["learned"] == ["reel-needs-narration"], \
+        "clips that carry no audio are a narration gap, not a pass"
+    assert not b.absorb(os.path.join(PROJECTS, "no-such-reel"))["ok"], \
+        "absorbing a missing project must fail open, not raise"
+    print("OK: absorb() audits every generation, files each missing craft layer as evidence, "
+          "stays quiet when complete, and fails open")
+
+    # the owner's corrections must be teachable from the CLI and land in the enforced lesson set
+    b.learn(slug="cli-learned-rule", title="A rule taught from the CLI",
+            why="argv slicing must not swallow the slug", tier="judgment", severity="block",
+            source="selfcheck")
+    assert any(l["slug"] == "cli-learned-rule" for l in st.craft_lessons()), \
+        "brain.learn() must reach the durable lesson set"
+    print("OK: brain learn() records an owner correction into the enforced craft lessons")
+
     st.close()
     print("OK: report aggregates work/budget/knowledge; needs-flags fire; directive is read-only")
+    print("OK: credit numbers are labelled manual vs observed with their read age")
     print("OK: observe senses events, reflect distills them into a session note (owner-vetted)")
     print("OK: propose mines walls + job + in-session failures -> candidates; promote gates them in")
     print("OK: harvest self-writes craft lessons from new conversation turns (no approval, advisory)")
+    print("OK: failed harvest keeps its cursor (retried); both final names reported; HELD is a need")
+    print("OK: brain review runs the gate, persists HELD, and report() surfaces it")
+
 
 
 def _stdin_json() -> dict:
@@ -446,9 +724,59 @@ def main(argv):
     try:
         if cmd == "review" and len(argv) >= 2:
             qc._report(b.review(argv[1]))
+        elif cmd == "absorb" and len(argv) >= 2:
+            r = b.absorb(argv[1])
+            if not r.get("ok"):
+                print(f"absorb skipped: {r.get('reason') or r.get('error')}")
+            else:
+                lay = b._layers(argv[1])
+                print(f"absorbed '{r['reel']}': captions={len(lay['captions'])} "
+                      f"narration={len(lay['narration'])}/{lay['clips']} clips "
+                      f"moral={lay['moral']} score={lay['score']} identity={lay['identity']}")
+                if r["learned"]:
+                    print(f"  filed {len(r['learned'])} gap(s) as candidates: "
+                          + ", ".join(r["learned"]))
+                else:
+                    print("  every craft layer present — nothing to file")
+        elif cmd == "generations":
+            evs = [e for e in b.st.events(limit=5000) if e["kind"] == "generation"]
+            for e in evs[-20:]:
+                try:
+                    f = json.loads(e["detail"])
+                    lay = f["layers"]
+                    print(f"  {f['when']}  {f.get('reel', '?')}  {f['final']}  "
+                          f"captions={len(lay['captions'])} "
+                          f"narration={len(lay.get('narration') or [])}/"
+                          f"{lay.get('clips', '?')} clips "
+                          f"moral={lay['moral']} score={lay['score']} "
+                          f"identity={lay.get('identity', '?')}")
+                except Exception:
+                    print("  (unparsed)", (e["detail"] or "")[:120])
+            print(f"  {len(evs)} generation(s) absorbed into memory")
+        elif cmd == "learn" and len(argv) >= 3:
+            import argparse
+            ap = argparse.ArgumentParser(prog="brain.py learn")
+            ap.add_argument("slug"); ap.add_argument("title")
+            ap.add_argument("--why", default=None); ap.add_argument("--tier", default="judgment")
+            ap.add_argument("--check", default=None)
+            ap.add_argument("--severity", default="block")
+            ap.add_argument("--source", default="owner-cli")
+            # argv[0] is the verb itself, so the flags+positionals start at argv[1:]
+            # (argv[2:] silently dropped the slug and argparse blamed the title)
+            a = ap.parse_args(argv[1:])
+            b.learn(slug=a.slug, title=a.title, why=a.why, tier=a.tier, check_id=a.check,
+                    severity=a.severity, source=a.source)
+            print(f"learned '{a.slug}' ({a.tier}/{a.severity}) -> enforced by the QC gate")
         elif cmd == "sessions":
             for s in b.sessions():
                 print(time.strftime("%Y-%m-%d %H:%M", time.localtime(s["ts"])), "·", (s["detail"] or "")[:300])
+        elif cmd == "reels":
+            out = b.report()["reels"]
+            for x in out:
+                note = {"pass": "gate PASS", "held": f"HELD ({x['block']} block, {x['gate']} gate)",
+                        "unchecked": "not gated yet — brain.py review " + x["project"]}[x["qc"]]
+                print(f"  {x['project']}: {x['final']} — {note}")
+            print(f"  {len(out)} finished reel(s)")
         elif cmd == "candidates":
             pend = b.st.candidates(status="pending")
             for c in pend:

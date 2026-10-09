@@ -1,0 +1,15 @@
+# Python deps for AI Video Gen Lab.
+#   pip install -r requirements.txt && python3 -m playwright install chromium
+# Everything else (agents.py, brain.py, stitch glue) is stdlib-only.
+#
+# NOTE: these must land in the interpreter you actually run the project with.
+# Check with:  python3 -c "import playwright, PIL, numpy, browser_cookie3"
+playwright        # browser driver — automation/browser.py
+pillow            # caption PNGs + the qc caption safe-area check
+numpy             # qc caption safe-area alpha scan
+browser-cookie3   # automation/import_login.py: read-only cookie import from real Chrome
+
+# Not pip-installable (must be on PATH):
+#   ffmpeg / ffprobe  — stitch.py + every qc media check
+#   node              — automation/test_brain_plugin.mjs (opencode plugin test)
+#   chromium          — python3 -m playwright install chromium

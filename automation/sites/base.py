@@ -18,7 +18,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from vision import read_state, find_control, STATES  # noqa: E402  (shared perception + self-heal)
+from vision import read_state, find_control, read_credits as _credits_from_png, STATES  # noqa: E402
 
 
 class Wall(Exception):
@@ -50,6 +50,17 @@ class SiteAdapter:
 
     def download(self, session, dest: str) -> str:
         return session.wait_download(self.download_sel, dest)
+
+    # ---- live balance: read THIS account's credits off the page we're already on, so the
+    # scheduler and brain.report work from observed numbers instead of hand-entered ones.
+    # Default = one vision call (works on any site, nothing per-site to drift); an adapter
+    # with a stable balance selector can override it. None = 'not clear' and the caller keeps
+    # the last known number — an unknown balance never overwrites a known one. ----
+    def read_credits(self, session):
+        try:
+            return _credits_from_png(session.screenshot())
+        except Exception:
+            return None
 
     def _guard(self, session):
         """Vision check for a wall before we spend effort. Raise Wall if blocked."""
@@ -141,6 +152,21 @@ if __name__ == "__main__":
         globals()["find_control"] = lambda png, cands, what: None
         assert ad.click_or_heal(_Sess(), lambda: False, "absent") is False, "no control found -> False (caller walls)"
         print("OK: click_or_heal uses fast path, else self-heals via vision and clicks the coords")
+
+        # live balance: the vision default passes a number through and fails open on anything else
+        _orig_c = globals()["_credits_from_png"]
+        try:
+            globals()["_credits_from_png"] = lambda png: 42
+            assert ad.read_credits(_Sess()) == 42, "observed balance passes through"
+            globals()["_credits_from_png"] = lambda png: None
+            assert ad.read_credits(_Sess()) is None, "unclear page -> None (keep the last known)"
+            def _down(png):
+                raise RuntimeError("gateway down")
+            globals()["_credits_from_png"] = _down
+            assert ad.read_credits(_Sess()) is None, "fails open, never raises into a job"
+        finally:
+            globals()["_credits_from_png"] = _orig_c
+        print("OK: read_credits observes the page balance and fails open to None")
     finally:
         globals()["find_control"] = _orig
 

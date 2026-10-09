@@ -16,3 +16,10 @@ automation/.harvest_cursors.json
 automation/.brain_state.json
 automation/.brain_transcripts/
 automation/.brain_hook.log
+
+# music cache + download scratch (the library itself IS committed — it is the archive of record)
+music/.analysis.json
+music/.candidates/
+
+# freebuff tool scratch (unreferenced)
+.freebuff/

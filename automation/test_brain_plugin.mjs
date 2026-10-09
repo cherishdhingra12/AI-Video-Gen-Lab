@@ -26,6 +26,14 @@ fs.cpSync(path.join(SRC, "automation"), path.join(T, "automation"), {
 
 // the project has no package.json, so a bare `.js` import would be parsed as CommonJS by Node.
 // Copy to .mjs (unambiguously ESM) — opencode's own loader transpiles the real file.
+// harvest() calls agents.chat to distill lessons; the real agents.py needs the root .env +
+// live gateways, which this sandbox doesn't copy. Stub it so the harness stays offline while
+// still exercising the real path: session.idle -> JSONL export -> harvest -> cursor advance.
+// (Without a stub, agents import fails and harvest deliberately does NOT move its cursor —
+// a failed distill must be retried, never skipped.)
+fs.writeFileSync(path.join(T, "agents.py"),
+  'def chat(messages, **kw):\n    return \'{"lessons":[]}\', "stub"\n')
+
 const plug = path.join(T, "brain.mjs")
 fs.copyFileSync(path.join(SRC, ".opencode/plugins/brain.js"), plug)
 const plugin = (await import(plug)).default

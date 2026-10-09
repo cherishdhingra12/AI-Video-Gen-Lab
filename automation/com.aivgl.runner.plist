@@ -8,6 +8,11 @@
   5-min RunAtLoad+StartInterval combo means "keep the fleet moving whenever the Mac
   is on", which is exactly the always-on-but-crash-safe behavior asked for.
 
+  NOTE: NOT INSTALLED and not part of the workflow — this project runs ON DEMAND
+  (you ask for a reel, you run pipeline.py + runner.py). Kept only as a reference
+  for anyone who later wants a daemon; the resume/crash-safety behavior does not
+  depend on it (it lives in state.db).
+
   Install (paths are already absolute for this machine):
     cp automation/com.aivgl.runner.plist ~/Library/LaunchAgents/
     launchctl load  ~/Library/LaunchAgents/com.aivgl.runner.plist

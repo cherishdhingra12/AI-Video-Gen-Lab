@@ -22,6 +22,7 @@ WAL mode + one connection = a power-cut mid-write can't corrupt the file
     for j in st.resume(): ...         # rows stuck mid-flight after a restart
 """
 
+import json
 import os
 import sqlite3
 import time
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS credits (
   remaining INTEGER NOT NULL DEFAULT 0,
   resets_at REAL NOT NULL DEFAULT 0, -- epoch; past = refill is due
   updated REAL NOT NULL,
+  source  TEXT NOT NULL DEFAULT 'manual', -- 'manual' (entered at login) | 'observed' (read off the site)
   PRIMARY KEY (site, account)
 );
 CREATE TABLE IF NOT EXISTS lessons (
@@ -90,6 +92,14 @@ CREATE TABLE IF NOT EXISTS brain_log (
   detail  TEXT,                           -- concise what-happened
   processed INTEGER NOT NULL DEFAULT 0     -- 1 once reflect() has distilled it
 );
+CREATE TABLE IF NOT EXISTS reel_qc (
+  project TEXT PRIMARY KEY,       -- project dir name (a reel)
+  ok      INTEGER NOT NULL,       -- 1 = gate PASS, 0 = HELD (block/gate items)
+  block_n INTEGER NOT NULL,
+  gate_n  INTEGER NOT NULL,
+  verdict TEXT NOT NULL,          -- json: the actual block/gate/warn/checklist lines
+  checked REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS candidate_lessons (
   id INTEGER PRIMARY KEY,
   slug     TEXT NOT NULL UNIQUE,
@@ -122,6 +132,13 @@ class State:
                 self.db.execute("PRAGMA journal_mode=WAL")     # survive a mid-write crash
                 self.db.execute("PRAGMA synchronous=NORMAL")
                 self.db.executescript(_SCHEMA)
+                # migration for brains created before credits.source existed
+                try:
+                    self.db.execute("ALTER TABLE credits ADD COLUMN source TEXT "
+                                    "NOT NULL DEFAULT 'manual'")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise            # a lock goes back to the retry loop above
                 self.db.commit()
                 return
             except sqlite3.OperationalError as e:
@@ -132,12 +149,16 @@ class State:
         raise last
 
     # ---- jobs ----
-    def add_job(self, project: str, idx: int, prompt: str, first_png: str = None) -> int:
+    def add_job(self, project: str, idx: int, prompt: str, first_png: str = None,
+                site: str = None) -> int:
         cur = self.db.execute(
-            "INSERT OR IGNORE INTO jobs(project,idx,prompt,first_png,updated) "
-            "VALUES(?,?,?,?,?)", (project, idx, prompt, first_png, time.time()))
+            "INSERT OR IGNORE INTO jobs(project,idx,prompt,first_png,site,updated) "
+            "VALUES(?,?,?,?,?,?)",
+            (project, idx, prompt, first_png, site, time.time()))
         self.db.commit()
-        if cur.lastrowid:
+        # rowcount, NOT lastrowid: on an IGNOREd insert lastrowid still holds the PREVIOUS
+        # successful insert (a dup of project A after project B returned B's id).
+        if cur.rowcount:
             return cur.lastrowid
         return self.db.execute(
             "SELECT id FROM jobs WHERE project=? AND idx=?", (project, idx)).fetchone()["id"]
@@ -158,6 +179,27 @@ class State:
         self.db.commit()
         return self.db.execute("SELECT retries FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
 
+    def requeue(self, project: str, idxs, prompt: str = None) -> list:
+        """Put already-done clips back on the queue so they re-render — used when a shipped
+        clip is REJECTED (e.g. it came back photoreal while the rest of the reel is 3-D).
+        A stale 'done' can never be re-shot by the runner, so re-queueing needs its own seam,
+        and it clears last_error/retries so the fresh attempt gets the full retry budget.
+        `prompt` rewrites the row's prompt (the hardened style-anchor version), so the queued
+        work carries the fix instead of the text that produced the defect."""
+        out = []
+        for idx in idxs:
+            r = self.db.execute("SELECT id FROM jobs WHERE project=? AND idx=?",
+                                (project, idx)).fetchone()
+            if not r:
+                raise SystemExit(f"no job for {project}#{idx}")
+            self.db.execute(
+                "UPDATE jobs SET status='queued', retries=0, last_error=NULL, updated=?"
+                + (", prompt=? " if prompt else " ") + "WHERE id=?",
+                ((time.time(), prompt, r["id"]) if prompt else (time.time(), r["id"])))
+            out.append(r["id"])
+        self.db.commit()
+        return out
+
     def resume(self) -> list:
         """Rows stuck mid-flight after a restart — re-drive these first."""
         q = ",".join("?" * len(LIVE))
@@ -176,13 +218,44 @@ class State:
         return self.db.execute(
             "SELECT * FROM jobs WHERE project=? ORDER BY idx", (project,)).fetchall()
 
+    def project_site(self, project: str) -> str:
+        """The ONE source a project is locked to, or None if it has not produced a clip yet.
+
+        Read off the clips that have actually come back, so it records where the reel's look
+        really came from rather than any intent. This is the standing rule: a reel is shot on a
+        single model, because mixing sites across scenes breaks character consistency — the one
+        thing the owner asked for — and no gate can see it (the style pre-flight only proves each
+        clip is 3-D, not that the six clips agree with each other)."""
+        row = self.db.execute(
+            "SELECT site FROM jobs WHERE project=? AND status='done' AND site IS NOT NULL "
+            "AND video_path IS NOT NULL ORDER BY idx LIMIT 1", (project,)).fetchone()
+        return row["site"] if row else None
+
     # ---- credits ----
-    def set_credits(self, site: str, account: str, remaining: int, resets_at: float = 0):
+    def set_credits(self, site: str, account: str, remaining: int, resets_at: float = 0,
+                    source: str = "manual"):
+        """Hand-entered balance (login/signup) — source='manual' so the report can say so
+        until a run observes the real number."""
         self.db.execute(
-            "INSERT INTO credits(site,account,remaining,resets_at,updated) VALUES(?,?,?,?,?) "
+            "INSERT INTO credits(site,account,remaining,resets_at,updated,source) VALUES(?,?,?,?,?,?) "
             "ON CONFLICT(site,account) DO UPDATE SET remaining=excluded.remaining, "
-            "resets_at=excluded.resets_at, updated=excluded.updated",
-            (site, account, remaining, resets_at, time.time()))
+            "resets_at=excluded.resets_at, source=excluded.source, updated=excluded.updated",
+            (site, account, remaining, resets_at, time.time(), source))
+        self.db.commit()
+
+    def observe_credits(self, site: str, account: str, remaining: int, observed_at: float = None):
+        """Balance READ OFF THE SITE (source='observed'): refreshes remaining + updated only.
+        Keeps the existing resets_at — a page read can't know the refill time — and never
+        downgrades the source back to 'manual'. Callers validate the number first."""
+        if remaining < 0:
+            raise ValueError(f"observed balance must be >= 0, got {remaining}")
+        now = observed_at or time.time()
+        self.db.execute(
+            "INSERT INTO credits(site,account,remaining,resets_at,updated,source) "
+            "VALUES(?,?,?,0,?,'observed') "
+            "ON CONFLICT(site,account) DO UPDATE SET remaining=excluded.remaining, "
+            "updated=excluded.updated, source='observed'",
+            (site, account, remaining, now))
         self.db.commit()
 
     def spend_credit(self, site: str, account: str, n: int = 1):
@@ -299,6 +372,29 @@ class State:
             "UPDATE brain_log SET processed=1 WHERE session=? AND kind!='session'", (session,))
         self.db.commit()
 
+    # ---- craft-gate verdicts: qc.run() writes the verdict HERE so a HELD reel is durable state,
+    # not a printout — brain.report() and `brain.py reels` read it back. ----
+    def record_qc(self, project: str, verdict: dict):
+        """Persist one craft-gate run: pass/fail + the actual problems, keyed by project."""
+        self.db.execute(
+            "INSERT INTO reel_qc(project,ok,block_n,gate_n,verdict,checked) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(project) DO UPDATE SET ok=excluded.ok, block_n=excluded.block_n, "
+            "gate_n=excluded.gate_n, verdict=excluded.verdict, checked=excluded.checked",
+            (project, 1 if verdict.get("ok") else 0, len(verdict.get("block", [])),
+             len(verdict.get("gate", [])),
+             json.dumps({k: verdict.get(k) for k in ("ok", "block", "gate", "warn")}
+                        | {"checklist": len(verdict.get("checklist", []))},
+                        ensure_ascii=False),
+             time.time()))
+        self.db.commit()
+
+    def qc_verdicts(self, project: str = None) -> list:
+        """Saved gate verdicts (newest first); one project when asked."""
+        if project:
+            row = self.db.execute("SELECT * FROM reel_qc WHERE project=?", (project,)).fetchone()
+            return [row] if row else []
+        return self.db.execute("SELECT * FROM reel_qc ORDER BY checked DESC").fetchall()
+
     # ---- candidate lessons: the brain PROPOSES rules from patterns; the owner vets them.
     # These never reach craft_lessons (the QC gate) until promote() copies an accepted one over. ----
     def propose_lesson(self, slug: str, title: str, why: str = None, evidence: str = None):
@@ -341,11 +437,34 @@ if __name__ == "__main__":
 
     # jobs: add, advance, and prove a mid-flight row is found on "restart"
     j = st.add_job("proj", 0, "a lantern in fog")
-    assert st.add_job("proj", 0, "dup") == j, "same (project,idx) must dedupe"
+    other = st.add_job("other", 0, "different project")     # a later successful insert
+    assert st.add_job("proj", 0, "dup") == j, \
+        "a deduped add must return ITS OWN id, not the last insert's (stale lastrowid)"
+    assert other != j, "separate projects get separate ids"
+    st.set_status(other, "done", video_path="/x/other.mp4")
+    assert st.db.execute("SELECT project FROM jobs WHERE id=?", (j,)).fetchone()["project"] == "proj", \
+        "the returned id must address the job the caller asked for"
     st.set_status(j, "rendering", site="kling", account="a1")
     assert [r["id"] for r in st.resume()] == [j], "rendering row must be resumable"
     st.set_status(j, "done", video_path="/x/0.mp4")
     assert not st.resume(), "done row must not resume"
+
+    # requeue: a REJECTED clip that already says 'done' must be re-shootable, and the retry
+    # budget must be fresh (otherwise a re-render inherits the old clip's burned retries)
+    st.set_status(j, "error", video_path=None)
+    st.bump_retry(j)
+    st.bump_retry(j)
+    assert st.requeue("proj", [0], "hardened style-anchored prompt") == [j], "requeue returns ids"
+    row = st.db.execute("SELECT status,retries,last_error,prompt FROM jobs WHERE id=?", (j,)).fetchone()
+    assert row["status"] == "queued" and row["retries"] == 0 and not row["last_error"], dict(row)
+    assert row["prompt"] == "hardened style-anchored prompt", "a requeued job carries the FIX"
+    assert st.next_queued()["id"] == j, "the requeued clip is next out of the queue"
+    st.set_status(j, "done", video_path="/x/0.mp4")      # put it back for the rest of the check
+    try:
+        st.requeue("proj", [7])
+        raise AssertionError("requeueing a clip with no job row must fail loudly")
+    except SystemExit:
+        pass
 
     # credits + scheduler availability
     st.set_credits("kling", "a1", remaining=6)
@@ -354,6 +473,20 @@ if __name__ == "__main__":
     assert ("kling", "a1") in avail and ("veo", "a1") not in avail, avail
     st.spend_credit("kling", "a1", 6)
     assert not st.available(), "spent-out + not-due -> nothing available"
+
+    # credits say WHERE the number came from: hand-entered at login vs observed off the site
+    st.set_credits("krea", "a1", remaining=30, resets_at=time.time() + 5000)
+    src = st.db.execute("SELECT source FROM credits WHERE site='krea'").fetchone()["source"]
+    assert src == "manual", "a login-time balance is labelled manual"
+    st.observe_credits("krea", "a1", 42)
+    row = st.db.execute("SELECT remaining, resets_at, source FROM credits WHERE site='krea'").fetchone()
+    assert row["remaining"] == 42 and row["source"] == "observed", dict(row)
+    assert row["resets_at"] > time.time(), \
+        "an observed read refreshes remaining only — it must not wipe the known refill time"
+    try:
+        st.observe_credits("krea", "a1", -1); assert False, "negative balance must be rejected"
+    except ValueError:
+        pass
 
     # lessons: a wall puts a pair in cooldown; escalation grows the wait
     st.record_lesson("kling", "captcha", account="a1", cooldown_s=300)
@@ -387,6 +520,15 @@ if __name__ == "__main__":
         all(e["kind"] == "session" for e in st.events(session="s1", processed=False)), \
         "mark_processed clears raw rows but keeps the session summary"
 
+    # craft-gate verdicts: persisted so a HELD reel is durable, and re-running overwrites
+    st.record_qc("reel_x", {"ok": False, "block": ["no audio"], "gate": [], "warn": [], "checklist": []})
+    st.record_qc("reel_x", {"ok": True, "block": [], "gate": [], "warn": [], "checklist": []})
+    q = st.qc_verdicts("reel_x")[0]
+    assert q["ok"] == 1 and q["block_n"] == 0, "a re-run overwrites the stored verdict"
+    st.record_qc("reel_y", {"ok": False, "block": ["frozen still"], "gate": [], "warn": [], "checklist": []})
+    assert {r["project"] for r in st.qc_verdicts()} == {"reel_x", "reel_y"}
+    assert st.qc_verdicts("nope") == [], "unknown project -> no verdict"
+
     # candidate lessons: propose (upsert bumps hits), owner dismiss freezes it against re-nag
     st.propose_lesson("wall-kling-captcha", "kling keeps hitting captcha", evidence="count=3")
     st.propose_lesson("wall-kling-captcha", "kling keeps hitting captcha", evidence="count=4")
@@ -399,3 +541,6 @@ if __name__ == "__main__":
     print("OK: craft lessons upsert-by-slug + tier query, identity fingerprints recorded")
     print("OK: brain log senses events + reflect marks them processed")
     print("OK: candidate lessons upsert + freeze on owner decision (vetting gate holds)")
+    print("OK: deduped add_job returns its own id; craft-gate verdicts persist and re-run overwrites")
+    print("OK: a rejected 'done' clip requeues with a fresh retry budget and the fixed prompt")
+    print("OK: credits are labelled manual vs observed; an observed read keeps resets_at")

@@ -60,10 +60,15 @@ class Brain:
         """A clean run — drop any lingering cooldown so we return at full speed."""
         self.st.record_lesson(site, "success", account=account, cooldown_s=0)
 
-    def pick(self, want_site: str = None) -> tuple:
+    def pick(self, want_site: str = None, strict: bool = False) -> tuple:
         """Scheduler helper: best (site,account) that has credit AND isn't cooling.
         want_site is a soft PREFERENCE (tried first), not a filter — a job whose last
         site is now cooling must still reroute, or the whole waterfall stalls on it.
+
+        strict=True makes want_site a HARD filter: the reel is already being shot on that
+        source, so nothing else may add a scene to it (one reel, one look). None comes back
+        when it is cooling or dry, and the caller waits rather than mixing the reel — a
+        stall costs a delay, a mix costs the consistency the reel was built for.
         Returns (site,account) or None."""
         cands = self.st.available()
         # most remaining credit first = spread load, delay hitting any one wall;
@@ -71,6 +76,8 @@ class Brain:
         cands.sort(key=lambda c: c["remaining"], reverse=True)
         if want_site:
             cands.sort(key=lambda c: c["site"] != want_site)
+            if strict:
+                cands = [c for c in cands if c["site"] == want_site]
         for c in cands:
             if self.before_action(c["site"], c["account"])["go"]:
                 return (c["site"], c["account"])
@@ -104,5 +111,16 @@ if __name__ == "__main__":
     # want_site is a PREFERENCE: when it's cooling/dry, reroute to a healthy other site
     st.set_credits("pika", "a1", remaining=5)
     assert br.pick("kling") == ("pika", "a1"), "must reroute off a cooling want_site"
+    # strict=True makes want_site a LOCK, not a preference: a reel already shooting on kling
+    # must WAIT for kling rather than let pika add a scene with a different look.
+    assert br.pick("kling", strict=True) is None, \
+        "a locked reel must wait for its own source, never fill in from another site"
+    st.spend_credit("pika", "a1", 5)                  # pika is dry again
+    st.db.execute("UPDATE lessons SET cooldown_until=0")   # kling's cooldown lapses
+    st.db.commit()
+    st.set_credits("kling", "a1", remaining=2)
+    assert br.pick("kling", strict=True) == ("kling", "a1"), \
+        "the lock lifts the moment its own source is healthy again"
     print(f"OK: consult->go, wall cools+escalates ({cd1:.0f}->{cd2:.0f}s), "
-          f"scheduler routes around cooling accounts and reroutes off a dead want_site")
+          f"scheduler routes around cooling accounts and reroutes off a dead want_site — "
+          f"but a STRICT want_site (one reel, one look) waits instead of rerouting")

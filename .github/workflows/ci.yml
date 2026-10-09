@@ -1,0 +1,39 @@
+name: self-checks
+
+# The offline gate: ./check.sh runs every self-check with no browser, no site and no
+# LLM/vision gateway. If it exits non-zero, a self-check failed — fix it, don't ship.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline-suite:
+    name: offline self-check suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # same interpreter family verified locally (3.12 has playwright/PIL/numpy/browser-cookie3)
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # node:sqlite (used by automation/test_brain_plugin.mjs) needs a build where it is
+      # unflagged — 26 is the runtime verified locally.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+
+      - name: ffmpeg (stitch + craft-gate media checks)
+        run: which ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+
+      - name: Python deps
+        run: python -m pip install -r requirements.txt
+
+      - name: Offline self-check suite
+        run: bash ./check.sh        # bash, not ./check.sh: don't depend on the exec bit
