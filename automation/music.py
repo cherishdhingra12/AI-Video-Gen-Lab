@@ -110,6 +110,30 @@ def _onsets(x, hop=512):
     return times, bpm
 
 
+def _mean_db(x):
+    """Whole-signal mean level in dBFS (the same measure ffmpeg's volumedetect reports)."""
+    if not x.size:
+        return -99.0
+    return float(20 * np.log10(max(float(np.sqrt((x ** 2).mean())), 1e-9)))
+
+def _level_start(x, win=0.5, thresh=10.0):
+    """Where the track first reaches its own body — the skip for a slow intro.
+
+    A raga or a pad can open on an alap / long fade: loudness well below the track's own mean
+    for many seconds. Starting the bed at t=0 there plays silence through a reel's hook (the
+    darzi-ka-tukda defect: ~14s inaudible). Scan 0.5s windows and return the first whose RMS is
+    within `thresh` dB of the loudest region — 0.0 for a track that starts at level."""
+    if x.size < 22050:                    # < ~1s — cannot judge an intro; start at the top
+        return 0.0
+    w = int(win * RATE)
+    rms = np.array([float(np.sqrt((x[i:i + w] ** 2).mean() + 1e-12))
+                    for i in range(0, len(x) - w, w)])
+    if not rms.size:
+        return 0.0
+    ref = float(np.percentile(rms, 90))   # the track's body, not its single loudest blip
+    body = np.nonzero(rms >= ref * (10 ** (-thresh / 20)))[0]
+    return round(float(body[0] * win), 2) if body.size else 0.0
+
 def analyse(path):
     """The measured profile of a track. Cached by (name, size, mtime) so a library scan is
     cheap after the first pass."""
@@ -119,8 +143,8 @@ def analyse(path):
         cache = json.load(open(INDEX)) if os.path.exists(INDEX) else {}
     except OSError:
         key, cache = None, {}
-    if key and key in cache:
-        return cache[key]
+    if key and key in cache and "mean_db" in cache[key]:
+        return cache[key]                         # a pre-mean_db entry is stale: recompute it
 
     x = _mono(path, secs=90.0)                    # 90s is plenty to characterise a bed
     onsets, bpm = _onsets(x)
@@ -129,6 +153,12 @@ def analyse(path):
          if x.size else -99.0,
          "hf_db": round(float(_hf_db(x)), 2),
          "bpm": round(bpm, 1), "onsets": [round(float(t), 3) for t in onsets[:400]]}
+    # Bed placement needs two things a brightness rank cannot give: how LOUD the track is
+    # (so a quietly-mastered bed can be normalised instead of landing doubly quiet) and how
+    # long its own quiet INTRO runs (so the bed does not start where the reel's hook is and
+    # play silence for the first third). Both measured, never guessed from the filename.
+    m["mean_db"] = round(_mean_db(x), 2)
+    m["level_start"] = round(_level_start(x), 2)
     if key:
         cache[key] = m
         os.makedirs(LIB, exist_ok=True)
@@ -185,14 +215,15 @@ def choose(profile, project_dir=None):
     got = pick(profile)
     if got:
         print(f"  library: {got['file']} (hf {got['hf_db']} dB, {got['bpm']} bpm)")
-        path = got["path"]
+        path, m = got["path"], got
     else:
         print(f"  nothing in the library fits {profile.get('want')!r} — searching for a new bed")
         path = find(profile)
         if not path:
             return None
+        m = analyse(path)
     if project_dir:
-        install(project_dir, path)
+        install(project_dir, path, m)
     return path
 
 
@@ -253,10 +284,19 @@ def add(src, *, title=None, artist="unknown", source="unknown", source_url=None,
     return dest
 
 
-def install(project_dir, track_path):
-    """Copy a chosen track in as the project's music_raw.mp3 — the path the assembler mixes."""
+def install(project_dir, track_path, track=None):
+    """Copy a chosen track in as the project's music_raw.mp3 — the path the assembler mixes —
+    and record HOW to place it (music_meta.json): the level skip for a slow intro, and the
+    track's own loudness so the assembler can normalise a quietly-mastered bed. Without this
+    the assembler can only guess from t=0, which is the defect that took darzi's bed silent
+    through its hook."""
     dest = os.path.join(project_dir, "music_raw.mp3")
-    shutil.copy2(track_path, dest)
+    if os.path.abspath(track_path) != os.path.abspath(dest):
+        shutil.copy2(track_path, dest)
+    if track:
+        with open(os.path.join(project_dir, "music_meta.json"), "w") as f:
+            json.dump({"level_start": track.get("level_start", 0.0),
+                       "mean_db": track.get("mean_db")}, f, indent=1)
     return dest
 
 

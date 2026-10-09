@@ -120,7 +120,26 @@ A reel the gate could **not measure** is not a defective reel and is not a passe
   (A single frame cannot answer "same person in every panel?"; the sheet is the question.)
 - Never let an outage read as a craft failure, and never let it read as a pass. Say which it was.
 
-## 7. Brand
+## 7. The score — audible from the first second
+
+A reel ships with a background bed, and the bed must be **audible through the whole reel**, not
+merely present on disk. The failure that cost a reel (darzi-ka-tukda, 2026-10-10): the bed *was*
+mixed in, but Indian classical tracks open on a slow **alap** — ~16s of near-silence — and the mix
+started at t=0, so the reel's entire hook and first scenes played with no music. Every offline
+check was green; only listening caught it.
+
+- Placement is **measured**, never assumed: `music.analyse` reports `level_start` (where the track
+  first reaches its own body) and the assembler skips the track's quiet intro rather than playing it.
+- Level is **normalised**, not fixed: a quietly-mastered bed is lifted toward its target instead of
+  landing doubly quiet under one hard-coded multiplier.
+- **Presence on disk is not presence in the mix.** QC proves the score reached the audio by its
+  *floor* — the quietest second of the finished reel. A bed carrying the reel keeps the floor within
+  ~10 dB of the narration; a missing or silent-intro bed drops it far below anything the reel says.
+  Measured across the fleet: healthy reels floor at −29…−41 dB, the silent-intro bed at −50,
+  no bed at −56. Do not score this from a file's existence — and never with `silencedetect`, which
+  reads a quiet alap as "not silent" and passes the defect.
+
+## 8. Brand
 
 `standardsunrisefoundation_ngo` — Standard Sunrise Foundation. The closing CTA is a card in the
 same caption system, and it lands as the last thing on screen.

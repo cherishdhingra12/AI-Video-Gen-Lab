@@ -310,10 +310,79 @@ def check_pacing(reel):
     return probs[:4]
 
 
+def _window_db(path, ss, dur):
+    """Mean level (dBFS) of one window of a reel's audio — ffmpeg's own volumedetect, so this
+    agrees with the measure the assembler records."""
+    for ln in _run(["ffmpeg", "-hide_banner", "-ss", f"{ss:.3f}", "-t", f"{dur:.3f}",
+                    "-i", path, "-af", "volumedetect", "-f", "null", "-"]).stderr.splitlines():
+        if "mean_volume:" in ln:
+            try:
+                return float(ln.split("mean_volume:")[1].split("dB")[0])
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def _audio_floor(path, step=1.0):
+    """The quietest 1s window's mean level — the reel's audio floor. A score carrying the reel
+    keeps this within ~10 dB of the narration; a bed that is absent, or that played its own slow
+    intro through the hook, drops the floor far below anything the reel says. Measured across the
+    whole fleet (2026-10-10): every healthy reel floors at -29..-41 dB, darzi-ka-tukda
+    (silent-intro bed) at -50.2, roz_ki_list (the same defect) at -48.3, a no-bed rebuild at
+    -56.3. The gap is ~7 dB wide, so the floor is a robust defect signal — unlike silencedetect,
+    which saw darzi's -45.2 dB intro as 'not silent' and passed it."""
+    d = _duration(path)
+    if not d:
+        return None
+    vals, t = [], 1.0
+    while t < d - 1.2:
+        v = _window_db(path, t, step)
+        if v is not None:
+            vals.append(v)
+        t += step
+    return round(min(vals), 2) if vals else None
+
+
+FLOOR_BAD = -46.0            # dB; below this the reel's audio has a hole no narration explains
+
+
+def check_score_present(reel):
+    """The background score must be AUDIBLE IN the rendered audio, not merely on the shelf.
+    craft-layers only checks that projects/<reel>/music_raw.mp3 exists — which passes a reel whose
+    bed was mixed in but silent through its hook (the track opened on a slow alap) or one whose
+    build skipped the mix entirely. Neither a file's existence nor a silencedetect scan catches
+    that; the audio floor does (see _audio_floor for the fleet measurement behind the threshold).
+    A quiet beat between lines is a performance choice — only a floor this low is a defect."""
+    if not reel.final or not glob.glob(os.path.join(reel.dir, "music_raw.mp3")):
+        return []                                   # craft-layers owns 'no score at all'
+    d = _duration(reel.final)
+    if d < 6:
+        return []
+    floor = None
+    meta = os.path.join(reel.dir, "music_bed.json")
+    if os.path.exists(meta):
+        try:
+            floor = json.load(open(meta)).get("floor")
+        except (OSError, ValueError, TypeError):
+            floor = None
+    if floor is None:                               # older build: no sidecar floor — measure now
+        floor = _audio_floor(reel.final)
+    if floor is None:
+        return [Unreviewed(f"could not measure the audio floor of {os.path.basename(reel.final)} "
+                           "— the score's presence in the mix is unproven")]
+    if floor < FLOOR_BAD:
+        return [f"the background score does not carry the reel — its quietest stretch sits at "
+                f"{floor:.1f} dBFS (a reel with a bed throughout floors near -35). The bed may be "
+                f"missing, or the track's quiet intro played through the hook. Re-mix with the "
+                f"intro skipped."]
+    return []
+
+
 CHECKS = {"playable": check_playable, "caption-safe-area": check_caption_safe_area,
           "realism": check_realism, "craft-layers": check_craft_layers,
           "style-uniform": check_style_uniform,
-          "character-consistency": check_character_consistency, "pacing": check_pacing}
+          "character-consistency": check_character_consistency, "pacing": check_pacing,
+          "score-present": check_score_present}
 
 
 # ---- canonical craft lessons: the owner's memory rules, absorbed into state.db --------------
@@ -337,6 +406,12 @@ LESSONS = [
          why="the owner was taught these layers repeatedly and reels still went out without "
              "them; nothing machine-checked it, so it is now a blocking gate. Narration is "
              "spoken INSIDE the generated clips (WAVELENGTH.md §3), never a track added after"),
+    dict(slug="score-present", check_id="score-present", severity="block",
+         title="The background score actually carries the reel (audible in the FINAL, not just on disk)",
+         why="a music_raw.mp3 on the shelf is not an audible score: a bed that opens on the "
+             "track's slow intro is silent through the hook (darzi-ka-tukda, 2026-10-10), and an "
+             "earlier build can skip the mix entirely — the owner hears the gap even when the "
+             "file exists"),
     dict(slug="style-uniform", check_id="style-uniform", severity="block",
          title="One art style for the WHOLE reel — every new reel is 3-D animation",
          why="per-frame review passes a reel whose scene 1 is photoreal and whose scene 2 is "
@@ -662,6 +737,41 @@ if __name__ == "__main__":
                 f"an unavailable comparison must gate go_live (not pass): {v7c['gate']}"
             assert not any("could NOT be reviewed" in b for b in v7c["block"]), \
                 f"an OUTAGE is not a craft defect — it must not block the ship: {v7c['block']}"
+
+            # score-present: an EXISTING music_raw.mp3 is not evidence the bed is audible. Proven
+            # against the real defect (darzi-ka-tukda, 2026-10-10): the bed was mixed, but the
+            # track's 16.5s slow intro played through the hook, so the reel's first third was
+            # silent while every offline check stayed green. Build one 12s reel with a loud bed
+            # and one whose bed is a -70 dB whisper, and prove the floor tells them apart.
+            for _name, _vol in (("bed_ok", 0.25), ("bed_gone", 0.0003)):
+                _d = tempfile.mkdtemp()
+                _cd = os.path.join(_CLIPS_ROOT, os.path.basename(_d))
+                os.makedirs(_cd)
+                for _i in range(3):
+                    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=s=720x1280:d=4",
+                                    "-f", "lavfi", "-i", "sine=frequency=440:d=4", "-pix_fmt",
+                                    "yuv420p", "-shortest", os.path.join(_cd, f"clip_{_i:03d}.mp4")],
+                                   check=True, capture_output=True)
+                for _f in ("caption_hook.png", "caption_moral.png", "caption_cta.png"):
+                    open(os.path.join(_d, _f), "wb").write(_PNG)
+                os.makedirs(os.path.join(_d, "vo"))
+                open(os.path.join(_d, "vo", "hook.aiff"), "wb").write(b"x")
+                open(os.path.join(_d, "music_raw.mp3"), "wb").write(b"x")
+                json.dump({"opener": _name, "font": "Kalam", "quote": "Kabir",
+                           "structure": f"arc {_name}"},
+                          open(os.path.join(_d, "identity.json"), "w"))
+                subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=s=720x1280:d={_RL}",
+                                "-f", "lavfi",
+                                "-i", f"sine=frequency=440:duration={_RL},volume={_vol}",
+                                "-pix_fmt", "yuv420p", "-shortest",
+                                os.path.join(_d, "final_veo.mp4")],
+                               check=True, capture_output=True)
+                _v = run(_d, st)
+                _hit = [b for b in _v["block"] if "background score does not carry" in b]
+                assert bool(_hit) == (_name == "bed_gone"), \
+                    f"{_name} (bed at volume {_vol}): the score check must " \
+                    f"{'flag' if _name == 'bed_gone' else 'pass'} it, blocks={_v['block']}"
+
             vision.compare_character = _orig_cmp
 
             # the verdict is DURABLE state, keyed by reel, and a re-run overwrites it

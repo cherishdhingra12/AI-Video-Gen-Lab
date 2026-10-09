@@ -39,10 +39,16 @@ ROOT = os.path.dirname(_DIR)
 sys.path.insert(0, _DIR)
 
 import caption                                                   # noqa: E402
+import music as musiclib                                      # noqa: E402
 
 DELOGO = "delogo=x=564:y=1122:w=72:h=74"     # the baked Vids sparkle, fixed bottom-right
 W, H = 720, 1280                             # the 9:16 canvas every clip is fitted onto
 MUS_VOL = float(os.environ.get("MUS_VOL", "0.30"))
+# Where a bed should sit IN THE MIX (dBFS), not a fixed multiplier: MUS_VOL=0.30 under the fleet's
+# tracks (mastered near -21 dB) landed them near -31.5, so that is the target a bed is normalised
+# to — a quietly-mastered track is lifted to it instead of landing doubly quiet. The gain is
+# clamped, so an oddly-mastered track is nudged rather than blown up or buried.
+BED_TARGET_DB = float(os.environ.get("BED_TARGET_DB", "-31.5"))
 TAIL_FADE = float(os.environ.get("TAIL_FADE", "0.50"))
 # Pace the whole reel. Generated motion often runs a touch slower than life, and the crafts used
 # ~1.06x — but a pace change is a taste call on THAT reel, so this defaults to 1.0 (OFF) and is
@@ -76,6 +82,41 @@ def _has_audio(p):
                             "-show_entries", "stream=codec_type", "-of", "csv=p=0", p]).stdout
 
 
+def _mean_db(p, ss=None, dur=None):
+    """Mean level in dBFS (ffmpeg volumedetect), whole file or one window. Recorded as a
+    checkable artifact so QC can prove the score reached the mix, not just the disk."""
+    cmd = ["ffmpeg", "-hide_banner"]
+    if ss is not None:
+        cmd += ["-ss", f"{ss:.3f}"]
+    if dur is not None:
+        cmd += ["-t", f"{dur:.3f}"]
+    for ln in _run(cmd + ["-i", p, "-af", "volumedetect", "-f", "null", "-"]).stderr.splitlines():
+        if "mean_volume:" in ln:
+            try:
+                return float(ln.split("mean_volume:")[1].split("dB")[0])
+            except ValueError:
+                return None
+    return None
+
+
+def _audio_floor(path, step=1.0):
+    """The quietest 1s window's mean level — the reel's audio floor. A bed playing throughout
+    keeps this up (a music bed sits ~-20..-30 dBFS, mixed ~-30..-40); a reel whose bed is absent
+    or silent for a long stretch drops it far below the narration. Measured across the fleet
+    2026-10-10: every healthy reel floors at -29..-41 dB, darzi (silent-intro bed) at -50.2, a
+    no-bed build at -56.3. The gap is wide, so a floor threshold is a robust defect signal."""
+    d = _dur(path)
+    if not d:
+        return None
+    vals, t = [], 1.0
+    while t < d - 1.2:
+        lv = _mean_db(path, ss=t, dur=step)
+        if lv is not None:
+            vals.append(lv)
+        t += step
+    return round(min(vals), 2) if vals else None
+
+
 def _frames_differ(p, d):
     import hashlib
     seen = set()
@@ -84,14 +125,6 @@ def _frames_differ(p, d):
                             "-f", "image2pipe", "-vcodec", "png", "-"], capture_output=True)
         seen.add(hashlib.md5(r.stdout).hexdigest())
     return len(seen) >= 2
-
-
-def _mean_db(p):
-    for ln in _run(["ffmpeg", "-hide_banner", "-i", p, "-af", "volumedetect",
-                    "-f", "null", "-"]).stderr.splitlines():
-        if "mean_volume:" in ln:
-            return float(ln.split("mean_volume:")[1].split("dB")[0])
-    return -999.0
 
 
 def verify_playable(path, expect):
@@ -364,12 +397,48 @@ def build(project_dir, clips_dir=None, absorb=True):
     amap, scored = aprev, False
     music = os.path.join(project_dir, "music_raw.mp3")
     if os.path.exists(music):
+        # Placement is MEASURED, not assumed. A slow intro (a raga's alap) is silence for many
+        # seconds — starting there plays the reel's hook with no music (the darzi-ka-tukda
+        # defect: ~14s inaudible). music.analyse measures where the track reaches its body and
+        # music_meta.json carries it; old projects without the sidecar fall back to t=0.
+        skip = 0.0
+        bed_mean = None
+        try:
+            with open(os.path.join(project_dir, "music_meta.json")) as f:
+                meta = json.load(f)
+            skip = max(0.0, float(meta.get("level_start") or 0.0))
+            bed_mean = meta.get("mean_db")
+        except (OSError, ValueError, TypeError):
+            # No sidecar (a project from before it existed, or a hand-installed bed): MEASURE the
+            # track rather than falling back to t=0. Falling back is what shipped darzi silent —
+            # the sidecar was absent, so nothing knew the track opens on a 16.5s alap.
+            try:
+                m = musiclib.analyse(music)
+                skip = max(0.0, float(m.get("level_start") or 0.0))
+                bed_mean = m.get("mean_db")
+            except Exception:  # noqa: BLE001 — an unreadable bed still mixes, from its head
+                pass
+        # Feed forward from the skip point; if the skip point alone cannot fill the reel (the
+        # body is shorter than the reel), start at 0 instead of running the tail dry.
         mi = ninp
         inputs += ["-i", music]
         ninp += 1
-        fc.append(f"[{mi}:a]atrim=0:{total:.3f},asetpts=PTS-STARTPTS,"
+        if skip >= 0.2 and (_dur(music) - skip) < total:
+            skip = 0.0
+        # Normalise the bed to a TARGET level in the mix rather than a fixed multiplier: a
+        # quietly-mastered track must not land doubly quiet under a fixed 0.30. Clamped, because
+        # a measured -40 dB bed would otherwise be pushed to a level that swamps the narration.
+        vol = MUS_VOL
+        if isinstance(bed_mean, (int, float)):
+            vol = min(0.60, max(0.06, 10 ** ((BED_TARGET_DB - float(bed_mean)) / 20)))
+        if skip >= 0.2:
+            print(f"  bed: skipping the track's {skip:.1f}s quiet intro")
+        if abs(vol - MUS_VOL) > 1e-3:
+            print(f"  bed: level {vol:.2f} (track measures {bed_mean:+.1f} dB, "
+                  f"target {BED_TARGET_DB:+.0f})")
+        fc.append(f"[{mi}:a]atrim={skip:.3f}:{skip + total:.3f},asetpts=PTS-STARTPTS,"
                   "aformat=sample_rates=48000:channel_layouts=stereo,"
-                  f"volume={MUS_VOL},afade=t=in:st=0:d=1.4,"
+                  f"volume={vol:g},afade=t=in:st=0:d=1.4,"
                   f"afade=t=out:st={max(0.0, total - 1.6):.3f}:d=1.6[bed]")
         fc.append(f"[{aprev}][bed]amix=inputs=2:normalize=0:dropout_transition=0[scored]")
         amap, scored = "scored", True
@@ -410,6 +479,15 @@ def build(project_dir, clips_dir=None, absorb=True):
         layers.append(f"dead-air trimmed {cut:.2f}s")
     if abs(speed - 1.0) > 1e-6:
         layers.append(f"{speed:g}x pace")
+    if scored:
+        # Record the audio's floor in the FINAL as a checkable artifact: the existence of
+        # music_raw.mp3 says nothing about whether the score is audible in the reel (the hole
+        # that let darzi's silent-intro bed ship). QC reads this instead of guessing.
+        try:
+            with open(os.path.join(project_dir, "music_bed.json"), "w") as f:
+                json.dump({"mean_db": _mean_db(out), "floor": _audio_floor(out)}, f)
+        except OSError:
+            pass
     print(f"OK -> {out}  ({_dur(out):.2f}s, {n} clips, {', '.join(layers)})  VERIFIED")
     if absorb:
         _absorb(project_dir)
@@ -469,6 +547,52 @@ if __name__ == "__main__":
             assert a[int(0.85 * 1280):].max() == 0, f"{f} leaks into the bottom 15%"
         print(f"OK: 3 clips -> a reel that plays ({_dur(out):.2f}s, dead air cut), "
               "three auto-placed cards, none in the bottom 15%")
+
+        # ---- the bed: offline QC used to see only that music_raw.mp3 exists, which passed a
+        # reel whose bed was silent through its hook (darzi-ka-tukda). Two things must hold, and
+        # only a real build proves them: a bed placed with NO sidecar is MEASURED (not started
+        # blindly at t=0), and the finished reel carries its own audibility proof — a floor.
+        def _bedfloor(path_):
+            import qc
+            return qc._audio_floor(path_)
+
+        plain_floor = _bedfloor(out)
+        assert plain_floor is not None and plain_floor > -46, \
+            f"a reel with a real bed must floor above the defect threshold: {plain_floor}"
+        assert os.path.exists(os.path.join(pdir, "music_bed.json")), \
+            "the build must record the bed's floor for QC to read"
+
+        # now the defect itself: a bed that opens on a long quiet intro (a raga's alap). With no
+        # music_meta.json the assembler must MEASURE where the track reaches its body and skip the
+        # intro — the old code started at t=0 and played the reel's whole hook in silence.
+        #
+        # The reel's own narration has to have GAPS for this to be provable. The source clips above
+        # carry a continuous tone, so a bed covering the first three seconds is indistinguishable
+        # from one covering the hook. Real narration is spoken lines with silence between them, and
+        # the silence must sit in the MIDDLE of a clip — trailing silence is dead air and gets cut.
+        # This narration speaks 0-1.25s and 3.75-5s, leaving a 2.5s hole the bed has to fill.
+        _gate = "0.5*sin(2*PI*440*t)*(lt(mod(t\\,5)\\,1.25)+gt(mod(t\\,5)\\,3.75))"
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=220:d=3",
+                        "-f", "lavfi", "-i", "sine=frequency=330:d=25", "-filter_complex",
+                        "[0:a]volume=0.004[quiet];[quiet][1:a]concat=n=2:v=0:a=1[out]",
+                        "-map", "[out]", "-c:a", "libmp3lame",
+                        os.path.join(pdir, "music_raw.mp3")], check=True, capture_output=True)
+        os.remove(os.path.join(pdir, "music_meta.json")) \
+            if os.path.exists(os.path.join(pdir, "music_meta.json")) else None
+        for _i in range(3):
+            subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=5",
+                            "-f", "lavfi", "-i", f"aevalsrc={_gate}:d=5", "-pix_fmt", "yuv420p",
+                            "-shortest", os.path.join(cdir, f"clip_{_i:03d}.mp4")],
+                           check=True, capture_output=True)
+        alap = build(pdir, clips_dir=cdir)
+        m = musiclib.analyse(os.path.join(pdir, "music_raw.mp3"))
+        assert m["level_start"] >= 2.0, \
+            f"the fixture's quiet intro must be measured (got {m['level_start']}s)"
+        assert _bedfloor(alap) > -46, \
+            f"a reel whose bed has a quiet intro must still floor above the threshold — the " \
+            f"intro should have been skipped, not played: {_bedfloor(alap)}"
+        print(f"OK: the bed's audibility is measured from the FINAL (floor {plain_floor:.1f} dB); "
+              f"a {m['level_start']:.1f}s quiet intro is skipped, not played through the hook")
 
         # ---- pace: the reel's own declared speed shortens the reel and keeps every card ------
         json.dump({"opener": "a held breath", "font": "rounded", "quote": "Kabir",
