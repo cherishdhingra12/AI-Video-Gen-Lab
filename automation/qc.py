@@ -17,6 +17,7 @@ music not license-cleared). The judgment checklist is for the human before appro
 import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -182,6 +183,21 @@ def check_craft_layers(reel):
 
 
 _HOUSE_MEDIUM = "3d"        # WAVELENGTH.md §1 — every NEW reel is 3-D animation
+
+
+def check_no_synth_voiceover(reel):
+    """WAVELENGTH.md §3: every spoken line is generated INSIDE the clip. A `vo/` folder of
+    separately synthesized lines (macOS `say`, edge-tts) is the thing the owner banned — three
+    shipped reels (`aawaaz`, `filter_wala`, `the-lamp-s-silent-promise`) still carry one.
+
+    A publish-gate, never a block: an existing finished reel stays shippable, but it does not
+    go_live until a human has heard whether a synthetic voice is riding over the clip's own.
+    Returned as a plain string -> the gate routes it by the lesson's severity (publish-gate)."""
+    vo = glob.glob(os.path.join(reel.dir, "vo", "*"))
+    if vo:
+        return [(f"a separately synthesized voiceover is present (vo/{os.path.basename(vo[0])}, "
+                 f"{len(vo)} file(s)) — narration must be spoken inside the generated clip")]
+    return []
 
 
 def _declared_medium(reel) -> str:
@@ -380,6 +396,7 @@ def check_score_present(reel):
 
 CHECKS = {"playable": check_playable, "caption-safe-area": check_caption_safe_area,
           "realism": check_realism, "craft-layers": check_craft_layers,
+          "no-synth-voiceover": check_no_synth_voiceover,
           "style-uniform": check_style_uniform,
           "character-consistency": check_character_consistency, "pacing": check_pacing,
           "score-present": check_score_present}
@@ -434,9 +451,16 @@ LESSONS = [
     dict(slug="editing-preserve-essence", tier="judgment", severity="publish-gate",
          title="Never trim an emotional beat (even a silent one); cut by viewing frames",
          why="silencedetect-driven cuts kill the beat the reel exists for"),
+    dict(slug="no-synth-voiceover", check_id="no-synth-voiceover", severity="publish-gate",
+         title="No separately synthesized voiceover — every line is spoken INSIDE the clip",
+         why="WAVELENGTH.md §3: the clip's own voice carries the narration, so lip and line "
+             "agree. A `vo/` folder of `say`/TTS lines mixed at assembly is banned — the reel "
+             "may ship, but a human must hear it before go_live (three legacy reels carry one)"),
     dict(slug="veo-narration-not-lipsync", tier="judgment", severity="publish-gate",
-         title="VO stays true background narration (faces from behind/wide + VO muxed separately)",
-         why="Veo lip-syncs any VO line to whatever face is on camera"),
+         title="Narration is spoken IN the generated scene, never a muxed VO track",
+         why="WAVELENGTH.md §3 bans after-the-fact synthesis; the line is written into the "
+             "generation prompt so a character on camera speaks it (agents.clip_prompts), and a "
+             "voice laid over the top is exactly the defect this rule exists to stop"),
     dict(slug="background-score-workflow", tier="judgment", severity="publish-gate",
          title="The bed is ducked UNDER the clips' own audio, never instead of it",
          why="the narration is spoken inside the generated clips (WAVELENGTH.md §3); a bed loud "
@@ -624,11 +648,9 @@ if __name__ == "__main__":
             # frame reviews clean, yet the reel mixes media. Only a cross-reel check catches it.
             vision.review_frame = lambda png: []
             d5 = tempfile.mkdtemp()
-            os.makedirs(os.path.join(d5, "vo"))
             for _f in ("caption_hook.png", "caption_moral.png"):
                 open(os.path.join(d5, _f), "wb").write(_PNG)
             open(os.path.join(d5, "music_raw.mp3"), "wb").write(b"x")
-            open(os.path.join(d5, "vo", "hook.aiff"), "wb").write(b"x")
             json.dump({"opener": "lantern", "font": "Georgia", "quote": "Kabir", "structure": "arc"},
                       open(os.path.join(d5, "identity.json"), "w"))
             subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=2",
@@ -662,11 +684,9 @@ if __name__ == "__main__":
 
             # a clean, distinct reel passes the auto checks
             d3 = tempfile.mkdtemp()
-            os.makedirs(os.path.join(d3, "vo"))
             for _f in ("caption_hook.png", "caption_moral.png", "caption_cta.png"):
                 open(os.path.join(d3, _f), "wb").write(_PNG)
             open(os.path.join(d3, "music_raw.mp3"), "wb").write(b"x")
-            open(os.path.join(d3, "vo", "hook.aiff"), "wb").write(b"x")
             json.dump({"opener": "typewriter", "font": "Snell", "quote": "Rumi", "structure": "montage"},
                       open(os.path.join(d3, "identity.json"), "w"))
             subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=s=720x1280:d={_RL}",
@@ -675,6 +695,17 @@ if __name__ == "__main__":
                            check=True, capture_output=True)
             v3 = run(d3, st)
             assert v3["ok"] and not v3["block"], v3
+            # ...but drop a synthesized `vo/` into it and the reel is gated (never blocked):
+            # WAVELENGTH.md §3 — narration is spoken in the clip, not muxed at assembly.
+            os.makedirs(os.path.join(d3, "vo"))
+            open(os.path.join(d3, "vo", "hook.aiff"), "wb").write(b"x")
+            v3v = run(d3, st)
+            assert any("synthesized voiceover" in g for g in v3v["gate"]), \
+                f"a reel carrying a TTS vo/ folder must gate go_live: {v3v}"
+            assert not any("synthesized voiceover" in b for b in v3v["block"]), \
+                f"a synthesized VO gates, it does not block the ship: {v3v['block']}"
+            shutil.rmtree(os.path.join(d3, "vo"))
+            assert run(d3, st)["ok"], "removing the vo/ folder clears the gate again"
             # A reel that declares NO medium inherits the house rule (WAVELENGTH.md §1: 3-D), so
             # the SAME reel judged photoreal is a defect — not because it disagrees with itself,
             # but because it is not what the house asked for.
@@ -686,11 +717,9 @@ if __name__ == "__main__":
             # shipped reels here are photorealistic by design, and the house rule must never
             # retroactively declare them inconsistent with themselves and hold them.
             d6 = tempfile.mkdtemp()
-            os.makedirs(os.path.join(d6, "vo"))
             for _f in ("caption_hook.png", "caption_moral.png", "caption_cta.png"):
                 open(os.path.join(d6, _f), "wb").write(_PNG)
             open(os.path.join(d6, "music_raw.mp3"), "wb").write(b"x")
-            open(os.path.join(d6, "vo", "hook.aiff"), "wb").write(b"x")
             json.dump({"opener": "letters", "font": "Rozha One", "quote": "Kabir",
                        "structure": "bookend mirror", "visual_style": "photorealistic warm documentary"},
                       open(os.path.join(d6, "identity.json"), "w"))
@@ -754,8 +783,6 @@ if __name__ == "__main__":
                                    check=True, capture_output=True)
                 for _f in ("caption_hook.png", "caption_moral.png", "caption_cta.png"):
                     open(os.path.join(_d, _f), "wb").write(_PNG)
-                os.makedirs(os.path.join(_d, "vo"))
-                open(os.path.join(_d, "vo", "hook.aiff"), "wb").write(b"x")
                 open(os.path.join(_d, "music_raw.mp3"), "wb").write(b"x")
                 json.dump({"opener": _name, "font": "Kalam", "quote": "Kabir",
                            "structure": f"arc {_name}"},

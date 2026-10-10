@@ -83,16 +83,29 @@ def _observe_credits(st: State, adapter, session, site: str, account: str) -> No
 def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
     """Drive one clip end to end. Returns final status. Any Wall -> cool down +
     requeue (not a failure). Each step commits before the next, so a crash resumes."""
-    # One reel, one source (the owner's rule, 2026-10-09). The job's own `site` is only the
-    # opening bid: once ANY clip of this project has come back, that site is the reel's lock and
-    # nothing else may add a scene to it. pick(strict=True) returns None while it is cooling, so
-    # the loop WAITS for the primary instead of filling in from a fallback — which is how this
-    # reel first ended up krea+vibes+googlevids, three looks in one cut, invisible to every gate.
-    locked = st.project_site(job["project"]) or job["site"]
-    pick = br.pick(want_site=locked, strict=bool(locked))
-    if not pick:
-        return "waiting"                            # nothing attackable right now
-    site, account = pick
+    # One reel, one source (the owner's rule, 2026-10-09). Once ANY clip of this project has come
+    # back, that site is the reel's lock and nothing else may add a scene to it — pick(strict=True)
+    # returns None while it is cooling, so the loop WAITS for the primary instead of filling in from
+    # a fallback (this reel first ended up krea+vibes+googlevids, three looks in one cut).
+    # BEFORE the first clip lands the job's `site` is only an opening bid: if that bid is unusable
+    # (dry / disabled / cooling for good), the WHOLE reel fails over to the next priority site
+    # (whole-reel fails over, never a scene at a time — see SITE_ORDER in learn.py).
+    locked = st.project_site(job["project"])
+    if locked:
+        pick = br.pick(want_site=locked, strict=True)      # a reel in progress waits, never mixes
+        if not pick:
+            return "waiting"
+        site = pick[0]
+    else:
+        pick = br.pick(want_site=job["site"], strict=False)
+        if not pick:
+            return "waiting"                                # nothing attackable right now
+        site = pick[0]
+        if site != job["site"]:
+            print(f"  {job['project']}: primary {job['site']} unavailable — the WHOLE reel "
+                  f"moves to {site} (one reel, one source)")
+            st.lock_project(job["project"], site)
+    account = pick[1]
     adapter = _adapter(site)
     dest = os.path.join(CLIPS_DIR, job["project"], f"clip_{job['idx']:03d}.mp4")
 
@@ -322,6 +335,43 @@ if __name__ == "__main__":
         assert runner.process_job(st, br, _jr, headless=True) != "waiting", \
             "the wait must end the moment the reel's own source is available again"
         print("OK: one reel = one source — a locked reel WAITS for its own site, never mixes")
+
+        # WHOLE-REEL FAILOVER (owner, 2026-10-10): before ANY clip lands, a dry primary moves the
+        # ENTIRE reel to the next waterfall site, and every queued scene follows. Once a clip is
+        # done, project_site() owns the lock and nothing may move the reel again.
+        fst = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+        fbr = Brain(fst)
+        fst.set_credits("googlevids", "g1", remaining=0)    # primary dry from the start
+        fst.set_credits("flow", "f1", remaining=8)          # next in waterfall
+        runner._adapter = lambda site: fake
+        runner._session = lambda site, account, headless: _NullSession()
+        fake2 = types.SimpleNamespace(name="flow", credit_cost=2)
+        fake2.submit = lambda s, prompt: None
+        fake2.poll = lambda s: "done"
+        def fake2_dl(s, dest):
+            import subprocess as _sp
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            _sp.run(["ffmpeg","-y","-f","lavfi","-i","color=c=green:s=720x1280:d=4",
+                     "-f","lavfi","-i","sine=frequency=440:d=4",
+                     "-pix_fmt","yuv420p","-shortest",dest],
+                    capture_output=True, check=True)
+        fake2.download = fake2_dl
+        fake2.read_credits = lambda s: None
+        fjid = fst.add_job("failover-proj", 0, "a scene", site="googlevids")
+        fst.add_job("failover-proj", 1, "another scene", site="googlevids")
+        runner._adapter = lambda site: fake if site != "flow" else fake2
+        assert runner.process_job(fst, fbr, fst.next_queued("failover-proj"), headless=True) == "done", \
+            "a dry primary must fail the WHOLE reel over to flow"
+        _all = fst.project_clips("failover-proj")
+        assert all(j["site"] == "flow" for j in _all), \
+            f"every queued scene must follow the reel to flow, got {[j['site'] for j in _all]}"
+        assert fst.project_site("failover-proj") == "flow", "the reel's lock is now flow"
+        # ...but once a clip exists the lock is absolute: flow dry, krea healthy -> still WAIT
+        fbr.hit_wall("flow", "f1", "block")
+        assert runner.process_job(fst, fbr, fst.next_queued("failover-proj"), headless=True) == "waiting", \
+            "a reel already shot on flow must WAIT for flow, never jump to krea"
+        print("OK: whole-reel failover — a dry primary moves the whole reel before the first "
+              "clip; after one clip the lock is absolute")
 
         # a broken balance reader must never block a job or clobber the last known number
         fake.read_credits = lambda s: (_ for _ in ()).throw(RuntimeError("no balance on this page"))

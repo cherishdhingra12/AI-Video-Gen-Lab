@@ -62,7 +62,10 @@ Dialogue belongs to the generated clip, spoken by a character on camera, in **Hi
 the line into the scene itself.
 
 **Never** synthesize a voice after the fact: no TTS, no `say`, no narration track mixed in at
-assembly. If the story needs a line, someone in the scene says it.
+assembly. If the story needs a line, someone in the scene says it. QC enforces this: a `vo/`
+folder of separately synthesized lines is a publish-gate (`no-synth-voiceover`), and every new
+reel built from the craft template has no VO path at all — only the background bed is added at
+assembly, under the clips' own audio.
 
 Silent beats are allowed and often better — a card can carry a line nobody speaks.
 
@@ -106,6 +109,10 @@ Per-clip speed ramps (a slow-motion hero shot inside an otherwise normal reel) a
   A source that is cooling or out of credit is **waited out**, never worked around; a delay costs
   an hour, a mixed reel costs the consistency the reel exists for. The engine enforces this
   (`State.project_site` → `Brain.pick(strict=True)`), because no gate can see it afterwards.
+  The **waterfall** picks which site a reel *starts* on: Google Vids first (one consistent
+  character + native in-scene Hindi voice), then Flow, then the rest. Before the first clip lands,
+  an unusable primary moves the **whole** reel to the next site (`runner.process_job` +
+  `State.lock_project`); after the first clip the lock is absolute.
 
 ## 6. When a review cannot run — the by-eye fallback
 

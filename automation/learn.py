@@ -17,6 +17,17 @@ import time
 
 from state import State, backoff_seconds
 
+# The site waterfall (owner's call, 2026-10-10): Google Vids FIRST — it draws one consistent
+# character and carries the native in-scene Hindi voice — then Flow, then everything else.
+# Sites not listed share last place, ordered among themselves by remaining credit. One reel is
+# still ONE source: this only decides which site a reel STARTS on (see runner.process_job).
+SITE_ORDER = ["googlevids", "flow"]
+
+
+def _order(site: str) -> int:
+    return SITE_ORDER.index(site) if site in SITE_ORDER else len(SITE_ORDER)
+
+
 # how a wall maps to an escalation floor (multiplied by 2^prior_hits in backoff)
 _WALL_BASE = {
     "captcha": 600.0,       # 10 min, doubling
@@ -71,11 +82,12 @@ class Brain:
         stall costs a delay, a mix costs the consistency the reel was built for.
         Returns (site,account) or None."""
         cands = self.st.available()
-        # most remaining credit first = spread load, delay hitting any one wall;
-        # then float want_site to the front (stable sort keeps credit order within groups)
-        cands.sort(key=lambda c: c["remaining"], reverse=True)
+        # The house waterfall decides the ORDER: Vids before Flow before the rest, and within a
+        # tier the most remaining credit first (spread load, delay hitting any one wall). This is
+        # a QUALITY order, not a credit order — a small Vids bucket must not lose to a fat krea one.
+        cands.sort(key=lambda c: (_order(c["site"]), -c["remaining"]))
         if want_site:
-            cands.sort(key=lambda c: c["site"] != want_site)
+            cands.sort(key=lambda c: c["site"] != want_site)     # stable: keeps the order above
             if strict:
                 cands = [c for c in cands if c["site"] == want_site]
         for c in cands:
@@ -121,6 +133,22 @@ if __name__ == "__main__":
     st.set_credits("kling", "a1", remaining=2)
     assert br.pick("kling", strict=True) == ("kling", "a1"), \
         "the lock lifts the moment its own source is healthy again"
+
+    # The house waterfall (owner, 2026-10-10): Vids FIRST, then Flow, then everyone else
+    # (credit-sorted among themselves). This is a QUALITY order, not a credit order — a thin
+    # Vids bucket must outrank a fat krea one, or the reel stops being one consistent world.
+    pst = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+    pbr = Brain(pst)
+    pst.set_credits("googlevids", "g1", remaining=1)
+    pst.set_credits("flow", "f1", remaining=9)
+    pst.set_credits("krea", "k1", remaining=50)
+    pst.set_credits("kling", "a1", remaining=40)
+    assert pbr.pick() == ("googlevids", "g1"), "Vids wins the waterfall even on 1 credit"
+    pst.spend_credit("googlevids", "g1", 1)                 # Vids dry
+    assert pbr.pick() == ("flow", "f1"), "Flow is next after Vids"
+    pst.spend_credit("flow", "f1", 9)                       # Flow dry too
+    assert pbr.pick() == ("krea", "k1"), "beyond Vids/Flow the most remaining credit wins"
     print(f"OK: consult->go, wall cools+escalates ({cd1:.0f}->{cd2:.0f}s), "
           f"scheduler routes around cooling accounts and reroutes off a dead want_site — "
-          f"but a STRICT want_site (one reel, one look) waits instead of rerouting")
+          f"but a STRICT want_site (one reel, one look) waits instead of rerouting; "
+          f"the waterfall is Vids->Flow->rest, not credit-ordered")

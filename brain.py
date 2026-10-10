@@ -409,9 +409,30 @@ class LocalBrain:
         except Exception:
             pass
 
+    _HARVEST_LOG = os.path.join(AUT, ".harvest.log")
+
+    def _hlog(self, r: dict, sess: str):
+        """Durable trace of every harvest. A run that learned NOTHING and a hook that never
+        FIRED both printed nothing before, so the two were indistinguishable — that hole hid a
+        dead hook for five days. One JSON line per call is the signal that tells them apart."""
+        try:
+            rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "session": sess,
+                   "new": r.get("new", 0), "learned": r.get("learned", []),
+                   "error": r.get("error"), "reason": r.get("reason")}
+            with open(self._HARVEST_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     def harvest(self, hook: dict) -> dict:
-        """Called by a Stop hook after each turn: distill any new craft lesson from the fresh
-        conversation turns and self-write it. Fail-open — never breaks the turn."""
+        """Called by a Stop hook after each turn: distill any new craft lesson, log the outcome."""
+        r = self._harvest(hook)
+        self._hlog(r, (hook or {}).get("session_id") or "default")
+        return r
+
+    def _harvest(self, hook: dict) -> dict:
+        """Distill any new craft lesson from the fresh conversation turns and self-write it.
+        Fail-open — never breaks the turn. (harvest() wraps this to record the outcome.)"""
         tp = (hook or {}).get("transcript_path")
         sess = (hook or {}).get("session_id") or "default"
         if not tp or not os.path.exists(tp):
@@ -574,12 +595,18 @@ def _selfcheck():
         f.write(json.dumps({"type": "user", "message": {"role": "user",
                 "content": [{"type": "text", "text": "the white caption box looks fake, blend it"}]}}) + "\n")
     b._CURSOR_FILE = os.path.join(tdir, "cur.json")
+    b._HARVEST_LOG = os.path.join(tdir, "harvest.log")
     _ag.chat = lambda msgs, **k: ('{"lessons":[{"slug":"blend-captions","title":"Blend captions","why":"boxes look fake"}]}', "stub")
     try:
         r = b.harvest({"transcript_path": tp, "session_id": "H"})
         assert "blend-captions" in r.get("learned", []), r
         assert any(l["slug"] == "blend-captions" for l in st.craft_lessons()), "harvested lesson is written"
         assert b.harvest({"transcript_path": tp, "session_id": "H"})["new"] == 0, "cursor skips already-seen turns"
+        # every call leaves a trace, including one that learned NOTHING — a silent no-op and a
+        # hook that never fired used to look identical, which is how a dead hook hid for days
+        logged = [json.loads(l) for l in open(b._HARVEST_LOG, encoding="utf-8")]
+        assert len(logged) == 2 and logged[0]["learned"] == ["blend-captions"], logged
+        assert logged[1]["new"] == 0 and logged[1]["session"] == "H", logged[1]
         # a gateway failure must NOT burn those turns: cursor stays put, the next hook retries
         _ag.chat = lambda msgs, **k: (_ for _ in ()).throw(RuntimeError("gateway down"))
         err = b.harvest({"transcript_path": tp, "session_id": "H2"})

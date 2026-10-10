@@ -231,6 +231,18 @@ class State:
             "AND video_path IS NOT NULL ORDER BY idx LIMIT 1", (project,)).fetchone()
         return row["site"] if row else None
 
+    def lock_project(self, project: str, site: str):
+        """Move a project that has NOT produced a clip yet onto `site`.
+
+        Whole-reel failover: when the primary source is dry/disabled before the first clip lands,
+        the ENTIRE reel follows the runner's pick and this records that decision so every queued
+        scene uses the new site. Only meaningful before any clip is done — once one exists,
+        project_site() owns the lock and nothing may change it (one reel, one source)."""
+        self.db.execute(
+            "UPDATE jobs SET site=?, updated=? WHERE project=? AND status='queued'",
+            (site, time.time(), project))
+        self.db.commit()
+
     # ---- credits ----
     def set_credits(self, site: str, account: str, remaining: int, resets_at: float = 0,
                     source: str = "manual"):
