@@ -31,7 +31,11 @@ Never photoreal. Never live action. Never 2-D. Never a real actor or a real room
 The style anchor is the FIRST sentence of every clip prompt and is **restated verbatim at the
 end** with the negation attached — a style block that sits only at the end is how a reel once
 shipped a photoreal opener in front of 3-D scenes (`agents.clip_prompts` is the fix; its
-self-check is the regression test).
+self-check is the regression test). And the medium is **stated at the very START of the build, not
+discovered after a render** (owner rule 2026-10-10): `agents.write_script` and `build_shotlist`
+carry the 3-D requirement and repair a non-animated style to the house anchor, and every clip
+prompt OPENS with `REQUIRED OUTPUT: 3-D ANIMATED VIDEO` before the style block. Catch it at
+generation time; the gate is the last resort, not the first.
 
 Negation to attach verbatim:
 
@@ -39,9 +43,18 @@ Negation to attach verbatim:
 > footage, NOT a 2-D drawing: no real skin pores, no camera grain of a real lens, no
 > photographic realism — every frame, every clip, one single animated look.
 
-*Reels shipped before 2026-10-08 — `apne`, `haath_thaame`, `roz_ki_list` — are photorealistic by
-design and stay as they are. Each reel's `identity.json` declares its own medium and is checked
-against that declaration; a reel that declares nothing gets this default.*
+*Every reel in this house is 3-D. This is a RULE, not the plan's choice, and it is enforced in
+code three ways: `agents.clip_prompts` **replaces** a missing or non-animated style with the
+house 3-D anchor (so a photoreal prompt cannot reach a site), `agents._presentation_selfcheck`
+refuses an identity whose `visual_style` does not read as animation, and the craft gate holds
+every new reel to this medium **no matter what its `identity.json` claims** — a photoreal
+declaration is a description, never a permission (`qc._declared_medium`).*
+
+*The three reels shipped before 2026-10-08 — `apne`, `haath_thaame`, `roz_ki_list` — are
+photoreal by the owner's own design and are grandfathered; that list (`qc.PHOTOREAL_GRANDFATHERED`)
+is CLOSED and no later reel may join it. `dadaji-ka-kahani` (2026-10-10) shipped photoreal when
+the generator drifted and its identity was then rewritten to describe the drift — the gate now
+holds exactly that case.*
 
 ## 2. Subject — old age, with a moral
 
@@ -78,9 +91,29 @@ Baloo 2 (rounded) · Mukta Vaani (rounded) · Rozha One (display serif) · Tiro 
 Devanagari Sangam MN
 
 Place each card in the **emptiest band of the frame it sits over** — sample the frames beneath
-the card, find where there is no face and no detailed business, and put it there. Never over a
-face. Never in the bottom 15% (≈288px of 1080×1920) and never at the far-right edge: the app
+the card, find where there is no face and no detailed business, and put it there. **Never over a
+face.** Never in the bottom 15% (≈288px of 1080×1920) and never at the far-right edge: the app
 paints the handle, caption, audio row and action buttons there.
+
+Faces are **found, not guessed**. Scoring "skin" by colour fails exactly where reels live: a warm
+amber room makes the wall the same RGB as the face, the skin mask fires on most of the picture,
+and the softest patch (the face) wins — which is how the owner came to see a title printed across
+the grandfather's face. Placement asks macOS Vision (on-device, offline) where the faces are and
+prices a face box so nothing can out-bid it; the colour rule survives only as a fallback for a
+machine without Vision. QC re-asks the same question of the finished cut (`caption-on-face`).
+
+## 4b. The film carries no text of its own
+
+The generated clips must contain **no writing at all** — no words on walls, signboards, papers,
+phone or TV screens, clothing or labels, and no subtitle bars or caption cards of their own. Every
+card is added *after* the cut, in this caption system. A generator that is even hinted at showing
+text renders **gibberish Devanagari** baked into the frame (a wall of nonsense letters; a phone
+screen of wrong words), and the real card then has to sit over it and reads as a fake.
+
+So the no-text rule is not left to a model's memory: `agents.clip_prompts` appends it to **every**
+clip prompt by code (`NO_TEXT`), and the shot-list prompt forbids asking for a caption, a heading,
+or a screen with text. Writing that *is* the subject of a close-up (a specific sign, a named list)
+is rendered separately and composited — never requested from the generator.
 
 ## 5. One reel, one identity
 
@@ -91,6 +124,25 @@ repeats more than 60% of a prior one.
 Transitions serve the story's motif (a dissolve on a continuous hum; hard cuts on comic timing;
 a match-cut on clasped hands). Speed changes and silence trimming happen at assembly — but
 **never trim an emotional beat**, and never cut a silent moment short because it is silent.
+
+### Camera moves: never *into* things
+
+One gentle move per clip, from four: slow push-in, slow pull-back, pan, drift. **Never** a camera
+that flies, glides, dives or travels **into** a frame, a photo, a screen or an object — the
+generator obeys it literally and the shot becomes a lurching zoom. A memory shown inside a wall
+photo is reached by cutting to it, or by a slow pan **across** it. The owner cut exactly such a
+move (camera pushing into the bicycle frame) out of a reel.
+
+### The gaps between lines
+
+Generated clips pad the line with a beat of nothing on each side, and the ends-only trim cannot
+reach the pause in the middle — so a 10s clip carrying 5s of speech shipped with the other 5s
+spread as dead air, and the owner heard "a lot of gap between the dialogues". An internal pause
+longer than `GAP_MIN` (0.8s) **is** dead air and is compressed to `GAP_KEEP` (0.25s) a side;
+anything shorter is a breath and stays exactly where the performance put it. The cut runs on
+picture and sound together, so lip-sync never moves. This is what makes the reel **shorter** and
+**crisper** rather than merely faster — and it is why speed stays a taste call (below) instead of
+the default fix for a slow reel.
 
 - **Pace (`speed`)** — a whole-reel pace adjustment, applied to picture and sound together so
   lip-sync stays locked and the pitch holds. It is **off by default** (a reel plays at its own

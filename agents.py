@@ -64,10 +64,48 @@ def _wavelength() -> str:
         return ""
 
 
+_brief_cache = None
+
+
+def _brief() -> str:
+    """The brain's own craft lessons, put in FRONT of every agent — the pre-generation trigger.
+
+    Before this, the brain was consulted only AFTER the fact: `absorb()` audited the finished
+    reel and `qc.run()` gated it, so a lesson learned from one reel (a card on a face, text the
+    generator baked in, dead air between lines) could not shape the NEXT one's prompts — it could
+    only fail it at the gate. This reads the same `craft_lessons` the gate enforces and hands them
+    to the writer, shot-lister and art-director as rules to obey WHILE writing.
+
+    Process rules (commit hygiene, db paths, monitoring) are filtered out — see
+    State.film_lessons. Fail-open: no brain / no db -> "", and the pipeline runs unchanged."""
+    global _brief_cache
+    if _brief_cache is not None:
+        return _brief_cache
+    try:
+        sys.path.insert(0, os.path.join(_DIR, "automation"))
+        from state import State
+        st = State()
+        try:
+            rows = st.film_lessons()
+        finally:
+            st.close()
+        if rows:
+            _brief_cache = ("RULES THIS PROJECT HAS ALREADY LEARNED — every one of these was a "
+                            "real defect in a shipped reel. Obey them while you write:\n"
+                            + "\n".join(f"- {r['title']}" for r in rows))
+        else:
+            _brief_cache = ""
+    except Exception:  # noqa: BLE001 — a missing brain must never cost a reel
+        _brief_cache = ""
+    return _brief_cache
+
+
 def _system(role: str) -> str:
-    """A role prompt with the house wavelength in front of it, so no agent can forget it."""
-    wl = _wavelength()
-    return f"{wl}\n\n---\n\n{role}" if wl else role
+    """A role prompt with the house wavelength AND the brain's learned craft rules in front of
+    it, so no agent writes without them — and so a lesson the brain has just learned lands on
+    the very next run."""
+    parts = [p for p in (_wavelength(), _brief(), role) if p]
+    return "\n\n---\n\n".join(parts)
 
 
 # A free router answers a 429 "Too Many Requests" most days. Falling through to the next gateway
@@ -127,6 +165,8 @@ def write_script(idea: str, seconds: int = 15) -> str:
     user = (
         f"IDEA: {idea}\n\n"
         f"Write a script for a ~{seconds}-second cinematic video. Include:\n"
+        "- MEDIUM: this is a 3-D ANIMATED film — a stylized animated-feature look, never photoreal, "
+        "never live action. Write every beat as it would look animated.\n"
         "- LOGLINE: one sentence.\n"
         "- VISUAL STYLE: palette, 3-D animation look, mood (one paragraph).\n"
         "- BEATS: a numbered beat-by-beat of the visual action and, for each beat, the exact "
@@ -143,13 +183,13 @@ def write_script(idea: str, seconds: int = 15) -> str:
 _SCHEMA = """{
   "title": "short title",
   "slug": "a short lowercase ASCII folder name for this reel — letters, digits and dashes only, e.g. 'the-tailors-thread'. A Hindi title MUST be transliterated here; this names the reel's folder on disk, so it must not be empty or a placeholder.",
-  "world": "the LOCKED universal anchor: setting/place, time of day, weather, season, overall lighting & color atmosphere, and the recurring subject's fixed description (who/what, exact clothes/colors/features). This never changes across clips.",
+  "world": "the LOCKED universal anchor: setting/place, time of day, weather, season, overall lighting & color atmosphere, and the recurring subject's fixed description (who/what, exact clothes/colors/features). This never changes across clips. It MUST also state that the room and every surface in it are clean of writing — no text, signage, papers with words, screen text or lettering.",
   "style": "the 3-D animation anchor from WAVELENGTH.md §1 — the phrase every clip prompt opens AND closes with (rounded shapes, soft global illumination, cinematic lighting, shallow depth of field)",
   "music_mood": "search words for the background score this reel needs, in plain English — e.g. 'mournful solo bansuri evening raga' or 'playful indian folk dholak festive'. Used to search for a track when nothing in the library fits.",
   "music_want": "one of exactly: bright | playful | warm | neutral | tender | mournful | sombre — where this reel's score sits on the brightness scale. A comic reel is bright; a reel about loss is mournful.",
   "aspect": "9:16",
   "clips": [
-    {"idx": 0, "prompt": "a COMPLETE text-to-video prompt for ONE ~5s shot: the action + camera move in THIS shot. It will be sent to a frontier video site as-is, with 'world' prepended and 'style' appended automatically.", "dialogue": "the Hindi line a character SPEAKS ON CAMERA in this shot, or an empty string for a silent beat. This is written into the generation prompt so the clip's own audio carries it — there is no narration track added later."}
+    {"idx": 0, "prompt": "a COMPLETE text-to-video prompt for ONE ~5s shot: the action + camera move in THIS shot. It will be sent to a frontier video site as-is, with 'world' prepended and 'style' appended automatically. Name ONE gentle camera move (slow push-in / pull-back / pan / drift). Never ask the shot to show text or a caption card, or to move the camera INTO a frame or object.", "dialogue": "the Hindi line a character SPEAKS ON CAMERA in this shot, or an empty string for a silent beat. This is written into the generation prompt so the clip's own audio carries it — there is no narration track added later."}
   ]
 }"""
 
@@ -168,6 +208,11 @@ def build_shotlist(script: str, aspect: str = "9:16", clip_seconds: int = 5) -> 
         f"SCRIPT:\n{script}\n\n"
         f"Produce a shot plan as JSON with EXACTLY this shape:\n{_SCHEMA}\n\n"
         "RULES:\n"
+        "- MEDIUM: this reel is 3-D ANIMATION — 'style' MUST describe a stylized animated-feature "
+        "look (rounded shapes, soft global illumination) and must contain the words '3-D "
+        "animation'. Never photoreal, never live action, never documentary or real footage. If "
+        "'style' does not read as animation the build REPLACES it with the house anchor, so write "
+        "it as animation from the start.\n"
         "- Write 'world' FIRST and make it rich and specific — it is prepended to "
         "every clip prompt, so no clip can drift or hallucinate a new place/character.\n"
         "- 3 to 6 clips. Each 'prompt' is a COMPLETE, self-contained ~"
@@ -181,6 +226,21 @@ def build_shotlist(script: str, aspect: str = "9:16", clip_seconds: int = 5) -> 
         "the same man.\n"
         "- Keep the recurring subject identical shot to shot. Use gentle, continuous "
         "camera moves (slow push-in, drift, pan) so consecutive clips cut together smoothly.\n"
+        "- CAMERA MOVES: ONE move per clip, and it must be gentle and continuous. NEVER write "
+        "a camera that flies, glides, dives or travels INTO a frame, a photo, a screen or an "
+        "object — the generator obeys it literally and the shot becomes a lurching zoom nobody "
+        "asked for (the owner cut exactly that move out of a reel). A memory shown INSIDE a wall "
+        "frame is reached by cutting to it, or by a slow pan or drift ACROSS it — never by the "
+        "camera entering it. Slow push-in, slow pull-back, pan, drift: those four, nothing else.\n"
+        "- NO TEXT, NO CAPTIONS, NO SUBTITLES — EVER. Nothing written, printed, drawn, embroidered, "
+        "engraved or shown on any surface in the shot: no words on walls, signboards, papers, "
+        "books, phone or TV screens, labels or clothing; no subtitle bars, no title or caption "
+        "cards, no lettering of any kind, in any script. State this in every clip prompt in your "
+        "own words, positively — 'a clean frame with no writing anywhere' — because the film must "
+        "carry no text of its own: every caption and card is added to the finished cut afterwards. "
+        "A prompt that asks the generator for a caption, a title, a heading, or a screen with text "
+        "on it gets gibberish Devanagari baked into the frame, and the real card then has to sit "
+        "over it and read as fake (the owner caught exactly this in a closing shot).\n"
         "- 'music_mood' + 'music_want' describe the SCORE the reel needs, and must agree "
         "with its feeling: a solemn raga under a comic beat is the wrong film. Write the "
         "mood as words someone would actually search for.\n"
@@ -191,7 +251,14 @@ def build_shotlist(script: str, aspect: str = "9:16", clip_seconds: int = 5) -> 
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         max_tokens=4000, temperature=0.7,
     )
-    return _extract_json(text)
+    shot = _extract_json(text)
+    # Decide the medium at the START, not after a render: a plan whose style does not read as
+    # animation gets the house 3-D anchor here, so the shot list itself is honest and the script,
+    # the shot list and the clip prompts all agree (owner rule 2026-10-10). clip_prompts enforces
+    # it again on the way out; this is the earliest catch.
+    if isinstance(shot, dict) and not _is_animated(shot.get("style") or ""):
+        shot["style"] = HOUSE_STYLE
+    return shot
 
 
 PROMPT_CHARS = 4000          # keep a typed prompt inside every site's input comfortably
@@ -239,6 +306,31 @@ def _char_lock(shot: dict) -> str:
             "swapping or redesigning between shots.")
 
 
+# Attached to EVERY clip prompt by code, not by a model's good behaviour. The generator bakes
+# gibberish lettering into a frame the moment a prompt even hints at text (a "caption card", a
+# phone screen, a sign), and the real card then reads as a fake pasted over nonsense — the owner
+# caught it in a closing shot. Asking the LLM to remember is not a guarantee; this is.
+NO_TEXT = ("No text of any kind anywhere in the frame: no words, letters, captions, subtitles, "
+           "title cards, signage, labels, or writing on walls, papers, screens or clothing — in "
+           "any script. A clean frame with nothing written on it; all captions are added later.")
+
+
+# The house medium, enforced by code. This house renders 3-D animation, always (WAVELENGTH.md §1;
+# owner rule 2026-10-10 for every Standard Sunrise reel). A plan's own style wins when it IS
+# animated — that is what gives each reel its distinct look — but a missing or non-animated style
+# is REPLACED by this, the same guarantee NO_TEXT makes. A photoreal plan (or a generator that
+# ignored the prompt) can no longer slip a real-looking frame past the pipeline.
+HOUSE_STYLE = ("soft stylized 3-D animation in a high-end animated-feature look: rounded shapes, "
+               "soft global illumination, cinematic lighting, shallow depth of field")
+
+# Stated at the very START of the build so the MODEL knows the medium BEFORE it generates, not
+# after (owner rule 2026-10-10: "make sure it is identified at the beginning of the project before
+# the video is generated"). It reaches every layer — agent 1's script prompt, agent 2's shot list
+# and its returned `style`, and the FIRST line of every clip prompt that actually goes to a site.
+MEDIUM_REQUIREMENT = ("REQUIRED OUTPUT: 3-D ANIMATED VIDEO — a stylized animated-feature look in "
+                      "every frame, never photoreal, never live action, never real footage, never 2-D.")
+
+
 def clip_prompts(shot: dict) -> list:
     """Materialize the final per-clip prompts. This is what gets pasted into each site.
     Kept here so the runner/pipeline stay dumb.
@@ -251,15 +343,20 @@ def clip_prompts(shot: dict) -> list:
     plus an explicit character lock. Long shots trim the lead back off rather than overflow.
     """
     world = (shot.get("world") or "").strip()
+    # The house renders 3-D, always — not the plan's to choose. An animated style wins (it
+    # carries the reel's own distinct look); a missing OR non-animated one is replaced by the
+    # house anchor, by code, exactly as NO_TEXT is. A photoreal prompt cannot reach a site.
     style = (shot.get("style") or "").strip()
-    if not style:
-        return [", ".join(p for p in (world, c["prompt"].strip()) if p)
-                for c in sorted(shot.get("clips", []), key=lambda x: x.get("idx", 0))]
+    if not _is_animated(style):
+        style = HOUSE_STYLE
 
     anti = _anti(style)
     lock = _char_lock(shot)
-    head = "STYLE for every frame of this clip, no exceptions: " + style.split(".")[0].strip() + "."
-    tail = ", ".join(p for p in (style, anti, lock) if p)
+    # The medium is the FIRST thing a site reads, so the requirement to render 3-D animation is
+    # stated before anything else — catching the medium at generation time, not after.
+    head = (MEDIUM_REQUIREMENT + " STYLE for every frame of this clip, no exceptions: "
+            + style.split(".")[0].strip() + ".")
+    tail = ", ".join(p for p in (style, NO_TEXT, anti, lock) if p)
     out = []
     for c in sorted(shot.get("clips", []), key=lambda x: x.get("idx", 0)):
         says = (c.get("dialogue") or "").strip()
@@ -431,16 +528,21 @@ def _prompt_selfcheck(shot):
     world = (shot.get("world") or "").strip()
     prompts = clip_prompts(shot)
     assert len(prompts) == len(shot["clips"]), "clip_prompts count mismatch"
-    if not style:                                   # a plan with no style block still builds
-        return True
     for i, pr in enumerate(prompts):
-        assert pr.lower().startswith("style for every frame"), \
-            f"clip {i}: the style anchor must LEAD — appended last, an early shot drifts photoreal"
+        assert pr.startswith(MEDIUM_REQUIREMENT), \
+            f"clip {i}: the 3-D requirement must LEAD every prompt — the medium is caught at " \
+            "generation time, before a photoreal frame is ever rendered"
+        assert "style for every frame" in pr.lower(), \
+            f"clip {i}: the style anchor must follow the requirement — appended last, an early " \
+            "shot drifts photoreal"
         assert world[:15].lower() in pr.lower(), f"clip {i}: world anchor must be present"
         assert shot["clips"][i]["prompt"][:20].lower() in pr.lower(), \
             f"clip {i}: the shot description must be present"
         assert "NOT photorealistic" in pr, \
             f"clip {i}: the anti-photoreal negation must be attached"
+        assert NO_TEXT in pr, \
+            f"clip {i}: the no-text rule must reach EVERY prompt — the model cannot be trusted " \
+            "to remember it, so clip_prompts attaches it by code"
         # narration lives IN the clip (WAVELENGTH.md §3): a shot's spoken line must reach the
         # generation prompt, because there is no assembly-time track to carry it instead
         _says = (shot["clips"][i].get("dialogue") or "").strip()
@@ -487,15 +589,63 @@ if __name__ == "__main__":
             "a silent beat must not acquire a line it never had"
         # a plan with no style block must still produce one prompt per clip, uncrashed
         _nostyle = dict(_shot, style="")
-        assert len(clip_prompts(_nostyle)) == 3, "a styleless plan must still build every clip"
+        _ns = clip_prompts(_nostyle)
+        assert len(_ns) == 3, "a styleless plan must still build every clip"
+        assert all(HOUSE_STYLE.lower() in p.lower() for p in _ns), \
+            "a styleless plan must be filled in with the house 3-D anchor, not left bare"
+        # A plan that asks for PHOTOREAL is replaced by the house 3-D anchor by code (owner rule
+        # 2026-10-10: every Standard Sunrise reel is 3-D). This is the generation-side half of the
+        # dadaji-ka-kahani fix; qc._declared_medium is the gate-side half.
+        _photo = dict(_shot, style="warm amber photoreal render, lifelike grandfather")
+        _pp = clip_prompts(_photo)
+        assert all("NOT photorealistic" in p for p in _pp), \
+            "a photoreal plan must be forced into the house 3-D anchor, anti-photoreal attached"
+        assert all(HOUSE_STYLE.lower() in p.lower() for p in _pp), \
+            "the house 3-D style must fill in for a non-animated plan"
+        # The medium is caught at generation time: EVERY prompt LEADS with the 3-D requirement,
+        # before the style block and the shot — this is what gives the site a chance to render
+        # animation the first time (owner rule 2026-10-10).
+        assert all(p.startswith(MEDIUM_REQUIREMENT) for p in clip_prompts(_shot)), \
+            "every clip prompt must lead with the 3-D requirement, not just describe the scene"
+        # The medium is decided at the START: a shot list whose style does not read as animation
+        # is repaired at build time (chat stubbed), so the plan is honest before any clip is queued.
+        _orig_chat = chat
+        try:
+            globals()["chat"] = lambda *a, **k: (json.dumps({
+                "title": "t", "slug": "s", "world": "A room. BABAJI sits.",
+                "style": "warm amber photoreal render, lifelike grandfather",
+                "music_mood": "warm", "music_want": "warm", "aspect": "9:16",
+                "clips": [{"idx": 0, "prompt": "He smiles.", "dialogue": ""}]}), "stub")
+            _sl = build_shotlist("script")
+            assert _is_animated(_sl["style"]), \
+                "build_shotlist must repair a non-animated style to the house 3-D anchor"
+            assert _sl["style"] == HOUSE_STYLE, "the repair uses the house anchor verbatim"
+        finally:
+            globals()["chat"] = _orig_chat
         # a very long plan must be trimmed to fit, never silently overflow
         _big = dict(_shot, world=_shot["world"] + " " + ("extra detail " * 400))
         assert all(len(pr) <= PROMPT_CHARS for pr in clip_prompts(_big)), \
             "an oversized plan must be trimmed to PROMPT_CHARS"
-        print("OK: clip_prompts leads with the style anchor, restates it, negates photorealism, "
-              "locks every character, writes each shot's spoken line INTO the prompt "
-              "(narration comes out of the clip), and fits the input")
-        print("OK: a styleless plan still builds; an oversized plan is trimmed, not dropped")
+        print("OK: clip_prompts LEADS with the 3-D requirement, then the style anchor (restated), "
+              "negates photorealism, locks every character, writes each shot's spoken line INTO "
+              "the prompt (narration comes out of the clip), and fits the input")
+        print("OK: a styleless or photoreal plan — and a photoreal shot list — is filled in with "
+              "the house 3-D anchor at the START; an oversized plan is trimmed, not dropped")
+
+        # --- the pre-generation trigger: the brain's learned rules reach the system prompt ---
+        # This is the owner's ask — the brain must fire BEFORE a generation, not only audit after.
+        _b = _brief()
+        if _b:
+            assert "already learned" in _b.lower(), "the brief must read as rules, not raw rows"
+            assert _brief() is _b, "the brief is cached — one db read per process, not per call"
+            assert _b in _system("ROLE TEXT"), \
+                "the learned rules must sit in FRONT of every agent's system prompt"
+        # a film rule reaches the brief; a PROCESS rule must NOT (it is not about the film)
+        import state as _state_mod
+        assert "verify-untracked-before-commit" in _state_mod.OFF_FILM, \
+            "a commit-hygiene rule must be classified as off-film"
+        print(f"OK: the brain briefs every agent before it writes ({len(_b)} chars of learned rules)"
+              if _b else "OK: no brain present — agents still run (fail-open)")
 
         # --- presentation(): the identity + the caption cards the engine must author itself ---
         def _ident(ident_over=None, caps=None):

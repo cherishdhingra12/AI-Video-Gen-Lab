@@ -53,6 +53,20 @@ def main():
     if not idea:
         sys.exit("need an idea")
 
+    st = State()
+    # The brain fires BEFORE anything is written: its learned craft rules are put in front of all
+    # three agents (agents._brief), and re-seeding here means a lesson added to qc.LESSONS since
+    # the last run reaches this one. This is the pre-generation trigger the owner asked for — the
+    # brain used to be consulted only AFTER a reel shipped, so it could fail a reel but never
+    # steer it.
+    try:
+        import qc as _qc
+        _qc.seed(st)
+        _n = len(st.film_lessons())
+        print(f"brain — {_n} learned craft rule(s) primed into every agent")
+    except Exception as e:  # noqa: BLE001 — no brain must never cost a reel
+        print(f"brain preflight skipped ({str(e)[:100]})")
+
     print("agent 1 — writing script...")
     script = agents.write_script(idea)
     print("agent 2 — building shot list...")
@@ -70,8 +84,6 @@ def main():
         f.write(f"# {shot.get('title')}\n\nIDEA: {idea}\n\n{script}")
     with open(os.path.join(pdir, "shotlist.json"), "w") as f:
         json.dump(shot, f, indent=2)
-
-    st = State()
 
     # agent 3 — the reel's identity + its caption cards. These are the two files the owner used
     # to hand-write per reel, which is why the engine could never finish one on its own. The

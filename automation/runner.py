@@ -242,6 +242,13 @@ def _gate(st: State, project_dir: str):
 
 def loop(once: bool = False, headless: bool = True):
     st, br = State(), Brain()
+    # 0) prime the brain: re-seed its canonical lessons so one added to qc.LESSONS since the last
+    # run reaches THIS one (the pre-generation trigger, at the driving end). Fail-open.
+    try:
+        import qc as _qc
+        _qc.seed(st)
+    except Exception as e:  # noqa: BLE001
+        print(f"  brain preflight skipped ({str(e)[:100]})")
     # 1) resume anything caught mid-flight by a shutdown — as if it never happened
     for job in st.resume():
         print(f"resuming clip {job['project']}#{job['idx']} (was {job['status']})")
@@ -417,7 +424,8 @@ if __name__ == "__main__":
         assert os.path.exists(final), f"the pass must assemble {final}"
         import assemble as _asm
         assert not _asm.verify_playable(final, _asm._dur(final)), "the assembled reel must play"
-        assert sorted(f for f in os.listdir(_pd) if f.startswith("caption_")) == \
+        assert sorted(f for f in os.listdir(_pd)
+                      if f.startswith("caption_") and f.endswith(".png")) == \
             ["caption_cta.png", "caption_hook.png", "caption_moral.png"], \
             "the assembler must place all three cards"
         q = st.qc_verdicts("selftest")

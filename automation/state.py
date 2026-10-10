@@ -33,6 +33,14 @@ DB_PATH = os.path.join(os.path.dirname(_DIR), "state.db")
 # steps that mean "in flight" — a restart must pick these back up
 LIVE = ("submitting", "rendering", "downloading")
 
+# Craft lessons that describe the WORK rather than the FILM. They are real rules and stay enforced
+# by the gate/tooling, but they must never be primed into a video-generation prompt — see
+# State.film_lessons. Everything not listed here is treated as a film rule.
+OFF_FILM = {
+    "verify-untracked-before-commit", "use-correct-db-path", "monitor-db-status-not-stdout",
+    "record-standing-policy", "defer-unverified-asset-removal", "regression-assert-timing",
+}
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
   id INTEGER PRIMARY KEY,
@@ -348,6 +356,17 @@ class State:
                 "SELECT * FROM craft_lessons WHERE tier=? ORDER BY id", (tier,)).fetchall()
         return self.db.execute("SELECT * FROM craft_lessons ORDER BY id").fetchall()
 
+    def film_lessons(self) -> list:
+        """The craft lessons that describe the FILM itself — the brief every agent is primed with
+        before it writes, and the pre-generation trigger. The tooling lessons below stay out: they
+        are instructions about how the work is committed, monitored and verified, not about what
+        the reel must contain, and pasting 'verify untracked files before committing' into a
+        video-generation prompt is noise the model then has to ignore.
+
+        ponytail: a hand-kept deny-list. Add a slug here when a new process rule appears; a film
+        rule wrongly left in costs a few tokens, a process rule wrongly kept costs clarity."""
+        return [l for l in self.craft_lessons() if l["slug"] not in OFF_FILM]
+
     # ---- reel identity fingerprints (so a new reel can't silently reuse an old one's look) ----
     def record_identity(self, reel: str, fp: str):
         self.db.execute(
@@ -516,6 +535,14 @@ if __name__ == "__main__":
     assert len(all_l) == 2, f"upsert by slug must not duplicate: {len(all_l)}"
     assert [l["slug"] for l in all_l if l["slug"] == "caption-safe-area"][0]
     assert st.craft_lessons(tier="judgment")[0]["slug"] == "style-consistency"
+
+    # film_lessons: the pre-generation brief. A process rule (commit hygiene) must be held back
+    # from the agents — pasting it into a video prompt is noise — while a film rule reaches them.
+    st.learn_lesson("verify-untracked-before-commit", "Verify untracked files before committing")
+    _film = {l["slug"] for l in st.film_lessons()}
+    assert "caption-safe-area" in _film, "a craft rule about the film must reach the agents"
+    assert "verify-untracked-before-commit" not in _film, \
+        "a process rule must never be primed into a video-generation prompt"
 
     # identity fingerprints: only OTHER reels count as a collision surface
     st.record_identity("reel_a", '{"opener":"reveal","font":"Didot"}')

@@ -9,6 +9,14 @@ Placement is the part that did not exist: every card shipped so far was hand-tun
 projects/roz_ki_list/render_caption.py — "Was y790, grazed her chin"). This samples the frames
 the card will actually sit over and puts the card where there is no face and no busy detail.
 
+FACES ARE FOUND, NOT GUESSED. The first version of this scored "skin" by colour and it failed
+exactly where reels live: a warm amber living-room makes the wall the same RGB as the face, so
+the skin mask fired on 78% of pixels, the "avoid a face" term became noise, and placement printed
+the opening title straight across the grandfather's face — the owner caught it. The colour rule is
+kept only as a last-ditch fallback. The real answer is macOS Vision (visionkit.swift, on-device,
+offline, no dependency): it finds the face on the same frame the colour rule missed. A face box
+is charged a cost an order of magnitude above any texture, so a card can never out-bid it.
+
 This ffmpeg has no drawtext and Chromium shapes Devanagari correctly, so cards are screenshotted
 from HTML at native size — the same trick those per-project scripts used, generalised here.
 
@@ -25,6 +33,8 @@ from PIL import Image
 W, H = 720, 1280
 BOTTOM_CLEAR = 0.15          # app UI lives here (handle / caption / audio row / buttons)
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+FACE_COST = 40.0             # the cost of one face pixel: nothing in the frame outranks a face
+FACE_SAMPLES = 6             # frames sampled across the card's window for the face boxes
 
 # The wavelength's rotating Devanagari faces, by feel rather than by name.
 FONTS = {
@@ -46,10 +56,84 @@ def _sample(video, t0, t1, n):
     return out
 
 
-def _cost_map(png):
-    """Per-pixel 'do not put text here'. Busy detail AND skin, because the thing a card must
-    never cover is a face — and a soft-focus face is low-detail enough that edge energy alone
-    would happily print a title across it."""
+# ---- the native helper: Apple Vision via a compiled Swift shim -------------------------------
+# Built once, cached next to this file. Everything is fail-open: if the machine has no Swift or
+# Vision, the caller silently gets the old colour-rule behaviour rather than a broken build.
+_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+_SWIFT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visionkit.swift")
+BIN = os.path.join(_CACHE, "visionkit")
+
+
+def _ensure_bin():
+    """Path to the compiled helper, or None when it cannot be built on this machine."""
+    if os.path.exists(BIN) and os.path.getmtime(BIN) >= os.path.getmtime(_SWIFT):
+        return BIN
+    if not (os.path.exists("/usr/bin/swiftc") and os.path.exists(_SWIFT)):
+        return None
+    try:
+        os.makedirs(_CACHE, exist_ok=True)
+        r = subprocess.run(["/usr/bin/swiftc", "-O", _SWIFT, "-o", BIN],
+                           capture_output=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return BIN if r.returncode == 0 and os.path.exists(BIN) else None
+
+
+def _pixel_boxes(pngs, mode):
+    """Run the helper over frames already in memory. Returns, per frame, a list of
+    (x, y, w, h) pixel boxes. Empty (not an exception) when Vision is unavailable — a missing
+    helper must degrade to the fallback rule, never crash a build."""
+    binp = _ensure_bin()
+    if not binp or not pngs:
+        return [[] for _ in pngs]
+    import tempfile
+    d = tempfile.mkdtemp()
+    paths = []
+    for i, p in enumerate(pngs):
+        fp = os.path.join(d, f"f{i}.png")
+        with open(fp, "wb") as f:
+            f.write(p)
+        paths.append(fp)
+    try:
+        r = subprocess.run([binp, mode, *paths], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return [[] for _ in pngs]
+    out = [[] for _ in pngs]
+    for ln in r.stdout.splitlines():
+        f, _, rest = ln.partition("\t")
+        if not f or rest.strip() in ("", "ERR"):
+            continue
+        i = paths.index(f)
+        for tok in rest.split("|"):
+            body = tok.strip().split(":")[0]
+            try:
+                x, y, w, h = (float(v) for v in body.split(","))
+            except ValueError:
+                continue
+            out[i].append((x, y, w, h))
+    return out
+
+
+def faces(pngs):
+    """Face boxes (x, y, w, h) per frame, via macOS Vision. Empty lists on any failure."""
+    return _pixel_boxes(pngs, "faces")
+
+
+def text_boxes(pngs):
+    """Readable-writing boxes per frame, via macOS Vision OCR. The scripts this machine's
+    Vision ships decide how much it can read — Devanagari is not universal, so a clean answer
+    means "no writing I can read", which is not the same as "no writing". Use it as a triage
+    signal for the eyes, never as a pass."""
+    return _pixel_boxes(pngs, "ocr")
+
+
+def _cost_map(png, face_boxes=()):
+    """Per-pixel 'do not put text here'. Busy detail AND, above all, a face: the one thing a
+    card must never cover, whatever the room's colour happens to be.
+
+    The colour-skin term is only a FALLBACK for when Vision found no faces and none could be
+    detected (no Swift/Vision on the machine). On its own it is untrustworthy — see the module
+    docstring — so it is weighted below texture and never allowed to out-rank a real face box."""
     im = Image.open(io.BytesIO(png)).convert("RGB")
     if im.size != (W, H):
         im = im.resize((W, H))
@@ -61,25 +145,38 @@ def _cost_map(png):
     mx, mn = a.max(2), a.min(2)                 # the classic RGB skin rule — permissive on
     skin = ((r > 95) & (gg > 40) & (b > 20) & ((mx - mn) > 15)   # purpose: it must not miss a
             & (np.abs(r - gg) > 15) & (r > gg) & (r > b))        # face on Indian skin tones
-    return edge + 2.0 * skin                    # a face outweighs busy texture
+    cost = edge + 1.0 * skin
+    for x, y, w, h in face_boxes:
+        x0, y0 = max(0, int(x)), max(0, int(y))
+        x1, y1 = min(W, int(x + w)), min(H, int(y + h))
+        if x1 > x0 and y1 > y0:
+            cost[y0:y1, x0:x1] += FACE_COST
+    return cost
 
 
 def find_empty_band(video, t0, t1, height, samples=5):
-    """The y (px) of the emptiest band `height` tall that a card could occupy, searching only
-    the safe vertical range. None when the frames cannot be read."""
-    frames = _sample(video, t0, t1, samples)
+    """The y (px) of the top of the emptiest band `height` tall that a card could occupy,
+    searching only the safe vertical range. None when the frames cannot be read.
+
+    Placement is the MINIMUM worst-case, not the minimum average. A card that covers a face for
+    only a moment is still a card over a face, and averaging let one face sample hide behind four
+    clean ones — so each candidate is scored by the most expensive window anywhere in its run and
+    the cheapest of those wins. A face box is priced so it can never be the cheapest."""
+    frames = _sample(video, t0, t1, max(samples, FACE_SAMPLES))
     if not frames:
         return None
-    cost = np.mean([_cost_map(p) for p in frames], axis=0)
+    fb = faces(frames)          # the same frames the cost map is built from, so boxes line up
+    cost = np.mean([_cost_map(p, fb[i] if i < len(fb) else ()) for i, p in enumerate(frames)],
+                   axis=0)
     x0, x1 = int(0.10 * W), int(0.86 * W)       # the far-right edge is off-limits too
     lo = int(0.04 * H)
     hi = int((1 - BOTTOM_CLEAR) * H) - height
     if hi <= lo:
         return max(0, min(lo, H - height))
-    # ponytail: a sliding window over a mean-cost map, not a saliency model. Good enough to
-    # stop a card landing on a face; upgrade to a real face detector if one ever does.
-    return min(range(lo, hi + 1, max(1, height // 6)),
-               key=lambda y: float(cost[y:y + height, x0:x1].mean()))
+    # ponytail: sliding window over a mean-cost map, not a saliency model. Good enough to stop a
+    # card landing on a face; upgrade to a real saliency model if one ever out-performs this.
+    cands = range(lo, hi + 1, max(1, height // 6))
+    return min(cands, key=lambda y: float(cost[y:y + height, x0:x1].max()))
 
 
 def render(lines, out, y, font="rounded", size=41, color="#FFF3D6", bg="rgba(18,16,14,0.72)",
@@ -113,6 +210,12 @@ def render(lines, out, y, font="rounded", size=41, color="#FFF3D6", bg="rgba(18,
     sz = os.path.getsize(out)
     assert sz > 2000, f"{os.path.basename(out)} too small ({sz} B) — render failed"
     return out
+
+
+def _png_bytes(im):
+    b = io.BytesIO()
+    im.save(b, "PNG")
+    return b.getvalue()
 
 
 if __name__ == "__main__":
@@ -155,6 +258,25 @@ if __name__ == "__main__":
              key=lambda yy: float(c2[yy:yy + 200, x0:x1].mean()))
     assert not (560 <= y2 <= 660), f"placement put a card on the face (y={y2})"
     print("OK: placement scores busy detail + skin, and avoids both")
+
+    # ---- THE REGRESSION: a face box must beat a lower-texture band, even on a warm scene ----
+    # This is the defect the owner caught: on a warm amber frame the colour-skin rule fires on
+    # most of the picture, so the smoothest patch (the soft-focus face) won and the title was
+    # printed across it. A real face box has to out-bid everything.
+    flat = np.full((H, W, 3), (150, 110, 85), np.uint8)      # a warm, low-detail whole frame
+    fb = [(200, 300, 300, 320)]                              # a face sitting in the plain area
+    cface = _cost_map(_png_bytes(Image.fromarray(flat)), fb)
+    fy0, fy1 = 300, 620                                      # the face box's rows
+    lo2 = int(0.04 * H)
+    hi2 = int((1 - BOTTOM_CLEAR) * H) - 200
+    scores = {yy: float(cface[yy:yy + 200, x0:x1].max())
+              for yy in range(lo2, hi2, max(1, 200 // 6))}
+    win = min(scores, key=scores.get)
+    assert not (win < fy1 and win + 200 > fy0), \
+        f"a card would sit on the face box (chose y={win}, face rows {fy0}-{fy1})"
+    assert max(scores[yy] for yy in scores if fy0 <= yy < fy1) >= FACE_COST, \
+        "the face region must be priced above every other band"
+    print("OK: a detected face box out-bids a plainer band — the card never lands on it")
 
     # render: a real Chrome round-trip, skipped only where Chrome is absent
     if os.path.exists(CHROME):

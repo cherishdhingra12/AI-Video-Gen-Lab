@@ -66,9 +66,102 @@ TRIM_KEEP = 0.25
 TRIM_MIN = 0.40
 TRIM_MAX = 1.50
 
+# GENERATED clips put the line in the middle and a beat of nothing on either side — and the
+# ends-only trim above can only reach so far into it. What is left is the owner's "a lot of gap
+# between the dialogues": a clip of 10s carrying 5s of speech. An INTERNAL pause longer than
+# GAP_MIN is dead air, not a performance beat, so it is cut down to GAP_KEEP on each side and the
+# rest is deleted — picture and sound together, syllable-locked. A pause shorter than GAP_MIN is
+# a breath and is left exactly where the performance put it.
+GAP_KEEP = float(os.environ.get("GAP_KEEP", "0.25"))     # the breath left on each side of a cut
+GAP_MIN = float(os.environ.get("GAP_MIN", "0.80"))       # a pause longer than this is dead air
+
 
 def _run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _silences(p):
+    """The quiet windows of an audio file: [(start, end)] at TRIM_DB. The signal the whole
+    trim/gap layer is built on — a silence is a fact about the sound, not an edit decision."""
+    out = _run(["ffmpeg", "-hide_banner", "-i", p, "-af",
+                f"silencedetect=noise={TRIM_DB}dB:d=0.30", "-f", "null", "-"]).stderr
+    st = [float(m) for m in re.findall(r"silence_start: ([\d.]+)", out)]
+    en = [float(m) for m in re.findall(r"silence_end: ([\d.]+)", out)]
+    return list(zip(st, en))
+
+
+def _keep_windows(p):
+    """The spans of a clip to KEEP, in the clip's own time — the complement of everything worth
+    cutting. Ends are cut to TRIM_KEEP (the same beat the ends-only trim always left); an
+    INTERNAL pause is cut down to GAP_KEEP on each side, and only when it is long enough
+    (> GAP_MIN) to be dead air rather than a breath. Returns None when there is no measurable
+    audio or nothing to cut, so the caller leaves the clip alone."""
+    segs = _silences(p)
+    if not segs:
+        return None
+    d = _dur(p)
+    cuts = []
+    for b, e in segs:
+        if b <= 0.15:                                    # opens silent — ends are cut harder
+            cuts.append((0.0, max(0.0, e - TRIM_KEEP)))
+        elif e >= d - 0.15:                              # closes silent
+            cuts.append((min(d, b + TRIM_KEEP), d))
+        elif e - b > GAP_MIN:                            # longer than a breath: it is dead air
+            cuts.append((b + GAP_KEEP, e - GAP_KEEP))    # keep a breath, delete the rest
+    cuts = sorted((s, e) for s, e in cuts if e - s > 0.05)
+    if not cuts:
+        return None
+    merged = [list(cuts[0])]
+    for s, e in cuts[1:]:                                # merge overlapping cuts
+        if s <= merged[-1][1] + 0.02:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    keep, prev = [], 0.0                                 # what is left between the cuts
+    for s, e in merged:
+        if s - prev > 0.30:
+            keep.append((prev, s))
+        prev = max(prev, e)
+    if d - prev > 0.30:
+        keep.append((prev, d))
+    return keep or None
+
+
+def compress_gaps(clips, keep_windows=None):
+    """Rebuild each clip from its keep-windows — ends and internal gaps in ONE pass — and return
+    (shortened clips, total cut seconds, [(head offset, new length)]).
+
+    Speech atoms and silence atoms are concatenated alternately, so no audio is time-stretched:
+    lip-sync cannot move and a line is never clipped mid-word. Doing ends and gaps together is
+    what lets the xfade chain and the card windows stay simple downstream — a clip is just a clip
+    with a real length again, instead of a length plus a trim offset to track."""
+    if not TRIM:
+        return list(clips), 0.0, [(0.0, _dur(c)) for c in clips]
+    out, cut, info = [], 0.0, []
+    for c in clips:
+        wins = (keep_windows or _keep_windows)(c)
+        d = _dur(c)
+        if not wins:
+            out.append(c); info.append((0.0, d)); continue
+        v = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in wins)
+        a = v
+        tmp = c + ".gap.mp4"
+        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", c, "-filter_complex",
+                            f"[0:v]select='{v}',setpts=N/FRAME_RATE/TB,fps=30[v];"
+                            f"[0:a]aselect='{a}',asetpts=N/SR/TB[a]",
+                            "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-profile:v",
+                            "high", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                            "-ar", "48000", "-ac", "2", "-movflags", "+faststart", tmp],
+                           capture_output=True, text=True)
+        nd = _dur(tmp) if r.returncode == 0 and os.path.exists(tmp) else d
+        if nd >= d - 0.05:                     # nothing gained: keep the original, drop the copy
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            out.append(c); info.append((0.0, d)); continue
+        cut += d - nd
+        out.append(tmp)
+        info.append((wins[0][0], nd))          # the head that was dropped, and the new length
+    return out, cut, info
 
 
 def _dur(p):
@@ -151,42 +244,6 @@ def _heal(path):
     os.replace(tmp, path)
 
 
-def _dead_air(clip):
-    """(head, tail) seconds of dead air to cut from a clip's ends. A generated clip usually
-    opens and closes on a beat of nothing; across six of them that is several seconds of the
-    owner's reel spent on silence. `silencedetect` finds the pauses, and only the ones touching
-    an end are eligible."""
-    d = _dur(clip)
-    if d <= 0:
-        return 0.0, 0.0
-    out = _run(["ffmpeg", "-hide_banner", "-i", clip, "-af",
-                f"silencedetect=noise={TRIM_DB}dB:d=0.35", "-f", "null", "-"]).stderr
-    starts = [float(m) for m in re.findall(r"silence_start: ([\d.]+)", out)]
-    ends = [float(m) for m in re.findall(r"silence_end: ([\d.]+)", out)]
-    if not starts or not ends:
-        return 0.0, 0.0
-    head = ends[0] if starts[0] <= 0.15 else 0.0
-    # trailing means it RUNS TO the end — where it starts is irrelevant (a 1s tail starts 1s
-    # before the end, not 0.4s; `silence_end` can also overshoot the clip length slightly)
-    tail = (d - starts[-1]) if ends[-1] >= d - 0.15 else 0.0
-    head = min(max(head - TRIM_KEEP, 0.0), TRIM_MAX)
-    tail = min(max(tail - TRIM_KEEP, 0.0), TRIM_MAX)
-    return (head if head >= TRIM_MIN else 0.0), (tail if tail >= TRIM_MIN else 0.0)
-
-
-def _trims(clips, durs, xf):
-    """Per-clip trims, refusing any that would leave a clip too short to survive the dissolve."""
-    if not TRIM:
-        return [(0.0, 0.0)] * len(clips)
-    out = []
-    for i, c in enumerate(clips):
-        h, t = _dead_air(c)
-        if durs[i] - h - t < xf + 0.8:
-            h = t = 0.0
-        out.append((h, t))
-    return out
-
-
 def _vision():
     import vision
     return vision
@@ -226,9 +283,9 @@ def _absorb(project_dir):
     """Re-audit what actually shipped and file a candidate for any layer that is missing.
     Fail-open: bookkeeping must never turn a finished build into a failed one."""
     try:
-        import brain
-        sys.path.insert(0, ROOT)
-        r = brain.LocalBrain().absorb(project_dir)
+        sys.path.insert(0, ROOT)          # brain.py lives at the project root, not here — the
+        import brain                      # import has to come AFTER the path is set, or a build
+        r = brain.LocalBrain().absorb(project_dir)   # run from automation/ silently never absorbs
         if r.get("ok"):
             gap = ("filed " + ", ".join(r["learned"])) if r.get("learned") else "all layers present"
             print(f"  brain absorbed: {gap}")
@@ -295,13 +352,14 @@ def build(project_dir, clips_dir=None, absorb=True):
     if not style_preflight(clips):
         raise RuntimeError("BUILD REJECTED — style drift; requeue the offending clip")
 
-    # ---- dead air off each end, then the xfade chain; `starts` records where each clip lands
-    #      so cards can be timed against it ----
-    trims = _trims(clips, durs, xf)
-    eff = [durs[i] - trims[i][0] - trims[i][1] for i in range(n)]
-    cut = sum(h + t for h, t in trims)
+    # ---- one pass turns each generated clip into what it should have been: the ends trimmed and
+    #      the dead air between spoken lines compressed. `clips` becomes the shortened files and
+    #      every downstream window is in this new timeline, so nothing has to carry a trim offset.
+    clips, cut, winfo = compress_gaps(clips)
+    durs = [_dur(c) for c in clips]
+    eff = list(durs)
     if cut:
-        print(f"  dead air: cut {cut:.2f}s across {sum(1 for h, t in trims if h or t)} clip(s)")
+        print(f"  dead air: cut {cut:.2f}s (clip ends + the gaps between spoken lines)")
 
     fc, inputs = [], []
     for c in clips:
@@ -316,19 +374,13 @@ def build(project_dir, clips_dir=None, absorb=True):
     FIT = f"scale={W}:{H}:force_original_aspect_ratio=decrease," \
           f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black"
     for i in range(n):
-        h, t = trims[i]
         # FIT is an identity for a clip that is already 9:16, and saves the reel when a site
         # returns a square or 16:9 generation — a mixed-size join otherwise mis-frames silently.
         vf = f"{FIT},format=yuv420p,fps=30,setsar=1"
-        if h or t:
-            vf = f"trim=start={h:.3f}:end={eff[i] + h:.3f},setpts=PTS-STARTPTS," + vf
         fc.append(f"[{i}:v]{vf},{DELOGO}[v{i}]")
         af = "aformat=sample_rates=48000:channel_layouts=stereo"
         if _has_audio(clips[i]):
-            if h or t:
-                af = f"atrim=start={h:.3f}:end={eff[i] + h:.3f},asetpts=PTS-STARTPTS," + af
-            else:
-                af += ",asetpts=PTS-STARTPTS"
+            af += ",asetpts=PTS-STARTPTS"
             fc.append(f"[{i}:a]{af}[a{i}]")
         else:
             fc.append("anullsrc=channel_layout=stereo:sample_rate=48000,"
@@ -364,18 +416,26 @@ def build(project_dir, clips_dir=None, absorb=True):
         windows.append(("cta", n - 1, c0, c1))
 
     vmap, ninp, cards = vprev, n, []
+    placed = {}
     for kind, ci, cs, ce in windows:
         lines = (spec.get(kind) or {}).get("lines") or []
         if ce <= cs or not lines:
             continue
         print(f"  card {kind}: {cs:.2f}-{ce:.2f}s (over clip {ci})")
-        # the window is in REEL time; the source clip's head may have been trimmed, so the
-        # sample window has to be shifted back into the clip's own untrimmed timeline
-        h = trims[ci][0]
-        y, _h = _place(lines, font, 560, clips[ci], max(0.0, cs - starts[ci]) + h,
-                       max(0.1, ce - starts[ci]) + h)
+        # the window is in REEL time; the clip it sits over has already been trimmed in this
+        # timeline, so the sample window is just the offset back into that clip
+        y, h = _place(lines, font, 560, clips[ci], max(0.0, cs - starts[ci]),
+                      max(0.1, ce - starts[ci]))
         png = os.path.join(project_dir, f"caption_{kind}.png")
         caption.render(lines, png, y=y, font=font, **CARD_STYLE)
+        # Wik the card's real ink box and the window it occupies so QC can re-ask "is there a face
+        # under this?" against the shipped cut, without guessing where the card is.
+        _ink = np.asarray(Image.open(png).convert("RGBA").getchannel("A"))
+        _ys, _xs = np.where(_ink > 150)
+        if len(_ys):
+            placed[kind] = {"start": round(cs, 3), "end": round(ce, 3),
+                            "y0": int(_ys.min()), "y1": int(_ys.max()),
+                            "x0": int(_xs.min()), "x1": int(_xs.max())}
         inputs += ["-loop", "1", "-t", f"{total:.3f}", "-i", png]
         oi = ninp
         ninp += 1
@@ -384,6 +444,18 @@ def build(project_dir, clips_dir=None, absorb=True):
         fc.append(f"[{vmap}][capv{oi}]overlay=0:0:enable='between(t,{cs:.3f},{ce:.3f})'[vo{oi}]")
         vmap = f"vo{oi}"
         cards.append(kind)
+
+    if placed:                       # where each card landed, for QC to re-check by face
+        # The window is in PRE-speed reel time; QC samples these times against the SHIPPED cut,
+        # so divide by the pace (below) before writing or the check reads the wrong frames.
+        try:
+            _sp = _speed(project_dir)
+            conv = {k: {**w, "start": round(w["start"] / _sp, 3), "end": round(w["end"] / _sp, 3)}
+                    for k, w in placed.items()}
+            with open(os.path.join(project_dir, "caption_place.json"), "w") as f:
+                json.dump(conv, f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
 
     # ---- gentle fade-out so the closing shot never just stops ----
     if TAIL_FADE > 0:
@@ -464,6 +536,9 @@ def build(project_dir, clips_dir=None, absorb=True):
                     "-video_track_timescale", "90000", "-c:a", "aac", "-b:a", "192k",
                     "-ar", "48000", "-ac", "2", "-movflags", "+faststart", out],
                    check=True, capture_output=True)
+    for c in clips:                       # the compressed temp copies are scratch, always
+        if c.endswith(".gap.mp4") and os.path.exists(c):
+            os.remove(c)
 
     probs = verify_playable(out, out_len)
     if probs:
@@ -509,20 +584,24 @@ if __name__ == "__main__":
                             os.path.join(cdir, f"clip_{i:03d}.mp4")],
                            check=True, capture_output=True)
         # clip 0 gets the dead air a generated clip really ships with: 1.2s of nothing at the
-        # head, 1.0s at the tail, a spoken middle. The trim must find both and nothing else.
+        # head, 1.0s at the tail, a spoken middle — plus a 1.4s hole IN the middle, which is the
+        # owner's "a lot of gap between the dialogues". All three must go; a solid clip must not.
+        _say = "0.5*sin(2*PI*300*t)*(between(mod(t\\,5)\\,1.2\\,3.0)+between(mod(t\\,5)\\,3.95\\,4.4))"
         subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=5",
-                        "-f", "lavfi", "-i", "sine=frequency=440:d=2.8",
-                        "-af", "adelay=1200|1200,apad", "-t", "5",
+                        "-f", "lavfi", "-i", f"aevalsrc={_say}:d=5",
                         "-pix_fmt", "yuv420p", "-shortest",
                         os.path.join(cdir, "clip_000.mp4")],
                        check=True, capture_output=True)
-        h, t = _dead_air(os.path.join(cdir, "clip_000.mp4"))
-        assert 0.8 <= h <= 1.05, f"head dead air not found (got {h:.2f}, want ~0.95)"
-        assert 0.6 <= t <= 0.85, f"tail dead air not found (got {t:.2f}, want ~0.75)"
-        assert _dead_air(os.path.join(cdir, "clip_001.mp4")) == (0.0, 0.0), \
+        kw = _keep_windows(os.path.join(cdir, "clip_000.mp4"))
+        assert kw, "the keep-windows must be found for a clip with ends and an inner gap"
+        assert kw[0][0] >= 0.9, f"the silent head was not dropped (starts {kw[0][0]:.2f})"
+        assert kw[-1][1] <= 4.65, f"the silent tail was not dropped (ends {kw[-1][1]:.2f})"
+        assert len(kw) >= 2 and kw[1][0] - kw[0][1] < 0.60, \
+            f"the inner gap was not compressed (kept {kw[1][0] - kw[0][1]:.2f}s of its ~1s)"
+        assert _keep_windows(os.path.join(cdir, "clip_001.mp4")) is None, \
             "a clip with no dead air must be left completely alone"
-        print(f"OK: dead air measured at the ends only (head {h:.2f}s, tail {t:.2f}s), "
-              "a solid clip untouched")
+        print(f"OK: ends AND the gaps between lines are cut, a solid clip untouched "
+              f"({len(kw)} keep-windows)")
         subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=220:d=20",
                         "-c:a", "libmp3lame", os.path.join(pdir, "music_raw.mp3")],
                        check=True, capture_output=True)
@@ -539,7 +618,8 @@ if __name__ == "__main__":
         naive = 3 * 5 - 2 * 0.40
         assert _dur(out) < naive - 1.2, \
             f"dead air was not cut: reel {_dur(out):.2f}s vs untrimmed {naive:.2f}s"
-        got = sorted(f for f in os.listdir(pdir) if f.startswith("caption_"))
+        got = sorted(f for f in os.listdir(pdir)
+                   if f.startswith("caption_") and f.endswith(".png"))
         assert got == ["caption_cta.png", "caption_hook.png", "caption_moral.png"], got
         for f in got:
             a = np.asarray(Image.open(os.path.join(pdir, f)).convert("RGBA"))[..., 3]
@@ -603,10 +683,17 @@ if __name__ == "__main__":
         assert abs(_dur(fast) - plain / 1.25) < 1.2, \
             f"1.25x pace did not shorten the reel: {_dur(fast):.2f}s vs {plain:.2f}s"
         assert not verify_playable(fast, _dur(fast)), "a paced reel must still play"
-        got = sorted(f for f in os.listdir(pdir) if f.startswith("caption_"))
+        got = sorted(f for f in os.listdir(pdir)
+                   if f.startswith("caption_") and f.endswith(".png"))
         assert got == ["caption_cta.png", "caption_hook.png", "caption_moral.png"], got
         # ...and a speed outside what atempo can do in one stage is ignored, not obeyed blindly
         assert _speed(pdir) == 1.25, "the reel's declared speed must be read"
+        # the recorded card windows are what QC samples against the SHIPPED cut, so a paced reel
+        # must record POST-speed times — a pre-speed window can name a moment past the reel's end
+        place = json.load(open(os.path.join(pdir, "caption_place.json"), encoding="utf-8"))
+        for k, w in place.items():
+            assert w["end"] <= _dur(fast) + 0.2, \
+                f"caption_place {k} ends at {w['end']}s, past the paced reel ({_dur(fast):.2f}s)"
         json.dump({"speed": 9.0}, open(os.path.join(pdir, "identity.json"), "w"))
         assert _speed(pdir) == 1.0, "an unusable speed must fall back to the native pace"
         print(f"OK: declared pace applied ({plain:.2f}s -> {_dur(fast):.2f}s), "

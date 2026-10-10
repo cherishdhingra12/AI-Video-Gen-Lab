@@ -200,13 +200,27 @@ def check_no_synth_voiceover(reel):
     return []
 
 
+_PHOTOREAL_WORDS = ("photoreal", "live action", "documentary", "real footage")
+
+# Reels approved BEFORE the 2026-10-08 house rule, photoreal by the owner's own design. They are
+# grandfathered so the rule never retroactively holds an approved deliverable — and this list is
+# CLOSED: no reel shipped after it may join. (See WAVELENGTH.md §1.)
+PHOTOREAL_GRANDFATHERED = {"apne", "haath_thaame", "roz_ki_list"}
+
+
 def _declared_medium(reel) -> str:
-    """A reel's own declared medium from identity.json, else the house default. Declaring
-    'photorealistic warm documentary' (three shipped reels do, by design) makes the gate check
-    that reel against photoreal; declaring nothing inherits the house 3-D rule."""
-    s = ((reel.identity or {}).get("visual_style") or "").lower()
-    if any(k in s for k in ("photoreal", "live action", "documentary", "real footage")):
-        return "photoreal"
+    """The medium a reel is JUDGED against — the house 3-D rule (WAVELENGTH.md §1) for every reel,
+    whatever its identity.json claims. A photoreal declaration counts ONLY for a grandfathered
+    pre-2026-10-08 reel.
+
+    Before this, ANY reel that wrote 'photorealistic' into identity.json was then checked against
+    photoreal and passed itself — which is exactly how `dadaji-ka-kahani` (2026-10-10) shipped a
+    photoreal reel past a 3-D house rule: the generator drifted and its identity was rewritten to
+    DESCRIBE the drift, and the description disarmed the gate. A declaration is a description, not
+    a permission; the owner's rule (2026-10-10) is that every Standard Sunrise reel is 3-D."""
+    if reel.name in PHOTOREAL_GRANDFATHERED:
+        s = ((reel.identity or {}).get("visual_style") or "").lower()
+        return "photoreal" if any(k in s for k in _PHOTOREAL_WORDS) else _HOUSE_MEDIUM
     return _HOUSE_MEDIUM
 
 
@@ -230,10 +244,8 @@ def check_style_uniform(reel):
                            capture_output=True)
         if r.stdout:
             samples.append(vision.medium_of(r.stdout))
-    # The expected medium is the reel's OWN declaration when it has one, else the house default
-    # (3-D, WAVELENGTH.md §1). Reading it from identity.json is what lets the house 3-D rule bind
-    # NEW reels without retroactively holding the three older photoreal ones — each is checked
-    # against what it declared. (A bare hard-coded '3d' here once held six shipped deliverables.)
+    # Judged against the HOUSE medium (3-D) unless this is a grandfathered pre-2026-10-08 reel —
+    # see _declared_medium. A new reel's own photoreal declaration no longer loosens this.
     verdict, ev = vision.medium_verdict(samples, expected=_declared_medium(reel))
     if verdict == "unknown":
         return [Unreviewed("style classification could NOT run (vision gateway unavailable) — "
@@ -394,7 +406,49 @@ def check_score_present(reel):
     return []
 
 
+def check_caption_on_face(reel):
+    """A caption card must never sit on a face. This is the defect the owner caught: the opening
+    title printed straight across the grandfather's face, because placement scored 'skin' by
+    COLOUR on a warm amber frame — the wall read as skin, the mask became noise, and the softest
+    patch (the face) won. Placement now finds faces with macOS Vision (caption.py), and this reads
+    the final cut the same way, over exactly the window each card occupies (recorded by the
+    assembler in caption_place.json, so a card is never matched against a face from another
+    scene). Offline, deterministic, no vision gateway.
+
+    Best-effort: a face detector can miss an unusual framing, so a clean result is 'the detector
+    found no card over any face', not a guarantee. It only ever raises a flag."""
+    if not reel.final:
+        return []
+    p = os.path.join(reel.dir, "caption_place.json")
+    if not os.path.exists(p):
+        return []                                     # a build from before windows were recorded
+    try:
+        import caption
+        place = json.load(open(p, encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    probs = []
+    for kind, w in sorted(place.items()):
+        frames = []
+        for i in range(5):
+            t = w["start"] + (w["end"] - w["start"]) * (i + 0.5) / 5
+            r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", reel.final,
+                                "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+                               capture_output=True)
+            if r.stdout:
+                frames.append(r.stdout)
+        faces = [f for fr in caption.faces(frames) for f in fr]
+        hits = [f for f in faces
+                if not (f[1] + f[3] < w["y0"] or f[1] > w["y1"])
+                and not (f[0] + f[2] < w["x0"] or f[0] > w["x1"])]
+        if hits:
+            probs.append(f"caption_{kind}.png: a face is inside the card (card y{w['y0']}-"
+                         f"{w['y1']}, face at y{hits[0][1]:.0f}) — it must sit in an empty band")
+    return probs
+
+
 CHECKS = {"playable": check_playable, "caption-safe-area": check_caption_safe_area,
+          "caption-on-face": check_caption_on_face,
           "realism": check_realism, "craft-layers": check_craft_layers,
           "no-synth-voiceover": check_no_synth_voiceover,
           "style-uniform": check_style_uniform,
@@ -412,6 +466,33 @@ LESSONS = [
     dict(slug="caption-safe-area", check_id="caption-safe-area", severity="block",
          title="On-screen text clears the bottom 15% and far-right edge",
          why="the IG app paints the handle, caption, audio row and action buttons there"),
+    dict(slug="caption-never-on-a-face", check_id="caption-on-face", severity="block",
+         title="A caption card NEVER overlaps a face — it sits in the frame's empty band",
+         why="the owner caught the opening title printed straight across the grandfather's face. "
+             "It happened because placement scored 'skin' by COLOUR and a warm amber room made "
+             "the wall read as skin, so the mask was noise and the softest patch won. Placement "
+             "now detects faces with macOS Vision (caption.py) and this check re-answers 'is a "
+             "face under this card?' against the shipped cut"),
+    dict(slug="no-text-in-the-film", tier="judgment", severity="warn",
+         title="The generated film carries NO text of its own — every card is added after the cut",
+         why="a prompt that asks for a caption, a heading or a screen with words gets gibberish "
+             "Devanagari baked into the frame, and the real card then reads as a fake pasted over "
+             "nonsense — the owner caught it in the closing shot. The generator cannot be trusted "
+             "with text, so agents.clip_prompts attaches the no-text rule to EVERY prompt by "
+             "code, and this is the by-eye backstop"),
+    dict(slug="camera-never-into-frame", tier="judgment", severity="warn",
+         title="Camera moves never travel INTO a frame, photo, screen or object",
+         why="the owner cut exactly such a move out of a reel (the camera pushing INTO a wall "
+             "photo). A generator obeys it literally and the shot becomes a lurching zoom. Only "
+             "four moves are allowed — slow push-in, slow pull-back, pan, drift; a memory shown "
+             "inside a photo is reached by cutting to it or panning ACROSS it (WAVELENGTH §5)"),
+    dict(slug="gaps-between-lines", tier="judgment", severity="warn",
+         title="Dead air between spoken lines is compressed, not left as padding",
+         why="the owner heard 'a lot of gap between the dialogues' on a reel whose 10s clips "
+             "carried ~5s of speech: the pause sat INSIDE the clip where an ends-only trim could "
+             "not reach it. assemble.compress_gaps cuts any internal pause longer than GAP_MIN "
+             "(0.8s) to GAP_KEEP (0.25s) a side — never a shorter breath, and picture/sound cut "
+             "together so lip-sync cannot move"),
     dict(slug="visual-realism", check_id="realism", severity="publish-gate",
          title="The finished reel passes a vision realism review (no body-merge, extra limbs, "
                "duplicated objects, garbled baked text, or style drift)",
@@ -430,10 +511,23 @@ LESSONS = [
              "earlier build can skip the mix entirely — the owner hears the gap even when the "
              "file exists"),
     dict(slug="style-uniform", check_id="style-uniform", severity="block",
-         title="One art style for the WHOLE reel — every new reel is 3-D animation",
-         why="per-frame review passes a reel whose scene 1 is photoreal and whose scene 2 is "
-             "animated; WAVELENGTH.md §1 makes 3-D the house medium, so a reel that declares "
-             "nothing and renders photoreal is caught here"),
+         title="Every Standard Sunrise reel is 3-D animation — never photoreal",
+         why="WAVELENGTH.md §1: 3-D is the house medium, and writing 'photorealistic' into "
+             "identity.json is NOT a hatch — a declaration describes, it does not permit. "
+             "dadaji-ka-kahani (2026-10-10) shipped photoreal when the generator drifted and its "
+             "identity was then rewritten to describe the drift, which disarmed this gate; the "
+             "same check also catches a reel that mixes photoreal and animated scenes. Only the "
+             "three pre-2026-10-08 reels (apne, haath_thaame, roz_ki_list) are grandfathered "
+             "(qc.PHOTOREAL_GRANDFATHERED — a CLOSED list)"),
+    dict(slug="medium-stated-first", tier="judgment", severity="warn",
+         title="State the 3-D requirement at the START — script, shot list, and the FIRST line of "
+               "every clip prompt — not after the render",
+         why="owner rule 2026-10-10: catch the medium before generation, don't correct it after. A "
+             "prompt that only describes the SCENE lets the model choose photoreal (dadaji-ka-"
+             "kahani). agents.write_script and build_shotlist carry the requirement (and repair a "
+             "non-animated style to HOUSE_STYLE), and agents.clip_prompts LEADS every prompt with "
+             "'REQUIRED OUTPUT: 3-D ANIMATED VIDEO' then forces the house anchor; the gate "
+             "(style-uniform) is the LAST resort, never the first line of defence"),
     dict(slug="unique-reel-identity", tier="judgment", severity="block",
          title="A fresh identity every reel — opener, fonts, transitions, quote, structure",
          why="repeating an old reel's look is the flaw the owner caught before"),
@@ -475,6 +569,10 @@ LESSONS = [
 
 
 def seed(st):
+    """Push the code's canonical craft lessons into the brain. Upserts by slug, so it is also how
+    a lesson ADDED TO THIS FILE LATER reaches a brain that already exists — running it only when
+    the brain was empty (the old behaviour) meant 'caption-never-on-a-face' and 'no-text-in-the-
+    film', taught to the code this session, never landed in state.db."""
     for l in LESSONS:
         st.learn_lesson(source="memory-rules", **l)
 
@@ -522,8 +620,7 @@ def run(project_dir, st=None):
     """Gate one reel. Returns {'ok', 'block', 'gate', 'warn', 'checklist'}."""
     own = st is None
     st = st or State()
-    if not st.craft_lessons():
-        seed(st)                                      # bootstrap a fresh brain
+    seed(st)                     # upsert, every run: a lesson added to LESSONS lands here too
     reel = Reel(project_dir)
     block, gate, warn, checklist = [], [], [], []
     bucket = {"block": block, "publish-gate": gate, "warn": warn}
@@ -713,9 +810,10 @@ if __name__ == "__main__":
             v3p = run(d3, st)
             assert any("every new reel is 3-D animation" in b for b in v3p["block"]), \
                 f"a reel that declared no medium and rendered photoreal must be HELD: {v3p['block']}"
-            # ...but a reel that DECLARES photoreal is judged against its own declaration. Three
-            # shipped reels here are photorealistic by design, and the house rule must never
-            # retroactively declare them inconsistent with themselves and hold them.
+            # A reel that DECLARES photoreal but is NOT grandfathered is still held to the house
+            # 3-D rule — the declaration is a description, not a hatch a new reel can open. This is
+            # the dadaji-ka-kahani case: a drifted photoreal reel whose identity was rewritten to
+            # say so must be HELD, not passed.
             d6 = tempfile.mkdtemp()
             for _f in ("caption_hook.png", "caption_moral.png", "caption_cta.png"):
                 open(os.path.join(d6, _f), "wb").write(_PNG)
@@ -728,8 +826,27 @@ if __name__ == "__main__":
                             "-shortest", os.path.join(d6, "final_veo.mp4")],
                            check=True, capture_output=True)
             v6 = run(d6, st)
-            assert not any("3-D animation" in b for b in v6["block"]), \
-                f"a reel that DECLARES photoreal is judged against its own declaration: {v6['block']}"
+            assert any("3-D animation" in b for b in v6["block"]), \
+                f"a NON-grandfathered reel declaring photoreal must still be HELD: {v6['block']}"
+            # ...but a GRANDFATHERED reel (approved photoreal before the house rule) is judged
+            # against its own declaration, so the rule never retroactively holds it. Keyed on the
+            # reel's folder name (qc.PHOTOREAL_GRANDFATHERED).
+            g6 = os.path.join(tempfile.mkdtemp(), "apne")
+            os.makedirs(g6)
+            for _f in ("caption_hook.png", "caption_moral.png", "caption_cta.png"):
+                open(os.path.join(g6, _f), "wb").write(_PNG)
+            open(os.path.join(g6, "music_raw.mp3"), "wb").write(b"x")
+            json.dump({"opener": "shadow-play on a wall", "font": "Tiro Devanagari Hindi",
+                       "quote": "Surdas", "structure": "a circle closes",
+                       "visual_style": "photorealistic warm documentary"},
+                      open(os.path.join(g6, "identity.json"), "w"))
+            subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=s=720x1280:d={_RL}",
+                            "-f", "lavfi", "-i", f"sine=frequency=440:d={_RL}", "-pix_fmt", "yuv420p",
+                            "-shortest", os.path.join(g6, "final_veo.mp4")],
+                           check=True, capture_output=True)
+            v6g = run(g6, st)
+            assert not any("3-D animation" in b for b in v6g["block"]), \
+                f"a grandfathered photoreal reel must not be held: {v6g['block']}"
             vision.medium_of = lambda png: "3d"
 
             # character consistency is the ONE cross-scene view of the render: one panel per
@@ -802,9 +919,10 @@ if __name__ == "__main__":
             vision.compare_character = _orig_cmp
 
             # the verdict is DURABLE state, keyed by reel, and a re-run overwrites it
-            # (v6, not v3: d3 is deliberately re-run as a defect just above, so its saved row
-            #  is the HELD one — which is itself proof the upsert overwrites)
-            assert st.qc_verdicts(v6["reel"])[0]["ok"] == 1, "a passing verdict is persisted"
+            # (v6g, the GRANDFATHERED photoreal reel, is the passing one — v6, a NEW reel that
+            #  declared photoreal, is now HELD; d3 is deliberately re-run as a defect just above,
+            #  so its saved row is the HELD one, itself proof the upsert overwrites)
+            assert st.qc_verdicts(v6g["reel"])[0]["ok"] == 1, "a passing verdict is persisted"
             assert st.qc_verdicts(v3["reel"])[0]["ok"] == 0, "a re-run overwrites the saved verdict"
             assert st.qc_verdicts(v["reel"])[0]["ok"] == 0, "a HELD verdict is persisted too"
             # with both finals present the NEWEST cut is gated (stale file must be ignored)

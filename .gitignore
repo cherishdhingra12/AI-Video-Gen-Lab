@@ -17,6 +17,11 @@ automation/.brain_state.json
 automation/.brain_transcripts/
 automation/.brain_hook.log
 
+# compiled macOS Vision shim (per-machine; rebuild from the committed .swift source) + the
+# harvest log (runtime bookkeeping, like .brain_hook.log)
+automation/.cache/
+automation/.harvest.log
+
 # music cache + download scratch (the library itself IS committed — it is the archive of record)
 music/.analysis.json
 music/.candidates/
