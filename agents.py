@@ -56,6 +56,35 @@ _GATEWAYS = {
 }
 _ORDER = [x.strip() for x in ENV.get("LLM_ORDER", "omniroute,freellmapi").split(",") if x.strip()]
 
+# THE MEASURED ASSIGNMENT: role -> {"route", "model", "score"} written by automation/measure.py,
+# which scores each candidate on the role's OWN contract (build_shotlist's plan, the caption
+# judge's planted defect, the vision gate's labelled frames). Read at call time, so a fresh
+# measurement lands on the next call with no restart. Absent or unreadable -> the plain order,
+# which is what every run did before this existed.
+_PICKS_MD = os.path.join(_DIR, "automation", "model_picks.json")
+_picks_cache = (0.0, {})
+
+
+def _picks() -> dict:
+    """(mtime, picks) — re-read only when the file changes, so a run costs one stat per call."""
+    global _picks_cache
+    try:
+        m = os.stat(_PICKS_MD).st_mtime
+    except OSError:
+        return {}
+    if m != _picks_cache[0]:
+        try:
+            with open(_PICKS_MD) as f:
+                _picks_cache = (m, json.load(f))
+        except (OSError, ValueError):
+            return _picks_cache[1]
+    return _picks_cache[1]
+
+
+# measurement-only pin. measure.py sets it to score ONE candidate at a time (no failover: a
+# candidate that falls back is not the candidate being measured). Never set in a normal run.
+_PIN = None
+
 _WAVELENGTH_MD = os.path.join(_DIR, "WAVELENGTH.md")
 
 
@@ -126,7 +155,7 @@ def _retryable(err) -> bool:
     return any(k in str(err) for k in _TRANSIENT)
 
 
-def chat(messages, max_tokens=4000, temperature=0.8, prefer=None):
+def chat(messages, max_tokens=4000, temperature=0.8, prefer=None, role=None):
     """Try each gateway in order; return (text, "gateway:model") from the first
     that returns non-empty content. Raises if all fail.
 
@@ -135,19 +164,36 @@ def chat(messages, max_tokens=4000, temperature=0.8, prefer=None):
     whichever gateway answers first, so the judge takes the other end of LLM_ORDER — a model that
     did not write the line. A preferred gateway that is down costs nothing; the rest still runs.
 
+    `role` asks for the assignment MEASURED for that agent (model_picks.json, written by
+    automation/measure.py): the winning route leads and its model is pinned. Measured, not
+    assumed — each role is scored on its own contract, and a role with no measurement keeps the
+    plain order. The rest of the order still runs behind the pick, so a subordinate takes over
+    without an interruption whenever the winner is walled or slow.
+
     A route the LAST call found walled is skipped, not re-discovered (routerhealth): a 429 costs
     three retries and ~4.5s of sleep per call, and the gate makes dozens of calls per run. If
     every route is cooling they are all tried anyway — a memory of failure must never be the
     reason a run fails."""
-    order = [prefer] + [n for n in _ORDER if n != prefer] if prefer else _ORDER
+    pin_model = {}
+    order = list(_ORDER)
+    pick = (_picks().get(role) or {}) if role else {}
+    if pick.get("route"):
+        pin_model[pick["route"]] = pick.get("model")
+        order = [pick["route"]] + [n for n in order if n != pick["route"]]
+    if prefer:
+        order = [prefer] + [n for n in order if n != prefer]
+    if _PIN:                                 # measurement: exactly this route, no failover —
+        order = [_PIN[0]]                    # a candidate that fell back is not the candidate
+        pin_model[_PIN[0]] = _PIN[1]
     cold = [n for n in order if routerhealth.cooling(n)[0]]
-    if len(cold) == len(order):
+    if len(cold) == len(order) and not _PIN:
         routerhealth.clear()             # nothing left to skip: last resort beats giving up
     errors = []
     for name in order:
         url, key, model, timeout = _GATEWAYS.get(name, (None, None, None, 30))
         if not url or not key:
             continue
+        model = pin_model.get(name) or model
         until, why = routerhealth.cooling(name)
         if until:
             errors.append(f"{name}[cooling {int(until - time.time())}s: {why}]")
@@ -201,7 +247,7 @@ def write_script(idea: str, seconds: int = 15) -> str:
     )
     text, used = chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=2000, temperature=0.9,
+        max_tokens=2000, temperature=0.9, role="script",
     )
     return text
 
@@ -275,7 +321,7 @@ def build_shotlist(script: str, aspect: str = "9:16", clip_seconds: int = 5) -> 
     )
     text, used = chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=4000, temperature=0.7,
+        max_tokens=4000, temperature=0.7, role="shotlist",
     )
     shot = _extract_json(text)
     # Decide the medium at the START, not after a render: a plan whose style does not read as
@@ -614,7 +660,7 @@ def presentation(script: str, shot: dict, prior: list = None) -> dict:
     )
     text, _used = chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=2000, temperature=0.9,
+        max_tokens=2000, temperature=0.9, role="presentation",
     )
     obj = _extract_json(text)
     caps = obj.get("captions")
@@ -746,8 +792,10 @@ def judge_captions(script: str, caps: dict) -> dict:
         # out of budget mid-thought returns prose with no JSON in it.
         max_tokens=4000, temperature=0.4,
         # the other end of the gateway order: the writer took whichever answered first, so the
-        # judge asks the one it probably did not use — a model that did not write the line.
+        # judge asks the one it probably did not use — a model that did not write the line. The
+        # measured pick for this role leads; `prefer` still decides among the rest.
         prefer=_ORDER[-1] if len(_ORDER) > 1 else None,
+        role="judge",
     )
     out = _extract_json(text)
     problems = [str(p).strip() for p in (out.get("problems") or []) if str(p).strip()]
@@ -1091,12 +1139,14 @@ if __name__ == "__main__":
         import routerhealth as _rh
         _rh.clear()
         _tries = {}
+        _sent = {}
         _orig_urlopen = urllib.request.urlopen
         _real_gw = dict(_GATEWAYS)
         try:
             def _fake_open(req, timeout=None):
                 name = "walled" if "walled" in req.full_url else "good"
                 _tries[name] = _tries.get(name, 0) + 1
+                _sent[name] = json.loads((req.data or b"{}").decode()).get("model")
                 if name == "walled":
                     raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
                 class _R:
@@ -1120,6 +1170,46 @@ if __name__ == "__main__":
             assert _t2[0] == "hi", "a cooling route must not break the call"
             assert _tries.get("walled", 0) == 0, \
                 f"a WALLED route must be skipped by the next call, not re-knocked: {_tries}"
+            # THE MEASURED ASSIGNMENT. A role with a pick leads with the picked route AND the
+            # picked model — measured per role, not guessed, and the rest of the order still runs
+            # behind it so a subordinate takes over if the winner is walled.
+            _rh.clear()
+            _tries.clear(); _sent.clear()
+            _orig_picks = _picks
+            try:
+                globals()["_picks"] = lambda: {"z": {"route": "good", "model": "pinned-1"}}
+                assert chat([{"role": "user", "content": "w"}], role="z")[0] == "hi"
+                assert next(iter(_tries)) == "good", \
+                    f"the MEASURED pick must lead the order, not sit behind LLM_ORDER: {_tries}"
+                assert _sent["good"] == "pinned-1", \
+                    f"the pick's model must be the one sent, got {_sent['good']!r}"
+                _tries.clear(); _sent.clear()
+                chat([{"role": "user", "content": "x"}])       # no role -> the plain order
+                assert next(iter(_tries)) == "walled", \
+                    "a call with no role must keep the plain LLM_ORDER"
+            finally:
+                globals()["_picks"] = _orig_picks
+            # …and the picks FILE is what feeds it: read at call time, re-read when it changes.
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as _f:
+                json.dump({"w": {"route": "good", "model": "pinned-2"}}, _f)
+                _pf = _f.name
+            _orig_md, _orig_cache = _PICKS_MD, _picks_cache
+            try:
+                _PICKS_MD = _pf
+                _picks_cache = (0.0, {})
+                assert _picks().get("w", {}).get("model") == "pinned-2", \
+                    "the pick written by measure.py must be read"
+                os.unlink(_pf)
+                with open(_pf, "w") as _f:
+                    _f.write("{ not json")
+                _picks_cache = (0.0, {})           # a corrupt file must not break a run
+                assert _picks() == {} or _picks().get("w") is None, \
+                    "an unreadable picks file must fall back to the plain order, never raise"
+            finally:
+                _PICKS_MD, _picks_cache = _orig_md, _orig_cache
+                if os.path.exists(_pf):
+                    os.unlink(_pf)
             # …and the memory must never be the reason a run fails: with EVERY route cooling,
             # they are all tried anyway rather than raising 'nothing to talk to'.
             assert _rh.cooling("good")[0] == 0, "the route that answered must be healthy"

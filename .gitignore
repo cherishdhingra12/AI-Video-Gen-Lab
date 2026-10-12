@@ -31,3 +31,9 @@ music/.candidates/
 
 # a runner probe log (runtime bookkeeping, like .brain_hook.log)
 automation/.runner-probe.log
+
+# the measured per-agent model assignment (runtime state: a free tier scores go stale)
+automation/model_picks.json
+
+# open crises: a to-do list of the stops waiting on a person, not code
+crises/

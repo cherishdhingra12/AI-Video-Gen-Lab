@@ -59,6 +59,8 @@ run "caption (empty-spot placement + Hindi render)"   "$PY" automation/caption.p
 run "assemble (clips -> reel, auto-placed cards)"     "$PY" automation/assemble.py --selfcheck
 run "music (measure + fit the score, no filename guessing)" "$PY" automation/music.py --selfcheck
 run "vision (offline parsing)"                        "$PY" automation/vision.py --selfcheck
+run "measure (per-agent model scoring + picks)"       "$PY" automation/measure.py --selfcheck
+run "crisis (a stop reaches a person AND the brain)"  "$PY" automation/crisis.py --selfcheck
 run "site adapter base (self-heal click)"             "$PY" automation/sites/base.py
 run "brain (report/reflect/propose/harvest)"          "$PY" brain.py --selfcheck
 
