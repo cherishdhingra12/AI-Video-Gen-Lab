@@ -68,9 +68,18 @@ def main():
         print(f"brain preflight skipped ({str(e)[:100]})")
 
     print("agent 1 — writing script...")
-    script = agents.write_script(idea)
-    print("agent 2 — building shot list...")
-    shot = agents.build_shotlist(script)
+    try:
+        script = agents.write_script(idea)
+        print("agent 2 — building shot list...")
+        shot = agents.build_shotlist(script)
+    except RuntimeError as e:
+        # Every route down is not a bad idea — it is the machine out of options, and re-running
+        # the kickoff cannot fix it. Stop loudly, with the record a person needs, instead of
+        # dying as a traceback that says nothing about what to bring back up.
+        import crisis
+        crisis.gateway_down(e, subject=idea[:60], st=st)
+        st.close()
+        raise SystemExit(2)
     # Shaped for the site this reel opens its bid on (Vids/Flow get a labelled brief, the rest the
     # plain paragraph). A failover moves the WHOLE reel to one site — one reel, one source — so
     # whichever site ends up rendering it gets the same words either way.
