@@ -71,7 +71,10 @@ def main():
     script = agents.write_script(idea)
     print("agent 2 — building shot list...")
     shot = agents.build_shotlist(script)
-    prompts = agents.clip_prompts(shot)
+    # Shaped for the site this reel opens its bid on (Vids/Flow get a labelled brief, the rest the
+    # plain paragraph). A failover moves the WHOLE reel to one site — one reel, one source — so
+    # whichever site ends up rendering it gets the same words either way.
+    prompts = agents.clip_prompts(shot, PRIMARY_SITE)
 
     # the model writes an ASCII slug (it can transliterate; _slug cannot) — fall back to the
     # title for an older plan that predates the field, and to a hash for a Hindi-only title.

@@ -22,6 +22,7 @@ WAL mode + one connection = a power-cut mid-write can't corrupt the file
     for j in st.resume(): ...         # rows stuck mid-flight after a restart
 """
 
+import glob
 import json
 import os
 import sqlite3
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   account   TEXT,
   video_path TEXT,                   -- filled when downloaded
   retries   INTEGER NOT NULL DEFAULT 0,
+  requeues  INTEGER NOT NULL DEFAULT 0,  -- times the GATE sent this clip back; its own budget
   last_error TEXT,
   updated   REAL NOT NULL,
   UNIQUE(project, idx)
@@ -108,6 +110,13 @@ CREATE TABLE IF NOT EXISTS reel_qc (
   verdict TEXT NOT NULL,          -- json: the actual block/gate/warn/checklist lines
   checked REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS eye_review (
+  project TEXT PRIMARY KEY,       -- project dir name (a reel)
+  fp      TEXT NOT NULL,          -- the CUT that was looked at (qc.Reel.fp)
+  by      TEXT NOT NULL,          -- who looked — the sign-off is a person, not a check
+  note    TEXT,                   -- what they saw
+  at      REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS candidate_lessons (
   id INTEGER PRIMARY KEY,
   slug     TEXT NOT NULL UNIQUE,
@@ -126,6 +135,8 @@ CREATE INDEX IF NOT EXISTS ix_brainlog_session ON brain_log(session, processed);
 
 
 class State:
+    _synced = False               # fingerprints backfilled from disk once per process (see below)
+
     def __init__(self, path: str = DB_PATH):
         self.db = sqlite3.connect(path, timeout=30)
         self.db.row_factory = sqlite3.Row
@@ -147,6 +158,14 @@ class State:
                 except sqlite3.OperationalError as e:
                     if "duplicate column" not in str(e).lower():
                         raise            # a lock goes back to the retry loop above
+                # …and before jobs.requeues existed (a gate-driven re-shoot needs its own budget:
+                # requeue() clears `retries`, so retries cannot count re-shoots)
+                try:
+                    self.db.execute("ALTER TABLE jobs ADD COLUMN requeues INTEGER NOT NULL "
+                                    "DEFAULT 0")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
                 self.db.commit()
                 return
             except sqlite3.OperationalError as e:
@@ -193,7 +212,11 @@ class State:
         A stale 'done' can never be re-shot by the runner, so re-queueing needs its own seam,
         and it clears last_error/retries so the fresh attempt gets the full retry budget.
         `prompt` rewrites the row's prompt (the hardened style-anchor version), so the queued
-        work carries the fix instead of the text that produced the defect."""
+        work carries the fix instead of the text that produced the defect.
+
+        `requeues` counts these and is NOT cleared here: retries budget a flaky SITE, requeues
+        budget the GATE's patience. Without a counter that survives, "re-shoot the clip the gate
+        rejected" is a loop with no exit — the same clip coming back slightly different forever."""
         out = []
         for idx in idxs:
             r = self.db.execute("SELECT id FROM jobs WHERE project=? AND idx=?",
@@ -201,7 +224,8 @@ class State:
             if not r:
                 raise SystemExit(f"no job for {project}#{idx}")
             self.db.execute(
-                "UPDATE jobs SET status='queued', retries=0, last_error=NULL, updated=?"
+                "UPDATE jobs SET status='queued', retries=0, requeues=requeues+1, "
+                "last_error=NULL, updated=?"
                 + (", prompt=? " if prompt else " ") + "WHERE id=?",
                 ((time.time(), prompt, r["id"]) if prompt else (time.time(), r["id"])))
             out.append(r["id"])
@@ -302,6 +326,21 @@ class State:
                 out.append(r)
         return out
 
+    def site_has_credit(self, site: str, now: float = None) -> bool:
+        """Does ANY account on this site still have credit left? Deliberately ignores cooldown.
+
+        Cooling is temporary, dry is not, and the scheduler has to tell them apart to choose
+        between waiting out a cooldown and failing a whole reel over to a lower-tier site.
+        `available()` answers "can I act right now" (both filters) — this answers "is this site
+        still worth waiting for" (credit only). `resets_at` is guarded for truthiness, exactly as
+        `available()` does: 0 means "no refill time known", NOT "refilled at the epoch"."""
+        now = now or time.time()
+        row = self.db.execute(
+            "SELECT COUNT(*) AS n FROM credits WHERE site=? AND "
+            "(remaining > 0 OR (resets_at AND resets_at <= ?))",
+            (site, now)).fetchone()
+        return row["n"] > 0
+
     # ---- lessons (anti-ban) ----
     def record_lesson(self, site: str, kind: str, account: str = None,
                       step: str = None, detail: str = None, cooldown_s: float = 0):
@@ -377,8 +416,38 @@ class State:
 
     def other_identities(self, reel: str) -> list:
         """Fingerprints of every OTHER shipped reel — to detect a repeated look."""
+        self._sync_identities()
         return self.db.execute(
             "SELECT reel, fp FROM reel_identity WHERE reel!=?", (reel,)).fetchall()
+
+    def _sync_identities(self):
+        """Backfill `reel_identity` from projects/*/identity.json, once per process.
+
+        The table is only written when a reel passes the gate, so every reel hand-built or built
+        before that seam has NO row: `other_identities` came back empty and both the collision
+        check and the art-director's 'differ from these' brief were blind, while 7 shipped looks
+        sat on disk. The disk is the durable record (it is committed), so read it back. `projects/`
+        sits beside the db in the house layout, so a db without one beside it — a selfcheck's temp
+        db — simply has nothing to sync and touches no house state."""
+        if State._synced:
+            return
+        State._synced = True
+        try:
+            dbp = self.db.execute("PRAGMA database_list").fetchone()[2] or ""
+            pdir = os.path.join(os.path.dirname(os.path.abspath(dbp)), "projects") if dbp else ""
+            if not pdir or not os.path.isdir(pdir):
+                return
+            for idp in glob.glob(os.path.join(pdir, "*", "identity.json")):
+                name = os.path.basename(os.path.dirname(idp))
+                try:
+                    fp = json.dumps(json.load(open(idp, encoding="utf-8")), sort_keys=True)
+                except Exception:                     # noqa: BLE001 — an unreadable one is skipped
+                    continue
+                self.db.execute("INSERT OR IGNORE INTO reel_identity(reel,fp,created) "
+                                "VALUES(?,?,?)", (name, fp, time.time()))
+            self.db.commit()
+        except Exception:                             # noqa: BLE001 — a missing record never costs a reel
+            pass
 
     # ---- brain activity log: the always-on sense stream (hooks append here as the session works;
     # reflect() distills the unprocessed rows into durable knowledge at session end). ----
@@ -413,7 +482,7 @@ class State:
             "gate_n=excluded.gate_n, verdict=excluded.verdict, checked=excluded.checked",
             (project, 1 if verdict.get("ok") else 0, len(verdict.get("block", [])),
              len(verdict.get("gate", [])),
-             json.dumps({k: verdict.get(k) for k in ("ok", "block", "gate", "warn")}
+             json.dumps({k: verdict.get(k) for k in ("ok", "live", "block", "gate", "warn")}
                         | {"checklist": len(verdict.get("checklist", []))},
                         ensure_ascii=False),
              time.time()))
@@ -425,6 +494,22 @@ class State:
             row = self.db.execute("SELECT * FROM reel_qc WHERE project=?", (project,)).fetchone()
             return [row] if row else []
         return self.db.execute("SELECT * FROM reel_qc ORDER BY checked DESC").fetchall()
+
+    # ---- the by-eye sign-off. When a review could NOT run (down gateway) the reel may ship but
+    # does NOT go_live until a human has looked (WAVELENGTH §6). Keyed on the CUT: a rebuild is a
+    # different cut that nobody has seen, so the old signature stops counting (qc.run's `live`). ----
+    def record_eye_review(self, project: str, fp: str, by: str, note: str = None):
+        """Record a human's verdict on one cut of one reel. Upsert: the newest look is the one."""
+        self.db.execute(
+            "INSERT INTO eye_review(project,fp,by,note,at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(project) DO UPDATE SET fp=excluded.fp, by=excluded.by, "
+            "note=excluded.note, at=excluded.at",
+            (project, fp, by, note, time.time()))
+        self.db.commit()
+
+    def eye_review(self, project: str):
+        """The sign-off on this reel, or None. Compare its `fp` to the cut before trusting it."""
+        return self.db.execute("SELECT * FROM eye_review WHERE project=?", (project,)).fetchone()
 
     # ---- candidate lessons: the brain PROPOSES rules from patterns; the owner vets them.
     # These never reach craft_lessons (the QC gate) until promote() copies an accepted one over. ----

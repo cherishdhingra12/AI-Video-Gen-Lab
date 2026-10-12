@@ -36,6 +36,12 @@ def _load_env(path=os.path.join(_DIR, ".env")):
 
 ENV = _load_env()
 
+# the automation package holds the shared pieces (this module lives at the repo root, so it is not
+# importable as a package of its own) — same insert _brief used to do inline.
+sys.path.insert(0, os.path.join(_DIR, "automation"))
+
+import routerhealth  # noqa: E402  (remembers which gateway is walled — see chat())
+
 # name -> (url, key, default model, timeout seconds)
 # The timeout must clear the model's slowest realistic answer, not its average: OmniRoute's free
 # tier returns a full presentation in ~22s and has run to ~48s, so the old 20s timed out on a
@@ -82,7 +88,6 @@ def _brief() -> str:
     if _brief_cache is not None:
         return _brief_cache
     try:
-        sys.path.insert(0, os.path.join(_DIR, "automation"))
         from state import State
         st = State()
         try:
@@ -121,13 +126,31 @@ def _retryable(err) -> bool:
     return any(k in str(err) for k in _TRANSIENT)
 
 
-def chat(messages, max_tokens=4000, temperature=0.8):
+def chat(messages, max_tokens=4000, temperature=0.8, prefer=None):
     """Try each gateway in order; return (text, "gateway:model") from the first
-    that returns non-empty content. Raises if all fail."""
+    that returns non-empty content. Raises if all fail.
+
+    `prefer` moves ONE gateway to the front of the queue without removing the others. The caption
+    proofread uses it to ask a route the writer is unlikely to have used: the authoring call takes
+    whichever gateway answers first, so the judge takes the other end of LLM_ORDER — a model that
+    did not write the line. A preferred gateway that is down costs nothing; the rest still runs.
+
+    A route the LAST call found walled is skipped, not re-discovered (routerhealth): a 429 costs
+    three retries and ~4.5s of sleep per call, and the gate makes dozens of calls per run. If
+    every route is cooling they are all tried anyway — a memory of failure must never be the
+    reason a run fails."""
+    order = [prefer] + [n for n in _ORDER if n != prefer] if prefer else _ORDER
+    cold = [n for n in order if routerhealth.cooling(n)[0]]
+    if len(cold) == len(order):
+        routerhealth.clear()             # nothing left to skip: last resort beats giving up
     errors = []
-    for name in _ORDER:
+    for name in order:
         url, key, model, timeout = _GATEWAYS.get(name, (None, None, None, 30))
         if not url or not key:
+            continue
+        until, why = routerhealth.cooling(name)
+        if until:
+            errors.append(f"{name}[cooling {int(until - time.time())}s: {why}]")
             continue
         for attempt in range(_TRIES):
             try:
@@ -143,6 +166,7 @@ def chat(messages, max_tokens=4000, temperature=0.8):
                     d = json.load(r)
                 content = (d.get("choices") or [{}])[0].get("message", {}).get("content")
                 if content and content.strip():
+                    routerhealth.note_success(name)
                     return content, f"{name}:{d.get('model', model)}"
                 raise ValueError("empty content")
             except Exception as e:  # noqa: BLE001 - any failure -> retry, then next gateway
@@ -151,7 +175,9 @@ def chat(messages, max_tokens=4000, temperature=0.8):
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 break
-    raise RuntimeError("all LLM gateways failed: " + " | ".join(errors))
+        routerhealth.note_failure(name, errors[-1] if errors else "failed")
+    raise RuntimeError("all LLM gateways failed: " + " | ".join(errors)
+                       + (f" | cooling: {routerhealth.walled()}" if routerhealth.walled() else ""))
 
 
 def write_script(idea: str, seconds: int = 15) -> str:
@@ -274,6 +300,18 @@ CARD_HARD = 44
 CARD_KINDS = ("hook", "moral", "cta")
 _DEVA = re.compile(r"[ऀ-ॿ]")
 
+# WAVELENGTH §8 names the foundation, and its domain is a FACT about the brand — not a creative
+# choice for the model to make. A model left to invent one wrote "standardsunrise.org" onto a
+# shipped card. So the domain is stated in the wavelength AND written by code here, and the
+# self-check asserts the two agree (drift between the prose and the constant is the failure mode).
+BRAND_URL = "standardsunrisefoundation.org"
+_DOMAIN = re.compile(r"\b(?:https?://)?(?:www\.)?[A-Za-z0-9-]+\.(?:org|com|in|net|co|io)\S*")
+
+
+def _fix_url(text: str) -> str:
+    """Any web address on a card is the foundation's — or it is wrong."""
+    return _DOMAIN.sub(BRAND_URL, text)
+
 
 def _is_animated(style: str) -> bool:
     s = (style or "").lower()
@@ -294,16 +332,47 @@ def _anti(style: str) -> str:
             "mixed rendering.")
 
 
+# A character tag is an ALL-CAPS word — the shot-lister is told to write the recurring subject
+# that way, and it is the only handle code has on WHO must not change.
+_CHAR_TAG = re.compile(r"\b[A-Z]{3,}\b")
+_SENT = re.compile(r"(?<=[.!?।])\s+")
+
+
+def _char_clauses(world: str) -> list:
+    """The sentences of `world` that describe a character — the ones naming an ALL-CAPS tag.
+    A plan that writes no tag (the model does not always) still deserves a lock, so the opening
+    sentence is the fallback: the subject of a `world` is always its first line.
+
+    ponytail: the quoted description is capped (240 chars, 4 clauses) so a rambling `world`
+    cannot make the lock longer than the prompt it is appended to. Raise the cap if a measured
+    cast description is being cut mid-way and the faces drift."""
+    sents = [s.strip() for s in _SENT.split((world or "").strip()) if s.strip()]
+    named = [s for s in sents if _CHAR_TAG.search(s)]
+    out = []
+    for s in (named or sents[:1])[:4]:
+        out.append(s if len(s) <= 240 else s[:240].rsplit(" ", 1)[0])
+    return out
+
+
 def _char_lock(shot: dict) -> str:
-    """A short reminder of WHO must not change, so a face/costume can't wander between
-    clips even when the shot description names the character only once."""
-    world = (shot.get("world") or "")
-    names = re.findall(r"\b([A-Z]{3,})\b", world)          # the ALL-CAPS character tags
-    if not names:
+    """ONE sentence per reel, appended VERBATIM — same words, same place — to every clip prompt.
+
+    Byte-identical is the point, not a nicety. The old lock was assembled from the character
+    TAGS alone ("same face, same hair, same glasses"), which tells a generator nothing it can
+    hold a face against, and a plan with no ALL-CAPS tag got no lock at all — that is how dadi
+    shipped three different women in one reel while every prompt dutifully named the same
+    character. Quoting the character's OWN description back, unchanged, on every clip, is what
+    keeps the person the same from the first scene to the last: the identity is re-read at
+    generation time instead of the model being asked to remember it.
+    """
+    clauses = _char_clauses((shot.get("world") or "").strip())
+    if not clauses:
         return ""
-    return ("Characters are identical in every clip and to the descriptions above — same "
-            + ", ".join(names) + ": same face, same hair, same glasses, same clothes, no "
-            "swapping or redesigning between shots.")
+    who = " ".join(clauses)
+    return ("THE SAME PEOPLE IN EVERY CLIP — identical face, age, hair, build, clothing and "
+            "colouring from the first clip to the last, and no accessory, garment, jewellery, "
+            "make-up or feature added, removed or redesigned along the way. The characters are "
+            f"exactly these, verbatim: {who}")
 
 
 # Attached to EVERY clip prompt by code, not by a model's good behaviour. The generator bakes
@@ -313,6 +382,52 @@ def _char_lock(shot: dict) -> str:
 NO_TEXT = ("No text of any kind anywhere in the frame: no words, letters, captions, subtitles, "
            "title cards, signage, labels, or writing on walls, papers, screens or clothing — in "
            "any script. A clean frame with nothing written on it; all captions are added later.")
+
+# The shot-lister is TOLD no text, but it writes the sentence it was told not to: asked to
+# visualize a notebook of memories, it authored "a glowing \"एक\" appears on the page" — text
+# baked into the frame, which is exactly what makes the generator render gibberish Devanagari.
+# Appending NO_TEXT is not prevention when the authored prompt ASKS for the text (the generator
+# gets two opposite orders). So the request is stripped by CODE here, not by the model's good
+# behaviour — the same rule the NO_TEXT appended to every prompt follows. A prompt that avoids
+# text entirely (the normal case) is returned untouched.
+# Only a REQUEST counts, and it must be told apart from the two things that look like it: a spoken
+# line in quotes, and a protective negation ("no writing anywhere"). Three guards, in order:
+#   - a quoted token that is DISPLAYED (quote then a display verb or a text-bearing object) is
+#     on-screen text. Dialogue is the reverse order — a speech verb then the quote
+#     (`says, with clear lip-sync: "…"`) — so a spoken line can never match and is never touched.
+#   - a word that only ever names a text device (spell/spelling, subtitle, title/caption card).
+#   - but a device word inside a NEGATION ("no writing or signage anywhere") is the protective
+#     sentence agent 2 was TOLD to write — kept, not stripped.
+_QUOTED = re.compile(
+    r'["“][^"”\n]{1,40}["”][^.]{0,30}?\b(?:appears?|glows?|shines?|flashes?|reads?|written|'
+    r'sign|signboard|label|plate|board|banner|poster|notice|card)\b', re.I)
+_DEVICE = re.compile(
+    r'\b(?:spell(?:s|ing|ed)?|spelt|lettering|signage|subtitles?|title\s+cards?|caption\s+cards?|'
+    r'the\s+words?)\b', re.I)
+_NEG = re.compile(r'\b(?:no|not|nothing|without|never|free|clean|blank)\b', re.I)
+
+
+def _asks_text(s: str) -> bool:
+    return bool(_QUOTED.search(s) or (_DEVICE.search(s) and not _NEG.search(s)))
+# Clauses, not sentences: the text request often shares a sentence with the action it decorates
+# ("she opens the notebook; a glowing \"एक\" appears"), so splitting at sentence ends alone would
+# throw the action away with the request. Strong punctuation only — a comma would over-split. The
+# lookbehind keeps each stop with the clause it ends, and danda is included for Hindi prompts.
+_CLAUSE = re.compile(r'(?<=[.!?।;—–])\s+')
+_LETTER = re.compile(r'\w')                       # \w is Unicode-aware: Devanagari counts
+
+
+def _no_text(prompt: str) -> str:
+    """Drop any clause of an authored shot that asks the generator to show text. Fail-open: a
+    prompt with no text request comes back unchanged."""
+    s = (prompt or "").strip()
+    if not _asks_text(s):
+        return s
+    kept = [c for c in _CLAUSE.split(s)
+            if c and not _asks_text(c) and _LETTER.search(c)]
+    out = " ".join(kept).strip()
+    return out if out else ("A clean frame carrying no writing of any kind — only the "
+                            "scene's physical action and expression")
 
 
 # The house medium, enforced by code. This house renders 3-D animation, always (WAVELENGTH.md §1;
@@ -330,8 +445,41 @@ HOUSE_STYLE = ("soft stylized 3-D animation in a high-end animated-feature look:
 MEDIUM_REQUIREMENT = ("REQUIRED OUTPUT: 3-D ANIMATED VIDEO — a stylized animated-feature look in "
                       "every frame, never photoreal, never live action, never real footage, never 2-D.")
 
+# The sites that run the SAME engine — Veo 3.1 — and are the waterfall's two primaries
+# (WAVELENGTH §5: Vids → Flow → the rest). They share one prompt pattern, so they share one
+# shape below; a reel that fails over between them is not re-written.
+VEO_SITES = ("flow", "googlevids", "veo")
 
-def clip_prompts(shot: dict) -> list:
+
+def _fit(lead: str, body: str, tail: str, chars: int, sep: str) -> str:
+    """Trim to `chars` in the order that keeps the GUARANTEES.
+
+    The tail is the guarantee set (look, no-text, anti-photoreal, the identity lock) and the
+    lead carries the medium requirement, so neither is what gives: a shorter action still
+    renders the same person in the same look, a lock trimmed off the end of a prompt does not.
+    The SHOT shortens first, then the lead goes (the LOOK line restates the whole style
+    anyway), and only a tail that cannot fit on its own falls back to a hard cut.
+    """
+    seg = sep.join(x for x in (lead, body, tail) if x)
+    if len(seg) <= chars:
+        return seg
+    keep = chars - len(lead) - len(tail) - 2 * len(sep) - 1
+    if keep > 0:
+        fitted = sep.join(x for x in (lead, body[:keep].rsplit(" ", 1)[0], tail) if x)
+        if len(fitted) <= chars:
+            return fitted
+    seg = sep.join(x for x in (body, tail) if x)
+    if len(seg) <= chars:
+        return seg
+    keep = chars - len(tail) - len(sep) - 1
+    if keep > 0:
+        fitted = sep.join(x for x in (body[:keep].rsplit(" ", 1)[0], tail) if x)
+        if len(fitted) <= chars:
+            return fitted
+    return seg[:chars - 1].rsplit(" ", 1)[0] + "."
+
+
+def clip_prompts(shot: dict, site: str = "") -> list:
     """Materialize the final per-clip prompts. This is what gets pasted into each site.
     Kept here so the runner/pipeline stay dumb.
 
@@ -341,6 +489,18 @@ def clip_prompts(shot: dict) -> list:
     end. Now the style LEADS (short, first sentence), the world+shot follow, and the full
     style block is RESTATED verbatim at the end with the anti-photoreal negation attached,
     plus an explicit character lock. Long shots trim the lead back off rather than overflow.
+
+    The WORDS are the same on every site (that is what makes one reel one film). What `site`
+    changes is only how they are written down — the shape each box reads best:
+      * Vids and Flow (VEO_SITES) get a LABELLED brief, one block per line: cast, action,
+        look, dialogue. Both are Veo 3.1, and Veo's own prompting pattern is a structured
+        brief, not one long run-on sentence — a labelled block also survives being read by a
+        model that skims, and it names the cast and the action in the same place on every clip.
+      * every other site keeps the single flowing paragraph it has always been given, so
+        nothing that already renders is re-shaped by this.
+    A failover moves the whole reel to one site (one reel, one source), so a prompt written
+    for the bid site is what the fallback gets too — both Veo sites read either shape, and
+    the labelled form is legible to any text-to-video model.
     """
     world = (shot.get("world") or "").strip()
     # The house renders 3-D, always — not the plan's to choose. An animated style wins (it
@@ -351,27 +511,40 @@ def clip_prompts(shot: dict) -> list:
         style = HOUSE_STYLE
 
     anti = _anti(style)
-    lock = _char_lock(shot)
+    lock = _char_lock(shot)                    # ONE string for the reel — appended to every clip
+    veo = site in VEO_SITES
+    sep = "\n" if veo else ", "
     # The medium is the FIRST thing a site reads, so the requirement to render 3-D animation is
     # stated before anything else — catching the medium at generation time, not after.
-    head = (MEDIUM_REQUIREMENT + " STYLE for every frame of this clip, no exceptions: "
+    lead = (MEDIUM_REQUIREMENT + " STYLE for every frame of this clip, no exceptions: "
             + style.split(".")[0].strip() + ".")
-    tail = ", ".join(p for p in (style, NO_TEXT, anti, lock) if p)
     out = []
     for c in sorted(shot.get("clips", []), key=lambda x: x.get("idx", 0)):
         says = (c.get("dialogue") or "").strip()
         if says:
             # Narration must come OUT of the clip (WAVELENGTH.md §3), so the line is written into
             # the generation prompt for a character to SPEAK — never laid over at assembly.
-            says = ('the character speaks this line aloud in Hindi, on camera, with natural '
-                    f'lip-sync — no narrator, no voiceover: "{says}"')
-        body = ", ".join(p for p in (world, c["prompt"].strip(), says) if p)
-        p = ", ".join(p for p in (head, body, tail) if p)
-        if len(p) > PROMPT_CHARS and head:            # trim the lead first — style stays twice
-            p = ", ".join(x for x in (body, tail) if x)
-        if len(p) > PROMPT_CHARS:                      # then the redundant tail sentences
-            p = (p[:PROMPT_CHARS - 1].rsplit(" ", 1)[0] + ".")
-        out.append(p)
+            # NOT AS A QUOTED LINE, THOUGH. A quoted Hindi string next to "speaks this line" is
+            # read as a CAPTION: dadi-ki-dhansuchi came back with its dialogue burned into the
+            # frame as garbled Devanagari subtitles in all four clips — the quote defeated three
+            # separate no-text clauses sitting in the same prompt. So the words are handed over as
+            # SPEECH the voice carries and the render must never draw: unquoted, and marked as
+            # sound. The code-level rules NO_TEXT and _no_text() exist for this same reason —
+            # text is kept out by construction, not by the model remembering not to.
+            says = ('the character speaks these words aloud in Hindi, on camera, with natural '
+                    'lip-sync — no narrator, no voiceover. They are SOUND the voice carries and '
+                    'must never be written anywhere: ' + says)
+        action = _no_text(c["prompt"])
+        if veo:
+            body = [f"SCENE AND CAST (identical in every clip): {world}" if world else "",
+                    f"ACTION AND CAMERA: {action}" if action else "",
+                    f"SPOKEN ALOUD, sound only — never written on screen: {says}" if says else ""]
+            tail = [f"LOOK, IN EVERY FRAME: {style}", NO_TEXT, anti, lock]
+        else:
+            body = [world, action, says]
+            tail = [style, NO_TEXT, anti, lock]
+        out.append(_fit(lead, sep.join(x for x in body if x),
+                        sep.join(x for x in tail if x), PROMPT_CHARS, sep))
     return out
 
 
@@ -431,6 +604,8 @@ def presentation(script: str, shot: dict, prior: list = None) -> dict:
         f"line must be under {CARD_CHARS} characters. One or two lines per card, never three.\n"
         "- The hook and the moral cards are written in DEVANAGARI. The CTA may be Hinglish or "
         "the brand name in Roman. Never English-only — see the audience rules above.\n"
+        f"- The CTA card carries the foundation's own address, {BRAND_URL}, spelled exactly "
+        "like that. There is no other address — do not invent, shorten or guess one.\n"
         "- 'hook' is the opening card (a question, a provocation, or the first line of the "
         "story). 'moral' is the turn — it lands the point. 'cta' is the last card.\n"
         "- 'identity.visual_style' must state that this is 3-D animation. This is not optional.\n"
@@ -445,7 +620,27 @@ def presentation(script: str, shot: dict, prior: list = None) -> dict:
     caps = obj.get("captions")
     if isinstance(caps, dict):
         caps["font"] = _font_class(caps.get("font"))
+        for card in caps.values():              # the brand's domain is corrected before the judge
+            if isinstance(card, dict):          # and the gate ever see the cards
+                card["lines"] = [_fix_url(ln) for ln in card.get("lines") or []]
     _presentation_selfcheck(obj)
+
+    # LAYER 1 of the caption gate: the art director reads its OWN cards back before they are
+    # written, with the script in hand. The Hindi is the one layer no metric measures, and the
+    # hook is usually not a quote but a TRANSLATION — the script writes its hook in English
+    # ("Rich in life because… you stopped by."), so the model is inventing the Devanagari, not
+    # copying it. That is how dadi-ki-dhansuchi reached the screen with "उनकी मुस्कान बनें ख़ज़ाना"
+    # (बनें is the respectful plural on a feminine singular) and ख़ज़ाना spelled two ways in one
+    # reel. The pass is a JUDGEMENT, not a rule — the cards and the script go back to the model and
+    # it fixes what a Hindi reader would wince at. Fail-open by design: a gateway that is down, or
+    # a "repair" that breaks the card contract, leaves the cards exactly as written, because
+    # qc.check_caption_wording is the independent second layer that catches what this one misses.
+    _orig_caps = obj["captions"]
+    try:
+        obj["captions"] = judge_captions(script, _orig_caps)["captions"] or _orig_caps
+        _presentation_selfcheck(obj)          # a repair that overflows a card is no repair
+    except Exception:  # noqa: BLE001 — a review that cannot run must never cost the reel
+        obj["captions"] = _orig_caps
     return obj
 
 
@@ -466,6 +661,100 @@ def _font_class(raw) -> str:
         if face in s:
             return cls
     return "rounded"
+
+
+# nukta (the dot that turns क/ख/ज/फ into क़/ख़/ज़/फ़) and the zero-width joiners — stripped for
+# COMPARISON only, so ख़ज़ाना and खज़ाना land in the same bucket while both surfaces are kept.
+_NUKTA = dict.fromkeys(map(ord, "़‌‍"), None)
+_DEVA_RUN = re.compile(r"[ऀ-ॿ]+")
+
+
+def _spelling_variants(lines) -> list:
+    """Words the reel writes two different ways — ख़ज़ाना in the hook, खज़ाना in the moral.
+
+    This decides nothing. It hands the judge a fact it would otherwise have to notice by reading
+    its own output twice, which is exactly the kind of thing a model skips. Devanagari only: a
+    'Standard' vs 'standard' in a CTA is not this defect."""
+    seen = {}
+    for ln in lines:
+        for tok in _DEVA_RUN.findall(ln or ""):
+            seen.setdefault(tok.translate(_NUKTA), set()).add(tok)
+    return [" / ".join(sorted(v)) for v in seen.values() if len(v) > 1]
+
+
+_CAPTION_JUDGE = (
+    "You are a Hindi copy editor for a short vertical film. You did NOT write these caption "
+    "cards. Judge them the way a native speaker watching on a phone, muted, would — then fix them. "
+    "Each card is one glance, about three seconds.\n"
+    "Work LINE BY LINE, and give every single line of every card its own verdict before you "
+    "finish. A line you did not consciously pass is a line you did not check — and the defect this "
+    "exists to catch is one that hides in a line that LOOKS fine at a glance.\n"
+    "For each line, in this order:\n"
+    "- GRAMMAR AND REGISTER: would a Hindi speaker actually say and write this? Verb agreement, "
+    "gender, case, idiom. A verbless fragment is wrong. So is a verb inflected for the wrong "
+    "gender or number — a respectful-plural ending on a feminine singular noun is exactly that.\n"
+    "- CONSISTENCY: one reel, one spelling. The same word written two ways in one reel reads as "
+    "carelessness, not as two words.\n"
+    "- MEANING: every card carries ONE beat of the script you are given. Does the card say that "
+    "beat, in that spirit? Where the script writes the beat in English, the card is a translation "
+    "of it, not a new line — a card that quietly changes the claim is wrong even when its Hindi is "
+    "flawless.\n"
+    "- NATURALNESS: would a reader wince? Fix it if so.\n"
+    "Then return the corrected cards. Every problem you name must be VISIBLY fixed in the cards "
+    "you return, and every line you changed must appear in problems.\n"
+    "Do not touch the 'font' field.\n"
+    "Keep every line under 34 characters and 1-2 lines per card. If the cards are already right, "
+    "return them unchanged and an empty problems list."
+)
+
+
+def judge_captions(script: str, caps: dict) -> dict:
+    """The caption proofread — ONE judge, called from two layers.
+
+    Layer 1 is presentation(): the art director reads its own cards back before writing them.
+    Layer 2 is qc.check_caption_wording(): the finished reel's cards are judged again, after the
+    render, and a problem gates go_live. Both need the same judgement, so the prompt lives here
+    once and each caller decides what to do with the answer — repair (layer 1) or report (layer 2).
+
+    It is fed EVIDENCE, not a rule: the script (the meaning every card must carry), and any word
+    the reel spells two ways, computed here so the judge is told rather than left to notice. The
+    judgement stays the model's — nothing in this function fires on its own.
+
+    Returns {'problems': [...], 'captions': {...}}. Raises if no gateway answers; the callers
+    decide what an outage means (ignored at authoring, a go_live gate at QC)."""
+    lines = [ln for k in CARD_KINDS for ln in (caps.get(k) or {}).get("lines") or []]
+    variants = _spelling_variants(lines)
+    evidence = ""
+    if variants:
+        evidence = ("\nThis reel spells the same word more than one way — settle on one form:\n- "
+                    + "\n- ".join(variants))
+    user = (f"SCRIPT:\n{script}\n\nCAPTION CARDS:\n"
+            f"{json.dumps(caps, ensure_ascii=False, indent=2)}{evidence}\n\n"
+            # The contract goes LAST and says 'do not show your reasoning' on purpose. The free
+            # routers answer with reasoning models, and one measured on this call spent 5,045
+            # tokens thinking through the cards — reaching the right answer, बनें -> बने — and
+            # never emitted the JSON at all, so _extract_json found no '{' and the check read as
+            # a gateway outage. A trailing, explicit contract is what actually lands; the same
+            # demand buried mid-prompt is what a reasoning model steps over.
+            "Answer with JSON ONLY — no reasoning, no commentary, no markdown fences:\n"
+            '{"problems": ["one line per thing you fixed or could not fix", ...], '
+            '"captions": {<the SAME shape you were given, corrected>}}')
+    text, _used = chat(
+        [{"role": "system", "content": _system(_CAPTION_JUDGE)},
+         {"role": "user", "content": user}],
+        # room for the whole card set AND the model's own thinking: a reasoning router that runs
+        # out of budget mid-thought returns prose with no JSON in it.
+        max_tokens=4000, temperature=0.4,
+        # the other end of the gateway order: the writer took whichever answered first, so the
+        # judge asks the one it probably did not use — a model that did not write the line.
+        prefer=_ORDER[-1] if len(_ORDER) > 1 else None,
+    )
+    out = _extract_json(text)
+    problems = [str(p).strip() for p in (out.get("problems") or []) if str(p).strip()]
+    fixed = out.get("captions")
+    if isinstance(fixed, dict):
+        fixed["font"] = _font_class(fixed.get("font") or caps.get("font"))
+    return {"problems": problems, "captions": fixed}
 
 
 def _presentation_selfcheck(obj: dict) -> bool:
@@ -561,6 +850,13 @@ def _prompt_selfcheck(shot):
             f"clip {i}: the full style block must be RESTATED after the shot, not only in the lead"
     # character lock: every ALL-CAPS character tag in the world reaches every prompt
     tags = re.findall(r"\b([A-Z]{3,})\b", world)
+    lock = _char_lock(shot)
+    assert lock, "a reel with a cast must get an identity lock"
+    assert all(lock in pr for pr in prompts), \
+        "the identity lock must sit in EVERY clip prompt — the first scene and the last are " \
+        "the same person only if every clip is told the same thing"
+    assert all(c in lock for c in _char_clauses(world)), \
+        "the lock must quote the character's own description verbatim, not just their tag"
     for t in tags:
         assert all(t in pr for pr in prompts), \
             f"character lock missing '{t}' from some prompt — identity can drift clip to clip"
@@ -607,6 +903,27 @@ if __name__ == "__main__":
         # animation the first time (owner rule 2026-10-10).
         assert all(p.startswith(MEDIUM_REQUIREMENT) for p in clip_prompts(_shot)), \
             "every clip prompt must lead with the 3-D requirement, not just describe the scene"
+        # The film carries no text of its own: a shot-lister that writes "a glowing 'एक' appears
+        # in the notebook" ASKS the generator for exactly the baked-in text NO_TEXT forbids — two
+        # opposite orders in one prompt. clip_prompts strips the request by code, so the frame
+        # cannot come back with gibberish Devanagari (the owner's own rule: not a model's memory).
+        _texty = dict(_shot, clips=[{"idx": 0,
+                                     "prompt": ("She opens the notebook; a glowing \"एक\" appears on "
+                                                "the page. The camera pushes in slowly."),
+                                     "dialogue": "एक अजनबी ने गाया।"}])
+        _tp = clip_prompts(_texty)[0]
+        assert "glowing" not in _tp.lower() and "appears on the page" not in _tp.lower(), \
+            "an authored request to write text into the frame must be stripped before generation"
+        assert "notebook" in _tp.lower() and "pushes in" in _tp.lower(), \
+            "only the text-asking sentence is dropped — the rest of the shot must survive"
+        assert NO_TEXT in _tp, "the code-level no-text rule must still be attached"
+        # The spoken line rides along as SOUND, never as a quoted string a renderer can typeset.
+        # dadi-ki-dhansuchi came back with its dialogue burned into all four clips as garbled
+        # Devanagari subtitles — a quoted Hindi line beside "speaks this line" reads as a caption.
+        assert '"' not in _tp and "“" not in _tp, \
+            "the spoken line must never be quoted — a quoted line is rendered as a subtitle"
+        assert "एक अजनबी ने गाया।" in _tp, "the words must still reach the site to be spoken"
+        assert "SOUND" in _tp, "the words must be marked as speech for the voice, not text for the eye"
         # The medium is decided at the START: a shot list whose style does not read as animation
         # is repaired at build time (chat stubbed), so the plan is honest before any clip is queued.
         _orig_chat = chat
@@ -626,6 +943,43 @@ if __name__ == "__main__":
         _big = dict(_shot, world=_shot["world"] + " " + ("extra detail " * 400))
         assert all(len(pr) <= PROMPT_CHARS for pr in clip_prompts(_big)), \
             "an oversized plan must be trimmed to PROMPT_CHARS"
+        # …and the trim must cut the SHOT, never the identity lock. Trimming a prompt's tail is
+        # how a lock disappears off the last clip of a long reel — which is exactly the clip the
+        # face changes in.
+        _blk = _char_lock(_big)
+        assert _blk and all(_blk in pr for pr in clip_prompts(_big)), \
+            "the identity lock must survive the length trim — the shot gives, the lock does not"
+
+        # --- the SITE SHAPE: same words, written the way Vids and Flow read a prompt ---------
+        # Vids and Flow are both Veo 3.1 and the waterfall's two primaries, so they get a
+        # labelled brief; every other site keeps the single flowing paragraph it already had.
+        _v = clip_prompts(_shot, "googlevids")
+        _f = clip_prompts(_shot, "flow")
+        _p = clip_prompts(_shot, "kling")
+        assert _v == _f, "Vids and Flow are the same engine — one pattern, not two"
+        assert "\n" in _v[0] and "\n" not in _p[0], \
+            "the Veo sites get a labelled brief, the rest the one-line paragraph they always had"
+        for i, pr in enumerate(_v):
+            assert pr.startswith(MEDIUM_REQUIREMENT), \
+                f"clip {i}: the 3-D requirement must still LEAD the brief"
+            assert "SCENE AND CAST" in pr and "ACTION AND CAMERA" in pr, \
+                f"clip {i}: the brief must name the cast and the action in the same place " \
+                "on every clip — that is what holds a face steady from the first scene to the last"
+            assert _char_lock(_shot) in pr, f"clip {i}: the brief must carry the identity lock"
+            assert NO_TEXT in pr, f"clip {i}: the brief must carry the no-text rule"
+            assert len(pr) <= PROMPT_CHARS, f"clip {i}: the brief may not overflow the site's box"
+        assert all(_char_lock(_shot) in pr for pr in clip_prompts(_big, "googlevids")), \
+            "the brief must survive the trim with its lock intact"
+        # a plan the model wrote with no ALL-CAPS tag still gets a lock — the hole that let a
+        # reel ship with three different women playing the same character
+        _note = dict(_shot, world="An old-age home at night. A frail old man in a mustard kurta.")
+        assert _char_lock(_note), "a cast with no ALL-CAPS tag must still be locked"
+        assert all(_char_lock(_note) in pr for pr in clip_prompts(_note, "flow")), \
+            "the fallback lock must reach every clip prompt too"
+        print("OK: one identity lock per reel, quoted from the character's own description and "
+              "repeated VERBATIM on every clip — and it survives the length trim")
+        print("OK: Vids and Flow get the labelled Veo brief, every other site the plain "
+              "paragraph — the same words either way")
         print("OK: clip_prompts LEADS with the 3-D requirement, then the style anchor (restated), "
               "negates photorealism, locks every character, writes each shot's spoken line INTO "
               "the prompt (narration comes out of the clip), and fits the input")
@@ -693,6 +1047,119 @@ if __name__ == "__main__":
         _presentation_selfcheck(_soft)
         print(f"OK: a card line up to {CARD_HARD} chars is tolerated (asked for {CARD_CHARS})")
 
+        # --- layer 1 of the caption gate: the art director reads its own Hindi back ---
+        # First the EVIDENCE, computed here so the judge is told rather than left to notice:
+        # ख़ज़ाना in one card and खज़ाना in another are one word spelled two ways. Nukta is
+        # stripped for the comparison only, so both surfaces survive into the message.
+        _two_way = ["आपका एक मिनट उनका ख़ज़ाना है", "उनकी मुस्कान बनें खज़ाना"]
+        assert _spelling_variants(_two_way) == ["खज़ाना / ख़ज़ाना"], _spelling_variants(_two_way)
+        assert _spelling_variants(["एक ही शब्द", "एक और शब्द"]) == [], \
+            "two different words must not read as two spellings of one"
+        assert _spelling_variants(["Standard Sunrise Foundation"]) == [], \
+            "a Roman CTA is not a Devanagari spelling defect"
+        # Then the judge itself. It is a model call, so prove the CONTRACT offline with the
+        # gateway stubbed — the corrected cards come back, and the script reaches the prompt.
+        _orig_chat2 = chat
+        _seen = {}
+        def _stub_chat(msgs, **kw):
+            _seen["user"], _seen["prefer"] = msgs[-1]["content"], kw.get("prefer")
+            return json.dumps({
+                "problems": ["बनें is the respectful plural on मुस्कान (feminine) — use बने"],
+                "captions": {"font": "rounded",
+                             "hook": {"lines": ["क्या आप उनका एक मिनट देंगे?"]},
+                             "moral": {"lines": ["आपका एक मिनट उनका ख़ज़ाना है"]},
+                             "cta": {"lines": ["Standard Sunrise Foundation"]}}}), "stub"
+        globals()["chat"] = _stub_chat
+        try:
+            _j = judge_captions("HOOK: Rich in life because… you stopped by.", _ident()["captions"])
+            assert _j["problems"], "a judged-wrong card must come back with its problems"
+            assert _j["captions"]["hook"]["lines"] == ["क्या आप उनका एक मिनट देंगे?"], \
+                "the CORRECTED cards are what layer 1 adopts — a flag with no repair fixes nothing"
+            assert "Rich in life because" in _seen["user"], \
+                "the script must be handed to the judge — meaning is judged against it"
+            assert _seen["prefer"], \
+                "the judge must prefer a gateway other than the one that wrote the cards"
+        finally:
+            globals()["chat"] = _orig_chat2
+        print("OK: the caption judge is handed the script and any two-way spelling, and prefers "
+              "the other gateway; it returns the cards CORRECTED, not merely flagged")
+
+        # ROUTER HEALTH. A walled route must be SKIPPED by the next call, not re-discovered: the
+        # retry budget (3 tries + backoff) exists for a busy tier, and paying it again on every
+        # one of a run's dozens of calls is where a 429 turns into minutes. Proven at the seam —
+        # a stubbed urlopen that counts how many times each route is actually knocked on.
+        import routerhealth as _rh
+        _rh.clear()
+        _tries = {}
+        _orig_urlopen = urllib.request.urlopen
+        _real_gw = dict(_GATEWAYS)
+        try:
+            def _fake_open(req, timeout=None):
+                name = "walled" if "walled" in req.full_url else "good"
+                _tries[name] = _tries.get(name, 0) + 1
+                if name == "walled":
+                    raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
+                class _R:
+                    def __enter__(self): return self
+                    def __exit__(self, *a): return False
+                    def read(self, *_a):
+                        return json.dumps({"model": "m",
+                                           "choices": [{"message": {"content": "hi"}}]}).encode()
+                return _R()
+            urllib.request.urlopen = _fake_open
+            _GATEWAYS.clear()
+            _GATEWAYS.update({"walled": ("http://walled", "k", "m", 1),
+                              "good": ("http://good", "k", "m", 1)})
+            _orig_order = _ORDER[:]
+            _ORDER[:] = ["walled", "good"]
+            _t1 = chat([{"role": "user", "content": "x"}])
+            assert _t1[0] == "hi" and _tries["walled"] == int(_TRIES) and _tries["good"] == 1, \
+                f"the first call pays the retry budget and moves on: {_tries}"
+            _tries.clear()
+            _t2 = chat([{"role": "user", "content": "y"}])
+            assert _t2[0] == "hi", "a cooling route must not break the call"
+            assert _tries.get("walled", 0) == 0, \
+                f"a WALLED route must be skipped by the next call, not re-knocked: {_tries}"
+            # …and the memory must never be the reason a run fails: with EVERY route cooling,
+            # they are all tried anyway rather than raising 'nothing to talk to'.
+            assert _rh.cooling("good")[0] == 0, "the route that answered must be healthy"
+            _rh.note_failure("good", "429 too many requests")
+            _tries.clear()
+            assert chat([{"role": "user", "content": "z"}])[0] == "hi", \
+                "an all-cooling fleet must still be tried — a memory of failure is not a failure"
+            assert _tries.get("good", 0) >= 1, "the last resort must actually be attempted"
+        finally:
+            urllib.request.urlopen = _orig_urlopen
+            _GATEWAYS.clear(); _GATEWAYS.update(_real_gw)
+            _ORDER[:] = _orig_order
+            _rh.clear()
+        print("OK: a 429 walls a route for the following calls; the fleet is still tried when "
+              "everything is cooling, so the memory can never itself fail a run")
+
+        # presentation() must WRITE the corrected cards (layer 1 is a fix, not a flag) and must
+        # fail OPEN when the judge cannot run — a caption review must never cost the reel.
+        _FIXED = dict(_ident()["captions"], hook={"lines": ["क्या आप उनका एक मिनट देंगे?"]})
+        def _stub_pres(msgs, **kw):
+            if "CAPTION CARDS" in msgs[-1]["content"]:           # the judge's own call
+                return json.dumps({"problems": ["बनें -> बने"], "captions": _FIXED}), "stub"
+            return json.dumps(_ident()), "stub"                  # the art director's call
+        globals()["chat"] = _stub_pres
+        try:
+            assert presentation("script", _shot)["captions"]["hook"]["lines"] == \
+                ["क्या आप उनका एक मिनट देंगे?"], \
+                "presentation must ADOPT the corrected cards, not merely receive them"
+            def _boom(msgs, **kw):
+                if "CAPTION CARDS" in msgs[-1]["content"]:
+                    raise RuntimeError("all LLM gateways failed")
+                return json.dumps(_ident()), "stub"
+            globals()["chat"] = _boom
+            assert presentation("script", _shot)["captions"]["hook"]["lines"] == \
+                _ident()["captions"]["hook"]["lines"], \
+                "a judge that cannot run must leave the cards as written — fail OPEN"
+        finally:
+            globals()["chat"] = _orig_chat2
+        print("OK: presentation adopts a caption repair, and fails open when the judge is down")
+
         # A model handed WAVELENGTH §4's face list answers with the FACE, which is the same answer
         # to the question the schema asked. presentation() maps it to the class the renderer knows;
         # _presentation_selfcheck stays strict, so only the mapping (not the contract) is lenient.
@@ -704,6 +1171,24 @@ if __name__ == "__main__":
         _mapped["captions"]["font"] = _font_class("Baloo 2")
         _presentation_selfcheck(_mapped)      # the mapped answer must clear the strict contract
         print("OK: a face name written where a font class belongs is mapped, not fatal")
+        # the brand's domain is a fact: an invented or shortened one is rewritten, not shipped
+        assert _fix_url("standardsunrise.org पर आएँ") == f"{BRAND_URL} पर आएँ", "domain kept"
+        assert _fix_url("visit www.example.com/join today") == f"visit {BRAND_URL} today", "url"
+        assert _fix_url("आपका कुछ मिनट उनका खज़ाना है") == "आपका कुछ मिनट उनका खज़ाना है", \
+            "a card with no address must come back untouched"
+        assert BRAND_URL in _wavelength(), "WAVELENGTH §8 and agents.BRAND_URL have drifted apart"
+        # §5: the identity lock and the per-site shape are prose facts a future edit could delete
+        # silently. The lock's own wording is asserted in _prompt_selfcheck; this is the drift
+        # guard between the wavelength and the code that enforces it.
+        assert "never trimmed off the end of a prompt" in _wavelength(), \
+            "WAVELENGTH §5 no longer says the identity lock outranks the length trim"
+        assert "Vids and Flow are both Veo 3.1" in _wavelength(), \
+            "WAVELENGTH §5 no longer names the two sites that share the labelled brief"
+        # §6: a down gateway is the agent's cue to LOOK, not the owner's. Prose drifts silently;
+        # this keeps the one rule the owner had to say twice from being edited away.
+        assert "the agent's job, not a ticket for the owner" in _wavelength(), \
+            "WAVELENGTH §6 no longer says the by-eye fallback is performed by the agent"
+        print("OK: any web address on a card is rewritten to the foundation's own")
         print("OK: presentation() rejects overflow, an empty card, an English-only hook, "
               "a photoreal identity, and an unknown font")
         raise SystemExit(0)

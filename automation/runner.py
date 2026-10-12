@@ -16,7 +16,9 @@ the backoff so we step back and return later instead of repeating the mistake.
 """
 
 import importlib
+import glob
 import os
+import re
 import sys
 import time
 
@@ -33,6 +35,7 @@ ROOT = os.path.dirname(_DIR)
 CLIPS_DIR = os.path.join(ROOT, "clips")            # per-project downloaded clips
 PROJECTS_DIR = os.path.join(ROOT, "projects")      # finished reels land here (final.mp4)
 MAX_RETRIES = 3
+REQUEUE_CAP = 2                              # times the GATE may send one clip back, then a human
 POLL_EVERY = 8.0                             # seconds between poll looks
 POLL_TIMEOUT = 12 * 60                       # give a render up to 12 min
 
@@ -87,9 +90,15 @@ def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
     # back, that site is the reel's lock and nothing else may add a scene to it — pick(strict=True)
     # returns None while it is cooling, so the loop WAITS for the primary instead of filling in from
     # a fallback (this reel first ended up krea+vibes+googlevids, three looks in one cut).
-    # BEFORE the first clip lands the job's `site` is only an opening bid: if that bid is unusable
-    # (dry / disabled / cooling for good), the WHOLE reel fails over to the next priority site
+    # BEFORE the first clip lands, the job's `site` is an opening bid: if that bid is unusable
+    # (dry / disabled / hard-blocked), the WHOLE reel fails over to the next priority site
     # (whole-reel fails over, never a scene at a time — see SITE_ORDER in learn.py).
+    # But a bid that is merely COOLING still gets the patience the lock gets. One `selector` wall
+    # (a 120s cooldown, retry 1/3) failed a reel over from Google Vids — 12 credits left, 720x1280,
+    # native audio — onto vibes: 464x832, silent, so the reel lost its narration and its
+    # resolution and came back with the dialogue burned in as garbled subtitles. `want_site` is a
+    # soft preference, so pick() fell straight through to vibes the moment the primary cooled.
+    # Wait it out instead; fail over only when the primary is genuinely dead.
     locked = st.project_site(job["project"])
     if locked:
         pick = br.pick(want_site=locked, strict=True)      # a reel in progress waits, never mixes
@@ -97,6 +106,11 @@ def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
             return "waiting"
         site = pick[0]
     else:
+        if br.wait_for_bid(job["site"]):
+            # ponytail: waiting breaks the whole queue loop, so a parked reel stalls other
+            # projects' queued jobs too. Fine while one reel is in flight at a time (how this
+            # house runs); skip-to-the-next-project if a second reel is ever queued alongside.
+            return "waiting"                               # a short cooldown is not a dead end
         pick = br.pick(want_site=job["site"], strict=False)
         if not pick:
             return "waiting"                                # nothing attackable right now
@@ -149,6 +163,67 @@ def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
         return "error"
 
 
+def _archive_cut(project_dir):
+    """Move a cut the gate just rejected out of the way. `stitch_done_projects` skips any project
+    that already has a final*.mp4 — so re-shooting a clip WITHOUT moving the rejected cut leaves
+    the new clip on disk and the old reel in place, and nothing ever rebuilds. Moving it is also
+    honest: the signature a human put on that cut (qc eye_review, keyed to qc.Reel.fp) is a
+    signature on a picture that no longer exists."""
+    moved = []
+    for f in os.listdir(project_dir):
+        if f in ("final_veo.mp4", "final.mp4"):
+            d = os.path.join(project_dir, "rejected")
+            os.makedirs(d, exist_ok=True)
+            dst = os.path.join(d, f"{int(time.time())}-{f}")
+            os.replace(os.path.join(project_dir, f), dst)
+            moved.append(os.path.basename(dst))
+    return moved
+
+
+def _regenerate(st: State, project_dir: str, bad, reason: str = None) -> list:
+    """Turn a gate finding into a RE-SHOOT: requeue exactly the clips that broke the look, with
+    the reason folded into their prompts, and stop after REQUEUE_CAP attempts.
+
+    The cap is the whole point. `state.requeue` clears `retries` on purpose — that budget belongs
+    to a flaky SITE. So without a counter of its own, "the gate rejected clip 2" → "re-shoot clip
+    2" → "the gate rejected clip 2" never ends; it just burns generations. Twice proves the
+    feedback is not the problem. After that the clip is a defect only a person can settle, and it
+    is reported as one instead of re-rolled a third time.
+
+    `bad` is a list of clip file paths (or idx ints). Returns the requeued idxs."""
+    project = os.path.basename(project_dir.rstrip("/"))
+    rows = {c["idx"]: c for c in st.project_clips(project)}
+    by_path = {os.path.abspath(c["video_path"]): c["idx"] for c in rows.values()
+               if c["video_path"]}
+    idxs, spent, unknown = [], [], []
+    for b in bad:
+        i = b if isinstance(b, int) else by_path.get(os.path.abspath(b))
+        if i is None or i not in rows:
+            unknown.append(os.path.basename(str(b)))
+        elif rows[i]["requeues"] >= REQUEUE_CAP:
+            spent.append(i)
+        elif i not in idxs:
+            idxs.append(i)
+    if unknown:
+        print(f"  {project}: cannot re-shoot {', '.join(unknown)} — no job row for it "
+              "(clip swept, or not generated by this runner)")
+    if spent:
+        print(f"  {project}: clip(s) {spent} already sent back {REQUEUE_CAP}x — NOT re-queued. "
+              "The feedback is not the problem, so another generation is not the fix: this is a "
+              "defect for a person (and a candidate lesson), not a re-roll.")
+    if not idxs:
+        return []
+    print(f"  {project}: re-shooting clip(s) {idxs} — {reason or 'rejected by the gate'}")
+    for i in idxs:
+        base = rows[i]["prompt"] or ""
+        # append once, never per attempt: a prompt that grows a note per re-shoot is its own bug
+        if "RE-SHOOT —" not in base:
+            base += f"\n\nRE-SHOOT — the previous render of this clip was rejected: {reason}"
+        st.requeue(project, [i], prompt=base)
+    _archive_cut(project_dir)
+    return idxs
+
+
 def stitch_done_projects(st: State):
     """Any project whose every clip is done -> ASSEMBLE the finished reel (once).
 
@@ -186,6 +261,13 @@ def stitch_done_projects(st: State):
             # pass CLIPS_DIR explicitly: assemble would otherwise resolve clips/ from the repo
             # root on its own, ignoring the dir this loop (and its self-check) was pointed at
             assemble.build(pdir, clips_dir=os.path.join(CLIPS_DIR, project), absorb=False)
+        except assemble.StyleDrift as e:
+            # NOT "will retry next run" — the same clips rebuild the same cut, which is what made
+            # this a livelock. Name the clips, send them back, and let the cap end it.
+            if os.path.exists(final):
+                os.unlink(final)
+            _regenerate(st, pdir, [p for p, _ in e.bad], e.reason)
+            continue
         except Exception as e:                        # this project only — keep the pass going
             print(f"  {project}: assemble failed ({str(e)[:160]}) — will retry next run")
             # any final_veo.mp4 here was written by THIS failed attempt (the guard above
@@ -223,9 +305,10 @@ def _absorb(project_dir: str, st: State = None):
 def _gate(st: State, project_dir: str):
     """Run the craft gate over a finished reel and log the verdict. Advisory in the
     autonomous loop (never crashes the drain); block/gate items mean don't hand off / go_live.
-    Every verdict is followed by _absorb, so a reel that PASSES teaches the brain as much as
-    one that fails — the loop runs on every generation, not only on problems."""
-    _absorb(project_dir, st)
+
+    The gate runs BEFORE _absorb, and that order is load-bearing: absorb records the generation
+    fact — including the QC result — so absorbing first memorised the PREVIOUS run's verdict and
+    every reel's brain record lagged one generation behind reality."""
     try:
         import qc
         v = qc.run(project_dir, st)
@@ -233,11 +316,63 @@ def _gate(st: State, project_dir: str):
             print(f"  QC BLOCK: {b}")
         for g in v["gate"]:
             print(f"  QC PUBLISH-GATE: {g}")
-        print(f"  QC {project_dir}: {'PASS' if v['ok'] else 'HELD'} "
+        if v.get("eye"):
+            print(f"  QC BY-EYE: {len(v['eye'])} check(s) could not run — the sheet and frames are "
+                  f"in {project_dir} (eye_review.json); sign off with "
+                  f"qc.py {project_dir} --signed-by '<name>'")
+        # `ok` is the automated gate; `live` is the one that ships — a reel whose only gate items
+        # were checks that could NOT run goes live once a human signs off the cut (WAVELENGTH §6).
+        _state = ("PASS" if v["ok"] else "LIVE (signed off)" if v.get("live") else "HELD")
+        print(f"  QC {project_dir}: {_state} "
               f"({len(v['block'])} block, {len(v['gate'])} gate, {len(v['checklist'])} to eyeball) "
               "— verdict saved to state.db")
+        _file_findings(st, v)
+        # A finding the machine can ACT on does not wait for a human. The gate named the clips;
+        # send them back. After REQUEUE_CAP attempts _regenerate stops and says so, so the loop
+        # cannot run forever and the owner still gets told when a person is genuinely needed.
+        if v.get("reject"):
+            _regenerate(st, project_dir, [i for r in v["reject"] for i in r["clips"]],
+                        "; ".join(r["reason"] for r in v["reject"]))
     except Exception as e:
         print(f"  QC skipped ({e})")
+    _absorb(project_dir, st)
+
+
+def _file_findings(st: State, v: dict):
+    """A defect the gate found must leave something behind, or the next reel makes it again.
+
+    It files a CANDIDATE, not a rule. The brain proposes and the owner vets (state.propose_lesson
+    → candidates → promote), because the alternative — a machine writing its own brief from one
+    bad render — is how a project talks itself into a rule nobody chose. What the candidate buys
+    is the count: keyed by the CHECK, so the same defect across ten reels lands as ONE row with
+    hits=10 instead of ten near-duplicates, and a defect that RECURS is visible instead of
+    anecdotal. Until promoted it changes nothing by itself.
+
+    Fail-open by contract: bookkeeping must never fail a build."""
+    try:
+        for slug, why in _findings(v).items():
+            st.propose_lesson(
+                slug=f"defect-{slug}",
+                title=f"The {slug} check keeps catching this on generated reels",
+                why=f"Found by the craft gate. A recurrence count here means the generation side "
+                    f"is still doing it, not that the reel was unlucky.",
+                evidence=f"{v['reel']}: {why}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  (findings not filed: {str(e)[:90]})")
+
+
+def _findings(v: dict) -> dict:
+    """Every defect in a verdict, keyed by the check that caught it: {check_slug: one example}.
+    The check slug is read from the `[slug]` prefix qc.run writes, so nothing here needs to know
+    the list of checks."""
+    out = {}
+    for line in v.get("block", []) + v.get("gate", []) + v.get("warn", []):
+        m = re.match(r"\[([a-z0-9-]+)\]\s*(.*)", line or "")
+        if m:
+            out.setdefault(m.group(1), m.group(2))
+    for r in v.get("reject", []):
+        out.setdefault(r["check"], f"clip {', '.join(str(i) for i in r['clips'])}: {r['reason']}")
+    return out
 
 
 def loop(once: bool = False, headless: bool = True):
@@ -380,6 +515,35 @@ if __name__ == "__main__":
         print("OK: whole-reel failover — a dry primary moves the whole reel before the first "
               "clip; after one clip the lock is absolute")
 
+        # A COOLING BID IS NOT A DEAD BID (owner, 2026-10-10). The failover above is for a primary
+        # that is genuinely OUT. One that merely stepped back — still funded, back in two minutes —
+        # must be waited for. A soft `want_site` used to fall straight through to the next site:
+        # a single `selector` wall moved a 12-credit Google Vids reel onto vibes, which is silent
+        # and 464x832, and the reel came back with no narration and its dialogue burned in.
+        bst = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+        bbr = Brain(bst)
+        bst.set_credits("googlevids", "g1", remaining=12)   # funded — cooling, not dead
+        bst.set_credits("flow", "f1", remaining=8)          # healthy lower tier: must NOT be taken
+        bbr.hit_wall("googlevids", "g1", "selector")        # the 120s wall that caused this
+        bst.add_job("cooling-proj", 0, "a scene", site="googlevids")
+        assert runner.process_job(bst, bbr, bst.next_queued("cooling-proj"), headless=True) == "waiting", \
+            "a funded primary in a short cooldown must be waited for, not abandoned"
+        assert bst.project_site("cooling-proj") is None, \
+            "a cooling primary must not move the reel to a lower tier"
+        bst.db.execute("UPDATE lessons SET cooldown_until=0"); bst.db.commit()
+        assert runner.process_job(bst, bbr, bst.next_queued("cooling-proj"), headless=True) == "done", \
+            "the wait must end the moment the primary is back"
+        assert bst.project_clips("cooling-proj")[0]["site"] == "googlevids", \
+            "the reel must land on its instructed primary, never the fallback"
+        # ...but a site that is DRY or hard-BLOCKED is a real dead end and still fails over.
+        bst.set_credits("googlevids", "g1", remaining=0)
+        assert not bbr.wait_for_bid("googlevids"), "a dry primary must not be waited for"
+        bst.set_credits("googlevids", "g1", remaining=12)
+        bbr.hit_wall("googlevids", "g1", "block")
+        assert not bbr.wait_for_bid("googlevids"), "a hard-blocked primary must fail over"
+        print("OK: a cooling but funded primary is WAITED for; only a dry or blocked one "
+              "fails the reel over")
+
         # a broken balance reader must never block a job or clobber the last known number
         fake.read_credits = lambda s: (_ for _ in ()).throw(RuntimeError("no balance on this page"))
         st.add_job("selftest", 1, "a second blue clip")
@@ -392,11 +556,16 @@ if __name__ == "__main__":
         # the craft gate makes LIVE vision calls, but this self-check promises no network — stub
         # the gateway and the style pre-flight, then prove the pass ASSEMBLES a finished reel
         # (cards placed, score bed, verified) and that the gate records a real verdict for it.
-        import json, vision
+        import json, vision, agents as _agents
         os.environ["STYLE_CHECK"] = "0"
         _orig_review, _orig_medium = vision.review_frame, vision.medium_of
+        _orig_judge = _agents.judge_captions
         vision.review_frame = lambda png: []
         vision.medium_of = lambda png: "3d"
+        # the caption-wording check is a live LLM judgement too (qc.check_caption_wording ->
+        # agents.judge_captions): stub it here for the same reason as the vision gateway, or the
+        # no-network promise is broken and a model's opinion decides the fixture's verdict.
+        _agents.judge_captions = lambda script, caps: {"problems": [], "captions": caps}
         # the engine authors these at kickoff (pipeline.py, agent 3); the assembler reads them
         _pd = os.path.join(runner.PROJECTS_DIR, "selftest")
         os.makedirs(_pd, exist_ok=True)
@@ -420,6 +589,7 @@ if __name__ == "__main__":
             runner.stitch_done_projects(st)
         finally:
             vision.review_frame, vision.medium_of = _orig_review, _orig_medium
+            _agents.judge_captions = _orig_judge
         final = os.path.join(_pd, "final_veo.mp4")
         assert os.path.exists(final), f"the pass must assemble {final}"
         import assemble as _asm
@@ -465,10 +635,12 @@ if __name__ == "__main__":
         os.environ["STYLE_CHECK"] = "0"
         vision.review_frame = lambda png: []
         vision.medium_of = lambda png: "3d"
+        _agents.judge_captions = lambda script, caps: {"problems": [], "captions": caps}
         try:
             runner.stitch_done_projects(st)           # must not raise on any of these rows
         finally:
             vision.review_frame, vision.medium_of = _orig_review, _orig_medium
+            _agents.judge_captions = _orig_judge
         assert not os.path.exists(os.path.join(runner.PROJECTS_DIR, "ghost", "final_veo.mp4")), \
             "a project with missing clips must be skipped"
         assert open(os.path.join(craft, "final_veo.mp4"), "rb").read() == b"owner's finished reel", \
@@ -480,7 +652,65 @@ if __name__ == "__main__":
         assert nq and nq[0]["ok"] == 0, "a reel with no caption cards must be HELD"
         assert any("no caption cards" in b for b in json.loads(nq[0]["verdict"])["block"]), \
             "the HELD reason must name the missing craft layer"
+        # A FINDING MUST LEAVE SOMETHING BEHIND, or the next reel makes it again. It files a
+        # CANDIDATE (brain proposes, owner vets), keyed by the CHECK — so three broken layers on
+        # one reel are one row, and the same defect across ten reels is hits=10, not ten rows.
+        _c = {c["slug"]: c for c in st.candidates()}
+        assert "defect-craft-layers" in _c, \
+            f"a gate finding must be filed as a candidate: {sorted(_c)}"
+        assert "no caption cards" in _c["defect-craft-layers"]["evidence"], \
+            "the candidate must carry the finding itself, not just the check's name"
+        runner._file_findings(st, {"reel": "nocaps", "block": ["[craft-layers] no caption cards"],
+                                   "gate": [], "warn": [], "reject": []})
+        assert {c["slug"]: c["hits"] for c in st.candidates()}["defect-craft-layers"] >= 2, \
+            "a RECURRING defect must accumulate on one candidate, not scatter near-duplicates"
+        # …and the brain's record of this generation must carry THIS run's verdict. _absorb reads
+        # the gate's verdict, so running it first memorised the PREVIOUS one (every reel's brain
+        # record lagged a generation) — the order in _gate is the fix.
+        _gen = [json.loads(e["detail"]) for e in st.events() if e["kind"] == "generation"
+                and json.loads(e["detail"]).get("reel") == "nocaps"]
+        assert _gen and _gen[-1]["qc"] == 0, \
+            f"the generation fact must record THIS run's QC result: {_gen[-1] if _gen else None}"
+        print("OK: a gate finding is filed as a candidate keyed by the check, and the brain's "
+              "generation fact carries this run's verdict (not the previous one)")
         print("OK: missing clips skipped, a finished cut untouched, an uncaptioned reel HELD")
+
+        # THE RE-SHOOT LOOP — what turns "the gate found it" into "the clip is re-made", and the
+        # cap that stops that being an infinite loop. Every part of it is load-bearing: the named
+        # clip goes back carrying the reason, ONLY that clip goes back, and the rejected cut MOVES
+        # (leave it in place and `stitch_done_projects` skips the project forever, so the re-shot
+        # clip is never assembled — the same livelock wearing a different hat).
+        reg = os.path.join(runner.PROJECTS_DIR, "regentest")
+        os.makedirs(reg, exist_ok=True)
+        _rids = [st.add_job("regentest", i, f"original prompt {i}") for i in range(2)]
+        for i, _rid in enumerate(_rids):
+            st.set_status(_rid, "done",
+                          video_path=os.path.join(_tmp, "clips", "regentest", f"clip_{i:03d}.mp4"))
+        with open(os.path.join(reg, "final_veo.mp4"), "wb") as f:
+            f.write(b"the cut the gate rejected")
+        assert runner._regenerate(st, reg, [1], "does not match the reel's look") == [1]
+        _rows = {c["idx"]: c for c in st.project_clips("regentest")}
+        assert _rows[1]["status"] == "queued" and _rows[0]["status"] == "done", \
+            "ONLY the named clip goes back — re-shooting the whole reel is not a fix"
+        assert "RE-SHOOT" in _rows[1]["prompt"] and "does not match" in _rows[1]["prompt"], \
+            f"the reason must reach the prompt: {_rows[1]['prompt']}"
+        assert "RE-SHOOT" not in _rows[0]["prompt"], "an innocent clip's prompt is untouched"
+        assert not os.path.exists(os.path.join(reg, "final_veo.mp4")), \
+            "the rejected cut must MOVE, or the stitch pass skips this project forever"
+        assert glob.glob(os.path.join(reg, "rejected", "*-final_veo.mp4")), \
+            "…and it is kept, not deleted: it is the evidence for the re-shoot"
+        # the note is appended ONCE, and the loop STOPS at the cap instead of re-rolling forever
+        st.set_status(_rids[1], "done")
+        runner._regenerate(st, reg, [1], "still wrong")
+        assert st.project_clips("regentest")[1]["prompt"].count("RE-SHOOT") == 1, \
+            "the note is appended once, not once per attempt"
+        st.set_status(_rids[1], "done")
+        assert runner._regenerate(st, reg, [1], "still wrong again") == [], \
+            f"after {runner.REQUEUE_CAP} re-shoots the loop must STOP — this is the livelock"
+        assert st.project_clips("regentest")[1]["status"] == "done", \
+            "a clip at the cap is reported, never silently re-rolled again"
+        print("OK: a gate finding requeues the named clip with the reason, moves the rejected cut, "
+              "and STOPS at the cap instead of looping")
         print("OK: hermetic self-check (temp dirs) + craft-gate verdict persisted")
         print("OK: observed balance updates the count before spend; a failed read never blocks a job")
     else:

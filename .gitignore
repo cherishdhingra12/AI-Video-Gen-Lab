@@ -28,3 +28,6 @@ music/.candidates/
 
 # freebuff tool scratch (unreferenced)
 .freebuff/
+
+# a runner probe log (runtime bookkeeping, like .brain_hook.log)
+automation/.runner-probe.log

@@ -7,6 +7,8 @@ Two tiers, straight from the lesson rows:
   judgment  no code can see it (style drift, emotional beats) -> a checklist for eyes.
 
     python3 qc.py <project_dir>      # gate one reel; exit 1 if anything blocks
+    python3 qc.py <project_dir> --signed-by '<name>' [--note '...']
+                                     # a human signs off the by-eye gaps on THIS cut, then re-gate
     python3 qc.py --seed            # (re)absorb the canonical lessons into state.db
     python3 qc.py --selfcheck       # offline: prove each check catches its failure
 
@@ -17,24 +19,60 @@ music not license-cleared). The judgment checklist is for the human before appro
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _DIR)
+sys.path.insert(0, os.path.dirname(_DIR))   # project root, so the caption judge (agents.py) is
+                                            # importable when qc runs standalone, not via runner.py
 from state import State  # noqa: E402
 
 
 # ---- auto checks: check_id -> fn(reel) -> list[problem strings] (empty = pass) ---------------
 
 class Unreviewed(str):
-    """A check that could NOT run (its gateway was down) — not a defect, and not a pass.
-    The three vision checks share the gateway that the QC frame-review exhausts, so an outage
-    used to read exactly like a craft failure and HELD a clean, finished reel (darzi-ka-tukda,
-    2026-10-10: all vision routes rate-limited, every offline check green). Wrapping the
-    message lets run() tell the two apart: a defect blocks the ship, an outage only gates
-    go_live and demands a human look. A str subclass so it prints and greps as the message."""
+    """An item a HUMAN must settle — not a defect, and not a pass.
+
+    Two things land here. (a) A check that could NOT run: the three vision checks share the
+    gateway that the QC frame-review exhausts, so an outage used to read exactly like a craft
+    failure and HELD a clean, finished reel (darzi-ka-tukda, 2026-10-10: all vision routes
+    rate-limited, every offline check green). (b) A JUDGE that ran and objected — the caption
+    wording judge is a model's opinion of Hindi, and the owner's rule is that it must never stop a
+    ship on its own, it asks for a human's eyes. Both mean the same thing to run(): the item gates
+    go_live in the `eye` list, where a human's sign-off settles it, and neither ever blocks.
+
+    Without (b) the gate could not be answered at all: the judge is non-deterministic, so
+    "apply its fix, rebuild, re-judge" found a fresh stylistic objection every round — a ratchet
+    with no end and no way for the owner to overrule it. Runs on 2026-10-11 gave three different
+    verdicts on the same two cards.
+
+    A str subclass so it prints and greps as the message."""
+
+
+class Reject(str):
+    """A DEFECT the machine can ACT on: the check ran, it found a real problem, and it knows
+    WHICH generated clips caused it.
+
+    This is the opposite of Unreviewed. Unreviewed says "nobody could answer this, ask a human";
+    Reject says "the answer is bad and here is the clip to re-make". runner._regenerate reads
+    `.clips`, requeues exactly those rows and appends `.reason` to their prompts.
+
+    Why it has to exist: a finding the pipeline cannot act on is a finding the owner has to act
+    on, and there was no path from "the gate says clip 3 is photoreal" back to a re-render. The
+    one seam that could carry it (`state.requeue`) had no caller, so the only automated response
+    to drift was `stitch_done_projects` retrying the SAME clips forever.
+
+    A str subclass so it prints and greps as the message."""
+
+    def __new__(cls, msg, clips=(), reason=None):
+        o = super().__new__(cls, msg)
+        o.clips = list(clips)          # source-clip idx values (the value state.requeue takes)
+        o.reason = reason or str(msg)  # what to append to the re-shot clip's prompt
+        return o
 
 def _run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
@@ -224,38 +262,98 @@ def _declared_medium(reel) -> str:
     return _HOUSE_MEDIUM
 
 
+def _clip_paths(reel, limit=6):
+    """The reel's SOURCE clips, in reel order. Source clips, not the final cut: no caption card is
+    overlaid, so a face and a render can be compared as generated. Empty once a published reel
+    has been swept — nothing to inspect."""
+    return sorted(glob.glob(os.path.join(_CLIPS_ROOT, reel.name, "clip_*.mp4")))[:limit]
+
+
+def _clip_frames(reel, frac=0.5, limit=6):
+    """One frame from `frac` through each source clip, PNG bytes, same order as _clip_paths."""
+    out = []
+    for c in _clip_paths(reel, limit):
+        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{_duration(c) * frac:.3f}", "-i", c,
+                            "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+                           capture_output=True)
+        if r.stdout:
+            out.append(r.stdout)
+    return out
+
+
+def _idx_of(path):
+    """The clip's idx — the number in `clip_003.mp4`, which is exactly what state.requeue takes.
+    Read off the filename, never the list position: a gap on disk would shift positions and the
+    requeue would re-shoot the wrong clip."""
+    m = re.search(r"clip_(\d+)\.mp4$", path)
+    return int(m.group(1)) if m else None
+
+
 def check_style_uniform(reel):
     """One art style across the WHOLE reel. review_frame catches a frame that breaks its OWN
     look (limbs, merges, text), but a reel can be frame-perfect photoreal in scene 1 and
     animated from scene 2 — every individual frame is 'fine', the reel is inconsistent. That is
     the defect the owner actually reported, and it needs a check that compares ACROSS the reel.
-    Classifies a frame's medium with vision and fails when the reel mixes media.
+
+    TWO questions, asked separately because they fail separately:
+      (1) MEDIUM — is each frame the look the house asks for? Classified per frame, judged
+          against _declared_medium.
+      (2) AGREEMENT — do the clips match EACH OTHER? Asked pairwise against clip 0, the first
+          clip finished, which is what locked the reel's site and character.
+
+    (2) is not optional and not the same question as (1). Classifying a frame into four buckets
+    collapses a whole photoreal clip into '3d' when its neighbours are 3-D — which is how
+    dadi-ki-dhansuchi (2026-10-12) passed this check carrying a photoreal scene. Pairwise
+    comparison answers with a reason AND a clip index, so the machine can re-shoot it.
     """
     if not reel.final:
         return []
     import vision
+    probs = []
     d = _duration(reel.final)
-    if d <= 0:
-        return []
-    samples = []
-    for frac in (0.06, 0.30, 0.55, 0.80, 0.95):
-        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{d * frac:.3f}", "-i", reel.final,
-                            "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
-                           capture_output=True)
-        if r.stdout:
-            samples.append(vision.medium_of(r.stdout))
-    # Judged against the HOUSE medium (3-D) unless this is a grandfathered pre-2026-10-08 reel —
-    # see _declared_medium. A new reel's own photoreal declaration no longer loosens this.
-    verdict, ev = vision.medium_verdict(samples, expected=_declared_medium(reel))
-    if verdict == "unknown":
-        return [Unreviewed("style classification could NOT run (vision gateway unavailable) — "
-                           "confirm by eye the reel stays in ONE art style")]
-    if verdict == "drift":
-        return [f"the reel is not in ONE art style ({ev}) — no photoreal scenes in front "
-                "of animated ones"]
-    if verdict == "wrong-medium":
-        return [f"{ev} — WAVELENGTH.md §1: every new reel is 3-D animation"]
-    return []
+    if d > 0:
+        samples = []
+        for frac in (0.06, 0.30, 0.55, 0.80, 0.95):
+            r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{d * frac:.3f}", "-i", reel.final,
+                                "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+                               capture_output=True)
+            if r.stdout:
+                samples.append(vision.medium_of(r.stdout))
+        # Judged against the HOUSE medium (3-D) unless this is a grandfathered pre-2026-10-08 reel
+        # — see _declared_medium. A new reel's own photoreal declaration no longer loosens this.
+        verdict, ev = vision.medium_verdict(samples, expected=_declared_medium(reel))
+        if verdict == "unknown":
+            probs.append(Unreviewed("style classification could NOT run (vision gateway "
+                                    "unavailable) — confirm by eye the reel stays in ONE art style"))
+        elif verdict == "drift":
+            probs.append(f"the reel is not in ONE art style ({ev}) — no photoreal scenes in front "
+                         "of animated ones")
+        elif verdict == "wrong-medium":
+            probs.append(f"{ev} — WAVELENGTH.md §1: every new reel is 3-D animation")
+
+    paths = _clip_paths(reel)
+    if len(paths) >= 2:
+        scan = vision.style_scan_cached(_clip_frames(reel))
+        if scan is None:
+            probs.append(Unreviewed("style drift could NOT be reviewed clip-against-clip (vision "
+                                    "gateway unavailable) — confirm by eye every scene is one look"))
+        elif scan["whole_reel"]:
+            # The anchor is the odd one out, so "re-shoot the rest" would be re-shooting the reel.
+            # That is the owner's call, never a requeue — and it is what protects a genuinely
+            # photoreal reel from being auto-re-made into something else.
+            probs.append(Unreviewed(
+                f"every clip differs from the reel's first clip ({scan['detail']}) — the whole "
+                "reel is one look, so this is not one bad clip: confirm by eye before re-shooting"))
+        elif scan["flagged"]:
+            idxs = [i for i in (_idx_of(paths[i]) for i in scan["flagged"]) if i is not None]
+            names = ", ".join(f"clip {i}" for i in idxs) or "a clip"
+            probs.append(Reject(
+                f"{names} in a different look from the rest of the reel ({scan['detail']})",
+                clips=idxs,
+                reason=f"the previous render of this clip did not match the reel's look "
+                       f"({scan['detail']}): hold the SAME art style and the SAME level of "
+                       f"realism as every other shot in this film"))
+    return probs
 
 
 def _contact_sheet(frames):
@@ -284,34 +382,51 @@ def check_character_consistency(reel):
     while every prompt dutifully names the same person. So this reads the frames: one panel per
     clip, tiled, and one question — is this the same person in every panel?
 
+    Read twice, from two directions, because a single answer to 'same person?' is a coin flip on
+    the frames this house actually shoots: the face is small, the render is soft, and a bindi is
+    not a different woman (the by-eye pass of 2026-10-12 convicted exactly that, wrongly, before
+    the measurement corrected it). So:
+      * the SHEET — every panel at once, "one person throughout?" (vision.compare_character)
+      * the PAIRWISE scan — each clip against clip 0, the same call that answers the look
+    A defect needs BOTH to agree. One voice saying drift, the other saying fine, is not a
+    conviction — it is a question for a human, and unreviewed is where it goes. That direction
+    matters: cross-checking can only ADD doubt, never clear a defect both saw (WAVELENGTH §6 —
+    never re-roll a judge until it agrees).
+
     Reads the SOURCE clips (no caption cards overlaid to confuse the comparison), and follows
     craft-layers' convention: clips swept after publish means there is nothing to inspect."""
     if not reel.final:
         return []
-    clips = sorted(glob.glob(os.path.join(_CLIPS_ROOT, reel.name, "clip_*.mp4")))
-    if len(clips) < 2:
-        return []                                   # one panel cannot disagree with itself
-    frames = []
-    for c in clips[:6]:
-        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{_duration(c) * 0.5:.3f}", "-i", c,
-                            "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
-                           capture_output=True)
-        if r.stdout:
-            frames.append(r.stdout)
+    frames = _clip_frames(reel)
     if len(frames) < 2:
-        return []
+        return []                                   # one panel cannot disagree with itself
     import vision
     sheet = _contact_sheet(frames)
-    if sheet is None:
-        return []
-    res = vision.compare_character(sheet)
-    if res is None:
+    res = vision.compare_character(sheet) if sheet is not None else None
+    scan = vision.style_scan_cached(frames)
+    pairs_drift = [i for i, same in (scan or {}).get("people", {}).items() if not same]
+    scan_ok = scan is not None
+    if res is None and not scan_ok:
         return [Unreviewed("character consistency could NOT be reviewed (vision gateway "
                            "unavailable) — check by eye that the same face and hair appear in "
                            "every scene")]
-    if not res["consistent"]:
-        return [f"the recurring character changes between scenes: "
-                f"{res['detail'] or 'the panels do not show the same person'}"]
+    if res is not None and not res["consistent"] and pairs_drift:
+        idxs = [i for i in (_idx_of(_clip_paths(reel)[i]) for i in pairs_drift) if i is not None]
+        return [Reject(
+            "the recurring character changes between scenes: "
+            f"{res['detail'] or scan.get('person_detail') or 'the panels do not show the same person'}",
+            clips=idxs,
+            reason=f"the character is not the same person as in the rest of the film "
+                   f"({res['detail'] or scan.get('person_detail')}): hold the SAME face shape, "
+                   f"age, hair and features as the first clip, and no jewellery or make-up the "
+                   f"character does not wear there")]
+    if (res is not None and not res["consistent"]) or pairs_drift:
+        who = "the panel review" if (res is not None and not res["consistent"]) else \
+              "the clip-against-clip scan"
+        return [Unreviewed(
+            f"{who} says the recurring character changes between scenes and the other view does "
+            "not — the two do not agree, so this is not a conviction. Look at the frames and "
+            f"settle it ({res['detail'] if res is not None and not res['consistent'] else scan.get('person_detail', '')})")]
     return []
 
 
@@ -447,8 +562,45 @@ def check_caption_on_face(reel):
     return probs
 
 
+def check_caption_wording(reel):
+    """Do the caption CARDS say the right thing, in correct Hindi? — layer 2 of the caption gate.
+
+    Every other caption check is geometry (safe area, never on a face) or existence (craft
+    layers). Nothing read the WORDS, so dadi-ki-dhansuchi shipped "उनकी मुस्कान बनें ख़ज़ाना" — a
+    verbless fragment whose बनें is the respectful plural bolted onto a feminine singular — and
+    ख़ज़ाना spelled two ways in one reel, and no check so much as blinked.
+
+    The words are a JUDGEMENT, not a rule: the cards go to agents.judge_captions with the script,
+    and what comes back is what a Hindi reader would wince at. Layer 1 (the art director reading
+    its own cards back at kickoff) has already repaired them, so this is the independent second
+    look on the FROZEN artifacts — after the render, on exactly what will ship.
+
+    A down gateway says so (Unreviewed -> publish-gate) rather than passing. It never BLOCKS: a
+    model's opinion of Hindi must not stop a ship on its own, it asks for a human's eyes — and
+    like every other human item it is settled by the sign-off (`--signed-by`), not by re-rolling
+    the model until it happens to agree."""
+    if not reel.final:
+        return []
+    caps_p = os.path.join(reel.dir, "captions.json")
+    if not os.path.exists(caps_p):
+        return []                                     # no cards on disk -> craft-layers HELDs it
+    try:
+        import agents
+        caps = json.load(open(caps_p, encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — unreadable cards are craft-layers' business, not this one
+        return []
+    sp = os.path.join(reel.dir, "script.md")
+    script = open(sp, encoding="utf-8").read() if os.path.exists(sp) else ""
+    try:
+        out = agents.judge_captions(script, caps)
+    except Exception:  # noqa: BLE001 — no gateway is an OUTAGE, never a pass and never a defect
+        return [Unreviewed("caption wording could NOT be judged (LLM gateway unavailable) — "
+                           "read the cards in Hindi before go_live")]
+    return [Unreviewed(f"caption wording: {p}") for p in out.get("problems") or []]
+
+
 CHECKS = {"playable": check_playable, "caption-safe-area": check_caption_safe_area,
-          "caption-on-face": check_caption_on_face,
+          "caption-on-face": check_caption_on_face, "caption-wording": check_caption_wording,
           "realism": check_realism, "craft-layers": check_craft_layers,
           "no-synth-voiceover": check_no_synth_voiceover,
           "style-uniform": check_style_uniform,
@@ -473,6 +625,18 @@ LESSONS = [
              "the wall read as skin, so the mask was noise and the softest patch won. Placement "
              "now detects faces with macOS Vision (caption.py) and this check re-answers 'is a "
              "face under this card?' against the shipped cut"),
+    dict(slug="caption-wording", check_id="caption-wording", severity="publish-gate",
+         title="The caption cards say the RIGHT thing, in correct Hindi",
+         why="dadi-ki-dhansuchi (2026-10-10) shipped a hook that read 'उनकी मुस्कान बनें ख़ज़ाना' — "
+             "a verbless fragment whose बनें is the respectful plural bolted onto a feminine "
+             "singular — and spelled ख़ज़ाना two ways in one reel. Nothing caught it because every "
+             "caption check was geometry or existence; no check read the WORDS. The hook was also "
+             "not a quote but a translation (the script wrote it in English), so the model invented "
+             "the Devanagari. Two layers now: agents.presentation has the art director read its own "
+             "cards back before writing them, and this independently judges the frozen artifacts "
+             "against the script after the render — grammar, register, spelling consistency, and "
+             "whether each card still says the script's beat. A judgement, never a rule, and a "
+             "publish-gate: it asks for a human's eyes rather than stopping the ship"),
     dict(slug="no-text-in-the-film", tier="judgment", severity="warn",
          title="The generated film carries NO text of its own — every card is added after the cut",
          why="a prompt that asks for a caption, a heading or a screen with words gets gibberish "
@@ -487,12 +651,15 @@ LESSONS = [
              "four moves are allowed — slow push-in, slow pull-back, pan, drift; a memory shown "
              "inside a photo is reached by cutting to it or panning ACROSS it (WAVELENGTH §5)"),
     dict(slug="gaps-between-lines", tier="judgment", severity="warn",
-         title="Dead air between spoken lines is compressed, not left as padding",
-         why="the owner heard 'a lot of gap between the dialogues' on a reel whose 10s clips "
-             "carried ~5s of speech: the pause sat INSIDE the clip where an ends-only trim could "
-             "not reach it. assemble.compress_gaps cuts any internal pause longer than GAP_MIN "
-             "(0.8s) to GAP_KEEP (0.25s) a side — never a shorter breath, and picture/sound cut "
-             "together so lip-sync cannot move"),
+         title="Each clip is ONE span around its line — late start, early end, never a splice",
+         why="assembled clips pad the line with nothing on both sides, so a 10s clip can carry 5s "
+             "of speech. assemble._keep_windows takes ONE span per clip — PRE (0.5s) before the "
+             "first line, POST (0.6s) after the last — and cuts nothing INSIDE it, however silent "
+             "it measures: a pause between two lines is a performance beat, and on the reel that "
+             "taught this, one 'silent' hole is three seconds of the old woman smiling at camera. "
+             "Cutting the middle seams the picture, which is what the owner saw as 'very abrupt "
+             "back-to-back cuts' (nine splices across one reel). A clip with no voice at all is "
+             "never cut by the sound: it is left whole and reported, for a human's eye to settle"),
     dict(slug="visual-realism", check_id="realism", severity="publish-gate",
          title="The finished reel passes a vision realism review (no body-merge, extra limbs, "
                "duplicated objects, garbled baked text, or style drift)",
@@ -593,6 +760,52 @@ class Reel:
         idp = os.path.join(self.dir, "identity.json")
         self.identity = json.load(open(idp)) if os.path.exists(idp) else None
 
+    @property
+    def fp(self):
+        """This CUT's fingerprint. A by-eye sign-off is a signature on a picture, so it is tied to
+        the file: rebuild the reel and the signature no longer covers what is there."""
+        if not self.final:
+            return ""
+        s = os.stat(self.final)
+        return f"{int(s.st_mtime)}:{s.st_size}"
+
+
+def _eye_artifacts(reel, items):
+    """Write the look a human owes this reel (WAVELENGTH §6): frames sampled across the WHOLE cut
+    plus ONE contact sheet — 'same person in every panel?' is a question no single frame answers.
+
+    It goes on disk next to the reel because the reviewer is a person with a file browser, not a
+    terminal: `eye_review.json` names the sheet and every item that needs a human's eyes.
+    """
+    d = _duration(reel.final)
+    n = 6
+    frames = []
+    for i in range(n):
+        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{d * (i + 0.5) / n:.3f}",
+                            "-i", reel.final, "-frames:v", "1", "-f", "image2pipe",
+                            "-vcodec", "png", "-"], capture_output=True)
+        if r.stdout:
+            frames.append(r.stdout)
+    sheet = _contact_sheet(frames) if frames else None
+    out = {}
+    if sheet:
+        p = os.path.join(reel.dir, "eye_review_sheet.png")
+        with open(p, "wb") as fh:
+            fh.write(sheet)
+        out["sheet"] = os.path.basename(p)
+    # a sampled frame in full size too: a 300px panel cannot show a caption sitting on a face
+    for i, png in enumerate(frames[:2]):
+        p = os.path.join(reel.dir, f"eye_review_{i + 1}.png")
+        with open(p, "wb") as fh:
+            fh.write(png)
+        out[f"frame{i + 1}"] = os.path.basename(p)
+    out |= {"reel": reel.name, "cut": os.path.basename(reel.final), "fp": reel.fp,
+            "could_not_run": items, "at": time.time(),
+            "sign_off": f"python3 automation/qc.py {reel.dir} --signed-by <your name>"}
+    with open(os.path.join(reel.dir, "eye_review.json"), "w", encoding="utf-8") as fh:
+        json.dump(out, fh, ensure_ascii=False, indent=2)
+    return out
+
 
 def _identity_collision(st, reel):
     """Compare this reel's declared fingerprint to every OTHER shipped reel. Flags a look
@@ -623,15 +836,24 @@ def run(project_dir, st=None):
     seed(st)                     # upsert, every run: a lesson added to LESSONS lands here too
     reel = Reel(project_dir)
     block, gate, warn, checklist = [], [], [], []
+    eye = []                       # what a HUMAN must settle — not a defect, not a pass
+    reject = []                    # what the MACHINE can re-make — clip indices + the reason
     bucket = {"block": block, "publish-gate": gate, "warn": warn}
+    import vision
+    _answered = len(vision.ANSWERED)      # everything the checks ask is appended here (see vision)
 
     for l in st.craft_lessons():
         if l["tier"] == "auto" and l["check_id"] in CHECKS:
             for p in CHECKS[l["check_id"]](reel):
-                # a "could not run" is a CAPABILITY gap, not a defect: it never blocks the ship
-                # (the reel may be perfect), it only gates go_live and asks a human to look.
+                # a human item is a CAPABILITY gap or a judge's OPINION, not a defect: it never
+                # blocks the ship (the reel may be perfect), it gates go_live and asks for eyes.
                 root = "publish-gate" if isinstance(p, Unreviewed) else l["severity"]
-                bucket.get(root, warn).append(f"[{l['slug']}] {p}")
+                line = f"[{l['slug']}] {p}"
+                bucket.get(root, warn).append(line)
+                if isinstance(p, Unreviewed):
+                    eye.append(line)
+                elif isinstance(p, Reject) and p.clips:
+                    reject.append({"check": l["slug"], "clips": p.clips, "reason": p.reason})
         elif l["tier"] == "judgment":
             checklist.append((l["severity"], f"[{l['slug']}] {l['title']} — {l['why'] or ''}"))
 
@@ -645,10 +867,25 @@ def run(project_dir, st=None):
                           "confirm by eye this reel's look is distinct from prior ones"))
 
     verdict = {"ok": not block and not gate, "block": block, "gate": gate,
-               "warn": warn, "checklist": checklist, "reel": reel.name}
+               "warn": warn, "checklist": checklist, "reel": reel.name, "eye": eye,
+               "reject": reject,
+               # WHO answered the vision questions this verdict rests on. Without it a verdict is
+               # unattributable: 'clip 2 does not match' is an argument you can only have with a
+               # named model, and a failover silently changing that model is exactly what nobody
+               # would notice. Distinct models, in the order they first answered.
+               "vision": sorted({a["model"] for a in vision.ANSWERED[_answered:]})}
+    # `ok` is the AUTOMATED gate. `live` is the one that matters: a reel whose only gate items are
+    # checks that could not run may ship, but it does not go_live until a human has looked at THIS
+    # cut (WAVELENGTH §6). A reel with a real defect never clears, whoever signs.
+    signed = st.eye_review(reel.name)
+    verdict["eye_signed"] = bool(signed and signed["fp"] == reel.fp)
+    verdict["live"] = bool(verdict["ok"] or (eye and not block and len(gate) == len(eye)
+                                             and verdict["eye_signed"]))
     # persist the verdict: a HELD reel must be durable state anyone can read back
     # (brain.report / `brain.py reels`), not a printout that scrolls away.
     st.record_qc(reel.name, verdict)
+    if eye:
+        _eye_artifacts(reel, eye)
     if own:
         st.close()
     return verdict
@@ -656,6 +893,8 @@ def run(project_dir, st=None):
 
 def _report(v):
     print(f"QC: {v['reel']}")
+    if v.get("vision"):
+        print(f"  judged by: {', '.join(v['vision'])}")
     for tag, items in (("BLOCK — do not ship", v["block"]),
                        ("PUBLISH-GATE — don't go_live yet", v["gate"]),
                        ("warn", v["warn"])):
@@ -665,8 +904,28 @@ def _report(v):
         print("  judgment checklist (human eyes before approval):")
         for sev, line in v["checklist"]:
             print(f"    - ({sev}) {line}")
-    print("  => " + ("PASS (auto checks clean; review the checklist)" if v["ok"]
-                      else "HELD (fix the block/gate items above)"))
+    if v.get("reject"):
+        print("  machine-fixable — these clips can be re-shot with the reason attached:")
+        for r in v["reject"]:
+            print(f"    - clip {', '.join(str(i) for i in r['clips'])} ({r['check']}): "
+                  f"{r['reason']}")
+    if v.get("eye"):
+        print("  needs YOUR eyes before go_live (a check could not run, or a judge objects — "
+              "neither is a defect, neither is a pass):")
+        for i in v["eye"]:
+            print(f"    - {i}")
+        print("    -> the sheet and frames are in the project dir (eye_review.json)")
+        print("    a human looks, then:  python3 automation/qc.py projects/<name> "
+              "--signed-by '<name>'")
+    if v["ok"]:
+        print("  => PASS (auto checks clean; review the checklist)")
+    elif v.get("live"):
+        print("  => LIVE — every gap was a check that could not run, and a human has signed "
+              "off THIS cut")
+    elif v.get("eye") and not v["block"] and len(v["gate"]) == len(v["eye"]):
+        print("  => SHIPPABLE, NOT LIVE — no human has signed off this cut yet")
+    else:
+        print("  => HELD (fix the block/gate items above)")
 
 
 if __name__ == "__main__":
@@ -698,6 +957,22 @@ if __name__ == "__main__":
         # 90s each). Stub the gateway so --selfcheck stays OFFLINE, then prove both directions:
         # a down gateway must NOT silently pass, and a reported defect must gate the reel.
         import vision
+
+        def _scan(ans, model=None):
+            """Point the pairwise scan at a FIXED answer, and drop its cache.
+
+            The cache is keyed by frame bytes (so the two checks comparing the same reel compare
+            the same ANSWER, not two rolls of the same question — see vision.style_scan_cached),
+            and these fixtures all reuse one temp reel's unchanged frames. Without the clear,
+            every fixture after the first would be answered by the first fixture's stub.
+
+            `model` fakes the attribution a real gateway reports (vision.ANSWERED)."""
+            if model:
+                vision.style_scan = lambda frames: (vision.ANSWERED.append(
+                    {"url": "stub", "asked": model, "model": model}), ans)[1]
+            else:
+                vision.style_scan = lambda frames: ans
+            vision._SCAN_CACHE.clear()
         # a real 1x1 transparent PNG: caption-safe-area OPENS the file, so a byte blob named
         # .png would raise instead of exercising the check we mean to prove
         import base64
@@ -707,9 +982,15 @@ if __name__ == "__main__":
         _orig_review = vision.review_frame
         _orig_medium = vision.medium_of
         _orig_cmp = vision.compare_character
+        _orig_scan = vision.style_scan
         try:
             # the style classifier is a LIVE vision call too; stub it so --selfcheck stays offline
             vision.medium_of = lambda png: "3d"
+            # the pairwise scan is a LIVE call as well, and one per clip — an unstubbed run sits
+            # on the network for a minute per fixture. Every fixture below that does not mean to
+            # test drift gets the clean answer; the drift fixtures override this one line.
+            _scan({"flagged": [], "whole_reel": False, "detail": "", "people": {},
+                   "person_detail": ""})
             vision.review_frame = lambda png: None                # gateway unavailable
             # narration is read from the SOURCE CLIPS now (WAVELENGTH.md §3), not from a vo/
             # dir — so point the gate at a temp library holding one SILENT clip for this reel
@@ -850,8 +1131,11 @@ if __name__ == "__main__":
             vision.medium_of = lambda png: "3d"
 
             # character consistency is the ONE cross-scene view of the render: one panel per
-            # source clip, tiled, one question. Stub the gateway so this stays offline, and prove
-            # all three outcomes — same person, a drift, and a down gateway (which must say so).
+            # source clip, tiled, one question — asked TWICE, from two directions. A defect needs
+            # both voices; one saying drift while the other says fine is a question for a person,
+            # not a conviction (the by-eye pass of 2026-10-12 convicted 'a different woman'
+            # wrongly — a bindi is not a different woman — so character identity gets a second
+            # opinion before it costs a re-render).
             d7 = tempfile.mkdtemp()
             _c7 = os.path.join(_CLIPS_ROOT, os.path.basename(d7))
             os.makedirs(_c7)
@@ -873,16 +1157,63 @@ if __name__ == "__main__":
             vision.compare_character = lambda png: {"consistent": True, "detail": ""}
             v7 = run(d7, st)
             assert v7["ok"] and not v7["block"], f"a consistent reel must pass: {v7}"
+            # one voice says drift, the other says fine -> NOT a conviction: it asks for eyes
             vision.compare_character = lambda png: {
                 "consistent": False, "detail": "her hair is grey in panel 1, black in panel 2"}
+            v7x = run(d7, st)
+            assert not v7x["block"], f"one dissenting view must not block: {v7x['block']}"
+            assert any("do not agree" in g for g in v7x["gate"]), v7x["gate"]
+            # BOTH views agree -> a real defect, and it names the clips to re-shoot
+            _scan({"flagged": [], "whole_reel": False, "detail": "",
+                   "people": {1: False, 2: False}, "person_detail": "the bindi is gone"})
             v7b = run(d7, st)
             assert any("character changes between scenes" in b for b in v7b["block"]), v7b["block"]
+            assert v7b["reject"] and v7b["reject"][0]["clips"] == [1, 2], \
+                f"a confirmed character drift must name the clips to re-shoot: {v7b['reject']}"
+            assert "SAME face shape" in v7b["reject"][0]["reason"], \
+                "the re-shot clip's prompt must carry the character lock"
             vision.compare_character = lambda png: None
+            _scan(None)
             v7c = run(d7, st)
             assert any("could NOT be reviewed" in g for g in v7c["gate"]), \
                 f"an unavailable comparison must gate go_live (not pass): {v7c['gate']}"
             assert not any("could NOT be reviewed" in b for b in v7c["block"]), \
                 f"an OUTAGE is not a craft defect — it must not block the ship: {v7c['block']}"
+            vision.compare_character = lambda png: {"consistent": True, "detail": ""}
+
+            # REJECT — a finding the MACHINE can fix. The pairwise scan names the odd clip, and
+            # the verdict carries the index + the reason so runner._regenerate can re-shoot it.
+            # Clip numbering comes from the FILENAME, so a gap on disk cannot shift the blame.
+            _scan({"flagged": [2], "whole_reel": False, "detail": "much more photoreal",
+                   "people": {}, "person_detail": ""})
+            v7d = run(d7, st)
+            assert any("clip 2" in b and "different look" in b for b in v7d["block"]), \
+                f"the odd clip must be NAMED in the block: {v7d['block']}"
+            assert v7d["reject"] and v7d["reject"][0]["clips"] == [2], \
+                f"the re-shoot must carry the clip index: {v7d.get('reject')}"
+            assert "photoreal" in v7d["reject"][0]["reason"], \
+                "the reason must travel into the re-shot clip's prompt"
+            assert "reject" in v7d and "eye" in v7d, "both keys must exist on every verdict"
+            # a minority can be re-shot; a MAJORITY differing means the anchor is the odd one out,
+            # and re-shooting the majority is re-shooting the reel — that is the owner's call.
+            _scan({"flagged": [1, 2], "whole_reel": True, "detail": "every scene differs",
+                   "people": {}, "person_detail": ""})
+            v7e = run(d7, st)
+            assert not v7e["reject"], "a whole-reel difference must never auto-requeue"
+            assert any("whole reel is one look" in g for g in v7e["gate"]), v7e["gate"]
+            # and a down gateway is still an outage, never an auto-reject
+            _scan(None)
+            v7f = run(d7, st)
+            assert not v7f["reject"] and any("clip-against-clip" in g for g in v7f["gate"]), v7f
+            # the verdict names WHO judged it — a model's finding has to be attributable
+            assert v7f.get("vision") == [], "no vision answer, no model claimed"
+            _scan({"flagged": [], "whole_reel": False, "detail": "", "people": {},
+                   "person_detail": ""}, model="a-named-model")
+            v7g = run(d7, st)
+            assert v7g["vision"] == ["a-named-model"], \
+                f"the judging model must be recorded on the verdict: {v7g.get('vision')}"
+            _scan({"flagged": [], "whole_reel": False, "detail": "", "people": {},
+                   "person_detail": ""})
 
             # score-present: an EXISTING music_raw.mp3 is not evidence the bed is audible. Proven
             # against the real defect (darzi-ka-tukda, 2026-10-10): the bed was mixed, but the
@@ -918,6 +1249,99 @@ if __name__ == "__main__":
 
             vision.compare_character = _orig_cmp
 
+            # BY-EYE FALLBACK (WAVELENGTH §6, hard-never #8): when the ONLY thing wrong with a
+            # reel is that a check couldn't run, the reel is shippable but NOT live until a human
+            # has looked at THIS cut. d3 passes every auto check, so taking its eyes away (a down
+            # vision gateway) produces exactly that case and nothing else.
+            vision.review_frame = lambda png: None
+            try:
+                v8 = run(d3, st)
+                assert v8["eye"] and sorted(v8["gate"]) == sorted(v8["eye"]), \
+                    f"only the un-runnable checks may gate a by-eye reel: {v8['gate']}"
+                assert not v8["ok"] and not v8["block"], v8
+                assert not v8["live"], "an unsigned by-eye gap must not go live"
+                assert not v8["eye_signed"], "nobody has looked yet"
+                # the human's artifacts land in the project dir, next to the reel
+                _j = json.load(open(os.path.join(d3, "eye_review.json"), encoding="utf-8"))
+                assert _j["fp"] == Reel(d3).fp and _j["could_not_run"] == v8["eye"], _j
+                assert os.path.exists(os.path.join(d3, _j["sheet"])), _j
+                # a human looks and signs THIS cut -> live (still not `ok`: nothing was re-run)
+                st.record_eye_review(Reel(d3).name, Reel(d3).fp, "owner", "looked at all panels")
+                v8s = run(d3, st)
+                assert v8s["eye_signed"] and v8s["live"] and not v8s["ok"], v8s
+                # a signature is on a PICTURE, not on a project: rebuild the cut and it is void
+                os.utime(Reel(d3).final, (1, 1))
+                assert not run(d3, st)["live"], "a sign-off must not cover a different cut"
+                # and a signature never clears a real defect, however fresh
+                st.record_eye_review(Reel(d3).name, Reel(d3).fp, "owner", None)
+                vision.review_frame = lambda png: [{"type": "extra-limb",
+                                                    "detail": "a third arm"}]
+                v8d = run(d3, st)
+                assert v8d["eye_signed"] and v8d["gate"] and not v8d["eye"] and not v8d["live"], \
+                    f"a signed reel with a REAL gated defect must still not go live: {v8d}"
+                vision.review_frame = lambda png: []
+                vision.medium_of = lambda png: "photoreal"     # the proven 3-D block path
+                v8b = run(d3, st)
+                assert v8b["eye_signed"] and v8b["block"] and not v8b["live"], v8b
+                vision.medium_of = lambda png: "3d"
+            finally:
+                vision.review_frame = lambda png: []
+
+            # caption WORDING — the layer that reads the words. Every other caption check is
+            # geometry (safe area, on a face) or existence (craft layers), which is exactly why a
+            # broken hook and a word spelled two ways reached the screen. Stub the judge so this
+            # stays offline and prove all three outcomes: clean passes, judged-wrong gates, and a
+            # down judge gates rather than passing or blocking.
+            import agents
+            _orig_judge = agents.judge_captions
+            d9 = tempfile.mkdtemp()
+            for _f in ("caption_hook.png", "caption_moral.png", "caption_cta.png"):
+                open(os.path.join(d9, _f), "wb").write(_PNG)
+            open(os.path.join(d9, "music_raw.mp3"), "wb").write(b"x")
+            json.dump({"font": "rounded",
+                       "hook": {"lines": ["उनकी मुस्कान बनें ख़ज़ाना"]},
+                       "moral": {"lines": ["आपका एक मिनट उनका खज़ाना है"]},
+                       "cta": {"lines": ["Standard Sunrise Foundation"]}},
+                      open(os.path.join(d9, "captions.json"), "w"), ensure_ascii=False)
+            open(os.path.join(d9, "script.md"), "w").write(
+                "# t\n\nHOOK: Rich in life because… you stopped by.\n")
+            json.dump({"opener": "a held breath", "font": "Kalam", "quote": "Bulleh Shah",
+                       "structure": "the room empties"},
+                      open(os.path.join(d9, "identity.json"), "w"))
+            subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=s=720x1280:d={_RL}",
+                            "-f", "lavfi", "-i", f"sine=frequency=440:d={_RL}", "-pix_fmt", "yuv420p",
+                            "-shortest", os.path.join(d9, "final_veo.mp4")],
+                           check=True, capture_output=True)
+            try:
+                agents.judge_captions = lambda s, c: {"problems": [], "captions": c}
+                assert not any("caption wording" in g for g in run(d9, st)["gate"]), \
+                    "a judge that finds nothing must not gate the reel"
+                agents.judge_captions = lambda s, c: {"problems": ["बनें should be बने"],
+                                                      "captions": c}
+                assert any("caption wording" in g for g in run(d9, st)["gate"]), \
+                    "a judged-wrong caption must gate go_live"
+                # ...and it is the HUMAN's item, not a wall: a model's opinion of Hindi must not
+                # stop a ship on its own, and re-rolling it until it agrees is not a way out.
+                _v9 = run(d9, st)
+                assert any("caption wording" in e for e in _v9["eye"]), \
+                    f"a judge's objection must land in the human's list: {_v9['eye']}"
+                assert not _v9["live"], "an unsigned objection must not go live"
+                st.record_eye_review(Reel(d9).name, Reel(d9).fp, "owner", "read the cards")
+                assert run(d9, st)["live"], \
+                    "a human's sign-off must settle a judge's objection, not only an outage"
+
+                def _down(s, c):
+                    raise RuntimeError("all LLM gateways failed")
+
+                agents.judge_captions = _down
+                v9 = run(d9, st)
+                assert any("could NOT be judged" in g for g in v9["gate"]), \
+                    f"a down caption judge must gate, not fall silent: {v9['gate']}"
+                assert not any("caption wording" in b for b in v9["block"]), \
+                    f"an outage is not a caption defect — it must not block the ship: {v9['block']}"
+            finally:
+                agents.judge_captions = _orig_judge
+
             # the verdict is DURABLE state, keyed by reel, and a re-run overwrites it
             # (v6g, the GRANDFATHERED photoreal reel, is the passing one — v6, a NEW reel that
             #  declared photoreal, is now HELD; d3 is deliberately re-run as a defect just above,
@@ -938,15 +1362,40 @@ if __name__ == "__main__":
             vision.review_frame = _orig_review
             vision.medium_of = _orig_medium
             vision.compare_character = _orig_cmp
+            vision.style_scan = _orig_scan
         st.close()
         print("OK: auto checks catch frozen/silent/off-safe-area + identity reuse; "
               "realism gates on a vision defect / reports a down gateway; clean reel passes")
         print("OK: verdict persisted to state.db; newest final*.mp4 is the one gated")
         print("OK: craft-layers holds a playable reel that ships no VO/moral/score")
         print("OK: pacing flags a stub reel and a 1s clip; character drift across scenes is HELD")
+        print("OK: the caption judge gates a wrong Hindi card and reports a down gateway — "
+              "never a silent pass, never a block; a human's sign-off settles the objection")
+        print("OK: a check that could not run is shippable-not-live until a human signs THIS cut; "
+              "a rebuild voids the signature and no signature clears a real defect")
     elif "--seed" in sys.argv:
         st = State(); seed(st)
         print(f"seeded {len(st.craft_lessons())} craft lessons into state.db"); st.close()
+    elif "--signed-by" in sys.argv:
+        # the human half of the by-eye fallback: record that a person looked at THIS cut, then
+        # re-run the gate so the verdict (and `live`) reflects it.
+        i = sys.argv.index("--signed-by")
+        who = sys.argv[i + 1] if len(sys.argv) > i + 1 else ""
+        note = sys.argv[sys.argv.index("--note") + 1] if "--note" in sys.argv else None
+        proj = next((a for a in sys.argv[1:] if not a.startswith("--")
+                     and a not in (who, note)), None)
+        if not proj or not who:
+            raise SystemExit("usage: qc.py projects/<name> --signed-by '<name>' [--note '...']")
+        st = State()
+        r = Reel(proj)
+        if not r.final:
+            raise SystemExit(f"no final*.mp4 in {proj} — nothing to sign off")
+        st.record_eye_review(r.name, r.fp, who, note)
+        print(f"signed off '{r.name}' cut {r.fp} by {who}" + (f" — {note}" if note else ""))
+        v = run(proj, st)
+        _report(v)
+        st.close()
+        sys.exit(0 if v["live"] else 1)
     elif len(sys.argv) > 1:
         v = run(sys.argv[1])
         _report(v)

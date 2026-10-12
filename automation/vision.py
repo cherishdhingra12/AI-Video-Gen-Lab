@@ -18,6 +18,8 @@ import time
 import urllib.error
 import urllib.request
 
+import routerhealth  # same dir: remembers which gateway is walled, so a dead route is skipped
+
 _DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -94,15 +96,35 @@ def _endpoints():
 STATES = ("rendering", "done", "error", "captcha", "rate_limited", "login", "unknown")
 
 
+# WHO ANSWERED. A verdict from an unnamed model cannot be argued with: when the gate says "clip 2
+# is photoreal", the first question is always which model said so, and until this existed the
+# answer was nowhere on the record. Append-only, read by qc.run to stamp the verdict.
+# ponytail: a module global, not a return value — this is a single-threaded CLI, and threading a
+# model name through every compare_*/medium_of signature would touch every caller for one string.
+ANSWERED = []
+
+
 def _ask(png: bytes, prompt: str, max_tokens: int = 600, patience: int = 2) -> str:
     """Ask a vision model, failing over across gateways and routes. On a transient throttle /
     high-demand code (429/503), retry the whole sweep a few times with backoff — so a momentary
-    spike doesn't blind the self-heal. Fail-open: callers treat a raise as 'unknown'."""
+    spike doesn't blind the self-heal. Fail-open: callers treat a raise as 'unknown'.
+
+    A route the LAST call found walled is skipped, not re-discovered: the 90s timeout and the
+    sweep backoff make a dead gateway the most expensive thing in the run, and the craft gate
+    makes dozens of vision calls per reel (routerhealth). If everything is cooling, everything is
+    tried anyway — a memory of failure must never be the reason a check cannot run."""
     b64 = base64.b64encode(png).decode()
     last = None
     for sweep in range(patience + 1):
         transient = False
-        for url, key in _endpoints():               # fail over across gateways …
+        ends = _endpoints()
+        if all(routerhealth.cooling(u)[0] for u, _ in ends):
+            routerhealth.clear()                    # nothing left to skip: last resort
+        for url, key in ends:                       # fail over across gateways …
+            until, why = routerhealth.cooling(url)
+            if until:
+                last = last or RuntimeError(f"{url} cooling {int(until - time.time())}s: {why}")
+                continue
             for model in _models_for(url):          # … each with a model dialect it accepts
                 body = json.dumps({
                     "model": model, "max_tokens": max_tokens, "temperature": 0,
@@ -119,13 +141,21 @@ def _ask(png: bytes, prompt: str, max_tokens: int = 600, patience: int = 2) -> s
                         d = json.load(r)
                     txt = (d.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
                     if txt.strip():
+                        # the model the SERVER reports, not the one we asked for: a gateway is free
+                        # to route 'auto', and the difference is exactly what a failover hides
+                        ANSWERED.append({"url": url, "asked": model,
+                                         "model": d.get("model") or model})
+                        routerhealth.note_success(url)
                         return txt
+                    routerhealth.note_failure(url, "empty content")
                 except urllib.error.HTTPError as e:
                     last = e
+                    routerhealth.note_failure(url, f"HTTP {e.code}")
                     if e.code in _TRANSIENT:
                         transient = True
                 except Exception as e:
                     last = e
+                    routerhealth.note_failure(url, e)
         if not transient or sweep == patience:
             break
         time.sleep(4 * (sweep + 1))     # 4s, 8s backoff on a transient spike
@@ -350,6 +380,125 @@ def medium_verdict(samples, expected=None):
     return "uniform", agreed
 
 
+# ---- the look of one clip against another: the question medium_of cannot answer ----------------
+# medium_of asks each frame for an absolute label out of four (photoreal/3d/2d/mixed), and the
+# style gate then compares the labels. Measured 2026-10-12 on dadi-ki-dhansuchi: it answered '3d'
+# for all five clips — including one whose frame at full size has skin pores and individual hair
+# strands — so medium_verdict called the reel uniform and the gate passed a reel whose clips
+# visibly differ in realism. The bucket is too coarse for the boundary that actually matters
+# ("painterly 3-D" vs "near-photoreal 3-D" both round to '3d'), and a second gateway agreeing on
+# a coarse label is still coarse. Two frames shown SIDE BY SIDE is a far easier question, and it
+# is the one the gate is really asking: "are these the same look?" Measured on the same five
+# clips, the paired form flagged both mismatches and passed the control (two moments of one clip).
+#
+# compare_style takes ONE image: the two frames composed side by side. The composing is the
+# caller's job (qc._pair / assemble's sampler), because only the caller knows what to compare.
+
+_STYLE_PROMPT = (
+    "These are two frames from the SAME short film, side by side (left, right). Answer two "
+    "separate questions. (1) art style: are the two frames rendered in the SAME technique and "
+    "the same level of realism/detail, or is one clearly more photoreal, or more cartoonish, "
+    "than the other? (2) person: is the human in both frames the same individual — same face "
+    "shape, eyes, age, features? Clothing, lighting and pose may legitimately differ, and a "
+    "film may be 3-D animation: never report 'this is animation' as a difference. "
+    'Reply ONLY JSON: {"same_style": true|false, "style_detail": "short phrase", '
+    '"same_person": true|false, "person_detail": "short phrase"}'
+)
+
+
+def compare_style(png_pair: bytes):
+    """Two frames composed side by side -> {'same_style', 'style_detail', 'same_person',
+    'person_detail'}, or None when the gateway could not answer (never a silent pass)."""
+    try:
+        d = _json_from(_ask(png_pair, _STYLE_PROMPT, max_tokens=1200))
+    except Exception:
+        return None
+    if not isinstance(d.get("same_style"), bool):
+        return None                                   # unparseable -> not reviewed
+    out = {"same_style": d["same_style"]}
+    for k in ("style_detail", "person_detail"):
+        v = str(d.get(k) or "").strip()
+        out[k] = "" if v.lower() in _NON_DEFECT or v.lower() in _ECHO else v[:160]
+    out["same_person"] = d.get("same_person") if isinstance(d.get("same_person"), bool) else None
+    return out
+
+
+def _pair(a: bytes, b: bytes, height: int = 560) -> bytes:
+    """Two PNG frames side by side, scaled to a common height, with a seam between them."""
+    import io
+    from PIL import Image
+    ia, ib = Image.open(io.BytesIO(a)).convert("RGB"), Image.open(io.BytesIO(b)).convert("RGB")
+    ia = ia.resize((max(1, int(ia.width * height / ia.height)), height))
+    ib = ib.resize((max(1, int(ib.width * height / ib.height)), height))
+    c = Image.new("RGB", (ia.width + ib.width + 10, height), (0, 0, 0))
+    c.paste(ia, (0, 0))
+    c.paste(ib, (ia.width + 10, 0))
+    buf = io.BytesIO()
+    c.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def style_scan(frames, anchor=0):
+    """One frame per clip, in reel order (PNG bytes). Compare every other clip to the ANCHOR —
+    clip 0, the first one finished, which is what locks the site and the character for the reel —
+    and return:
+
+        {'flagged': [indices], 'whole_reel': bool, 'detail': str,
+         'people': {index: bool}, 'person_detail': str}
+
+    or None when the gateway could not answer. The SAME comparison answers two questions —
+    'same look?' and 'same person?' — because they are what one clip-vs-clip call can see, and one
+    call per clip is what the budget allows. (`whole_reel`/`detail` are the look; `people` is the
+    character, keyed by clip index, so a drifting face can be named as precisely as a drifting
+    style.)
+
+    `whole_reel` is the honest guard: when MORE than half the clips differ from the anchor the
+    anchor itself is the odd one out, and re-shooting the majority would be re-shooting the reel.
+    That is a decision for a human, not a requeue, so those come back flagged as whole-reel and
+    the caller must not auto-regenerate. It also protects the grandfathered photoreal reels: a
+    photoreal reel whose scenes read 'different' to each other is never silently re-shot."""
+    if len(frames) < 2:
+        return {"flagged": [], "whole_reel": False, "detail": "", "people": {},
+                "person_detail": ""}
+    a = frames[anchor]
+    flagged, detail, people, pdetail = [], "", {}, ""
+    for i, f in enumerate(frames):
+        if i == anchor:
+            continue
+        r = compare_style(_pair(a, f))
+        if r is None:
+            return None                               # not reviewed, never a silent pass
+        if not r["same_style"]:
+            flagged.append(i)
+            detail = detail or r["style_detail"]
+        if r["same_person"] is not None:
+            people[i] = r["same_person"]
+            if not r["same_person"]:
+                pdetail = pdetail or r["person_detail"]
+    whole = len(flagged) * 2 > len(frames)
+    return {"flagged": flagged, "whole_reel": whole,
+            "detail": detail or "every clip matches the anchor",
+            "people": people, "person_detail": pdetail}
+
+
+def style_scan_cached(frames):
+    """style_scan, answered ONCE per set of frames.
+
+    Two checks ask this same question (the look, and the recurring character), and a vision model
+    is not deterministic — calling it twice would hand the two checks different answers to the
+    same question, and any cross-check built on that would be comparing the model with itself on
+    a coin flip. Cache on the frame bytes: the answer is identical because it IS the same answer."""
+    import hashlib
+    key = hashlib.sha256(b"|".join(frames) + str(len(frames)).encode()).hexdigest()
+    if key not in _SCAN_CACHE:
+        _SCAN_CACHE.clear()                  # one reel at a time; frames are ~200KB each
+        _SCAN_CACHE[key] = style_scan(frames)
+    return _SCAN_CACHE[key]
+
+
+_SCAN_CACHE = {}
+
+
 def read_state(png: bytes) -> dict:
     """Look at a generation page. Return {'state': one of STATES, 'reason': str,
     'progress': 0-100 or None}. The runner branches on 'state'."""
@@ -529,6 +678,71 @@ if __name__ == "__main__":
         assert medium_verdict(["3d"] * 5, expected="photoreal")[0] == "wrong-medium"
         print("OK: medium_verdict judges AGREEMENT (drift / wrong-medium / uniform / unknown); "
               "a photorealistic reel is not drifting from itself")
+
+        # style_scan: the anchor comparison that can NAME a clip (medium_of cannot — see above),
+        # plus the guard that stops it re-shooting a majority.
+        _orig_cs = compare_style
+        # real 4x6 PNGs, so _pair itself is exercised rather than stubbed away
+        import io as _io
+        from PIL import Image as _Im
+        _png = []
+        for _c in ((200, 40, 40), (40, 200, 40), (40, 40, 200)):
+            _b = _io.BytesIO()
+            _Im.new("RGB", (4, 6), _c).save(_b, "PNG")
+            _png.append(_b.getvalue())
+        assert _Im.open(_io.BytesIO(_pair(_png[0], _png[1], height=6))).size == (18, 6), \
+            "two 4x6 frames -> one 18x6 strip (4 + 10 seam + 4)"
+        _f = lambda n: [_png[i % 3] for i in range(n)]
+        try:
+            globals()["compare_style"] = lambda p: {"same_style": True, "style_detail": "",
+                                                    "same_person": True, "person_detail": ""}
+            s = style_scan(_f(3))
+            assert s["flagged"] == [] and s["people"] == {1: True, 2: True}, \
+                f"ONE call per clip answers both questions: {s}"
+            # exactly one clip differs from the anchor -> that clip, and NOT a whole-reel problem
+            globals()["compare_style"] = lambda p: {"same_style": False, "style_detail": "photoreal",
+                                                    "same_person": True, "person_detail": ""}
+            s = style_scan(_f(5))
+            assert s["flagged"] == [1, 2, 3, 4] and s["whole_reel"], \
+                "everything differing from the anchor is a whole-reel problem, not a requeue"
+            calls = []
+
+            def _one_bad(p, _c=calls):
+                _c.append(p)
+                same = len(_c) != 2                       # the 2nd comparison (clip 2) differs
+                return {"same_style": same, "style_detail": "" if same else "much more realist2",
+                        "same_person": True, "person_detail": ""}
+            globals()["compare_style"] = _one_bad
+            s = style_scan(_f(4))
+            assert s["flagged"] == [2] and not s["whole_reel"], f"the odd clip must be named: {s}"
+            assert s["detail"] == "much more realist2", "the reason must travel with the blame"
+            globals()["compare_style"] = lambda p: None
+            assert style_scan(_f(2)) is None, "gateway down -> None, never a silent pass"
+            assert style_scan(_f(1))["flagged"] == [], "one clip has nothing to compare against"
+            # a drifting FACE is named as precisely as a drifting look, and an answerless
+            # person question (None) is simply absent — never recorded as "same person"
+            globals()["compare_style"] = lambda p: {"same_style": True, "style_detail": "",
+                                                    "same_person": False,
+                                                    "person_detail": "she is wearing a bindi here"}
+            s = style_scan(_f(3))
+            assert s["people"] == {1: False, 2: False} and s["person_detail"], s
+            globals()["compare_style"] = lambda p: {"same_style": True, "style_detail": "",
+                                                    "same_person": None, "person_detail": ""}
+            assert style_scan(_f(3))["people"] == {}, "an unparsed answer is not 'same person'"
+            # the CACHE is what keeps the two checks comparing the same answer, not two rolls
+            _hits = []
+            globals()["compare_style"] = lambda p, _h=_hits: (
+                _h.append(p), {"same_style": True, "style_detail": "", "same_person": True,
+                               "person_detail": ""})[1]
+            _SCAN_CACHE.clear()
+            style_scan_cached(_f(3))
+            style_scan_cached(_f(3))
+            assert len(_hits) == 2, f"one answer per frame set, not per call: {len(_hits)}"
+            _SCAN_CACHE.clear()
+        finally:
+            globals()["compare_style"] = _orig_cs
+        print("OK: style_scan names the odd clip against the anchor, answers the character "
+              "question in the same call, and refuses to re-shoot a majority")
 
         # An ANIMATED film is not defective for being animated. This shipped as a publish-gate
         # that HELD a finished reel ("3D animated CGI style instead of photorealism"), because

@@ -125,6 +125,35 @@ Transitions serve the story's motif (a dissolve on a continuous hum; hard cuts o
 a match-cut on clasped hands). Speed changes and silence trimming happen at assembly — but
 **never trim an emotional beat**, and never cut a silent moment short because it is silent.
 
+### The same person from the first scene to the last
+
+One reel has ONE cast, and the cast is locked in the prompt — not left to a model's memory.
+
+`agents._char_lock` builds a single sentence per reel and appends it **verbatim** to every clip
+prompt: the same words, in the same place, on every clip. It quotes the character's own
+description back out of `world` (the sentences naming an ALL-CAPS tag, or the opening sentence
+when the plan writes no tag), followed by the no-add negatives — no accessory, garment, jewellery,
+make-up or feature added or removed along the way. A lock naming only the character's *tag* ("same
+face, same hair") is not a lock: it gives the generator nothing to hold a face against, and a plan
+with no ALL-CAPS tag got no lock at all — that is how one reel shipped **three different women
+playing the same grandmother**. Positive-only descriptions also cannot stop what gets *added*: the
+generator invented round glasses on one clip of a reel and on no other.
+
+The lock is a guarantee, so it is never what gives when a prompt is too long. `agents._fit` trims
+in this order: the shot shortens first, then the lead goes (the LOOK line restates the style),
+then a hard cut. **The identity lock is never trimmed off the end of a prompt** — the last clip of
+a long reel is exactly the clip a face drifts in.
+
+### The shape a site reads
+
+The words of a clip prompt are the same everywhere — one reel is one film. What `agents.clip_prompts`
+changes per site is only how they are **written down**. **Vids and Flow are both Veo 3.1 and are the
+waterfall's two primaries**, so they get the same labelled brief, one block per line: cast, action,
+look, spoken line. Veo's own prompting pattern is a structured brief, and a label puts the cast and
+the action in the same place on every clip. Every other site keeps the single flowing paragraph it
+has always been given, so nothing that already renders is re-shaped. A failover moves the whole
+reel to one site (one reel, one source), so the bid site's shape is what the fallback gets too.
+
 ### Camera moves: never *into* things
 
 One gentle move per clip, from four: slow push-in, slow pull-back, pan, drift. **Never** a camera
@@ -133,16 +162,34 @@ generator obeys it literally and the shot becomes a lurching zoom. A memory show
 photo is reached by cutting to it, or by a slow pan **across** it. The owner cut exactly such a
 move (camera pushing into the bicycle frame) out of a reel.
 
-### The gaps between lines
+### The gaps between lines — one span per line, never a splice
 
-Generated clips pad the line with a beat of nothing on each side, and the ends-only trim cannot
-reach the pause in the middle — so a 10s clip carrying 5s of speech shipped with the other 5s
-spread as dead air, and the owner heard "a lot of gap between the dialogues". An internal pause
-longer than `GAP_MIN` (0.8s) **is** dead air and is compressed to `GAP_KEEP` (0.25s) a side;
-anything shorter is a breath and stays exactly where the performance put it. The cut runs on
-picture and sound together, so lip-sync never moves. This is what makes the reel **shorter** and
-**crisper** rather than merely faster — and it is why speed stays a taste call (below) instead of
-the default fix for a slow reel.
+Generated clips pad the line with a beat of nothing on either side, so a 10s clip can carry 5s of
+speech and ship with the other 5s spread as dead air. **The edit is one span per clip: it starts
+`PRE` (0.5s) before the first line and ends `POST` (0.6s) after the last one — and nothing inside
+that span is cut, however silent it measures.** What replaces the padding is a *late start*, not a
+splice: a clip whose line lands at the end simply begins three seconds in.
+
+Cutting the *middle* is what puts a seam in the picture, and a reel built that way reads as "very
+abrupt back-to-back cuts" (owner, 2026-10-11) — the first version of this rule returned the
+complement of every silence, 2-4 splices per clip, nine across one reel. Measured on that reel,
+one of its "silent" holes is three seconds of the old woman **smiling straight at camera**: the
+sound calls it dead air, the picture calls it the beat. The picture wins — a pause between two
+lines is a performance beat, not padding, and the sound is not allowed to overrule it.
+
+- The cut runs on picture and sound together, so lip-sync never moves. This is what makes a reel
+  **shorter** and **crisper** rather than merely faster — and it is why speed stays a taste call
+  (below) instead of the default fix for a slow reel.
+- **A clip with no voice is never cut by the sound.** A wordless clip — a sunrise sweep, a silent
+  beat — is left whole and reported at the end of the build, because there the picture decides and
+  a human's eye settles it ("where there are no vocals, that needs to be taken care of by seeing
+  the video"). Whether a clip speaks is measured by its own **dynamic range in the voice band**
+  (250–3500 Hz, p95 minus the floor): the dadi reel's four spoken clips ran 26–40 dB, its wordless
+  sweep 16.5. Never by level alone — the sweep's ambience bridges a −35 dB silence gate, and its
+  loud fraction matches a spoken clip's.
+- *Ceiling: a clip with a long, genuinely empty stretch between two lines keeps it. Nothing
+  offline can tell that stretch from a held expression — the camera drifts in every clip, so
+  stillness does not separate them — so the machine keeps it and the eye decides.*
 
 - **Pace (`speed`)** — a whole-reel pace adjustment, applied to picture and sound together so
   lip-sync stays locked and the pitch holds. It is **off by default** (a reel plays at its own
@@ -170,13 +217,31 @@ Per-clip speed ramps (a slow-motion hero shot inside an otherwise normal reel) a
 
 The craft gate's vision checks (style-uniform, character-consistency, visual-realism) all share
 the one vision gateway, and the QC frame-review exhausts it — so the gateway **does** go down.
-A reel the gate could **not measure** is not a defective reel and is not a passed one.
+A reel the gate could **not measure** is not a defective reel and is not a passed one. Nor is a
+reel a judge merely *has an opinion* about — same rule, same answer.
 
 - The gate routes "could not run" to the **publish-gate** (never to block): the reel may ship,
-  but it does **not** go_live until a human has looked at it.
+  but it does **not** go_live until a human has looked at it. A **judge's objection** (the caption
+  wording judge) is the same kind of item — a model's opinion of Hindi never stops a ship on its
+  own, it asks for the owner's eyes. Neither is a defect, neither is a pass, and both are settled
+  the same way: a human looks and signs. Do not "fix" a judge by re-rolling it until it agrees —
+  it is non-deterministic, so that is a ratchet with no end.
 - That look is **by eye**: sample frames across the whole reel *and* one contact sheet — one panel
   per scene — to judge whether the recurring character is the same person and the art style holds.
   (A single frame cannot answer "same person in every panel?"; the sheet is the question.)
+- **The by-eye review is the agent's job, not a ticket for the owner.** When the gateway is down,
+  the agent samples the frames, *looks at them*, answers each stalled check itself — style-uniform,
+  character-consistency, visual-realism — and **shows the owner the verdict with the frames it was
+  drawn from**. An outage is never returned as "waiting for your eyes": saying "I could not run the
+  check" while the pictures are sitting right there is handing back a job the agent can do. Owner
+  rule 2026-10-12, after exactly that was handed back to him. The sign-off below still gates
+  go_live — the agent decides whether the reel is *defective*, the owner decides whether it ships.
+- The gate writes that look for you: `eye_review_sheet.png`, two full-size frames and
+  `eye_review.json` (every item that needs a human's eyes) land in the project dir. The human
+  looks, then
+  `python3 automation/qc.py projects/<name> --signed-by '<name>' [--note '...']` records the
+  sign-off and re-runs the gate. The signature is on the **cut** (`qc.Reel.fp`), not the project —
+  rebuild the reel and the sign-off is void — and no sign-off ever clears a real defect.
 - Never let an outage read as a craft failure, and never let it read as a pass. Say which it was.
 
 ## 7. The score — audible from the first second
@@ -200,8 +265,11 @@ check was green; only listening caught it.
 
 ## 8. Brand
 
-`standardsunrisefoundation_ngo` — Standard Sunrise Foundation. The closing CTA is a card in the
-same caption system, and it lands as the last thing on screen.
+`standardsunrisefoundation_ngo` — Standard Sunrise Foundation, **standardsunrisefoundation.org**
+(`agents.BRAND_URL`; the caption self-check asserts the two agree). The closing CTA is a card in
+the same caption system, and it lands as the last thing on screen — carrying that address and no
+other. A wrong domain is a fact the model got wrong, not a taste call, so the code rewrites any
+web address on a card to this one before the card is written (`agents._fix_url`).
 
 ---
 

@@ -3,7 +3,7 @@
 Replaces the copy-per-video craft scripts (`projects/*/assemble_veo.py`). What it does:
 
   * joins the clips with cross-dissolves (a reel whose motif wants hard cuts sets XFADE=0)
-  * strips the baked Vids sparkle
+  * finds the logo the site baked into the frame and inpaints it away, whatever site that was
   * adds the caption cards, each one PLACED by `caption.find_empty_band` over the frames it
     actually covers — the card goes where there is no face and no busy detail
   * lays an instrumental bed UNDER the clips' own audio
@@ -32,7 +32,7 @@ import sys
 import tempfile
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(_DIR)
@@ -41,8 +41,23 @@ sys.path.insert(0, _DIR)
 import caption                                                   # noqa: E402
 import music as musiclib                                      # noqa: E402
 
-DELOGO = "delogo=x=564:y=1122:w=72:h=74"     # the baked Vids sparkle, fixed bottom-right
 W, H = 720, 1280                             # the 9:16 canvas every clip is fitted onto
+FIT = f"scale={W}:{H}:force_original_aspect_ratio=decrease," \
+      f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black"
+
+# Every free site burns a small logo into the frame. It is the SAME mark in the SAME place for
+# every clip of one reel (the fleet fails a whole reel over to the next site, never one clip) and
+# the same overlay in every frame of it — which makes it FINDABLE instead of hard-coded: a static
+# semi-transparent overlay compresses a pixel's temporal range by (1-alpha), so it sits in the
+# range image as a dark blob of the mark's own shape. This replaces a box measured for one site
+# only, which on another site smudged an innocent 72x74 patch while that site's own mark — a
+# different place, a different size — survived untouched.
+WM_ROI = (0.72, 0.78)      # x,y fraction: a baked logo lives in the bottom-right corner
+WM_MIN_A = 0.12            # peak alpha below this = no mark, leave the clip alone
+WM_MAX_PX = 4000           # a logo is small; a bigger "blob" is scene content, not an overlay
+WM_FLAT = 0.45             # alpha inside the blob must be one flat plate, not an object's shading
+WM_SHAPE = 0.5             # and it must be compact — a logo is a glyph, not a stripe
+
 MUS_VOL = float(os.environ.get("MUS_VOL", "0.30"))
 # Where a bed should sit IN THE MIX (dBFS), not a fixed multiplier: MUS_VOL=0.30 under the fleet's
 # tracks (mastered near -21 dB) landed them near -31.5, so that is the target a bed is normalised
@@ -57,23 +72,22 @@ TAIL_FADE = float(os.environ.get("TAIL_FADE", "0.50"))
 SPEED = float(os.environ.get("SPEED", "1.0"))
 CARD_STYLE = dict(size=41, color="#FFF3D6", bg="rgba(18,16,14,0.72)")
 
-# Dead air at a clip's ENDS only — never an internal pause, which is a performance beat and
-# cutting one would butcher a spoken line. Conservative by design: it leaves TRIM_KEEP of the
-# pause so a line never starts clipped, and refuses to eat more than TRIM_MAX. TRIM=0 disables.
+# The edit is ONE span per clip, anchored on the voice (owner rule 2026-10-11: "start the video a
+# little late ... a little bit before the vocals and a little bit after the vocals"). What this
+# replaced returned the complement of every silence — 2-4 windows per clip — and spliced the
+# picture at each seam; nine splices across five clips is what the owner saw as "very abrupt
+# back-to-back cuts". Nothing inside the span is cut, however silent it measures: the picture
+# decides that, not the sound, and measured on the dadi reel the "silent" hole in clip_000 is
+# three seconds of her smiling straight at camera. TRIM=0 disables all of it.
 TRIM = os.environ.get("TRIM", "1") != "0"
 TRIM_DB = -35
-TRIM_KEEP = 0.25
-TRIM_MIN = 0.40
-TRIM_MAX = 1.50
-
-# GENERATED clips put the line in the middle and a beat of nothing on either side — and the
-# ends-only trim above can only reach so far into it. What is left is the owner's "a lot of gap
-# between the dialogues": a clip of 10s carrying 5s of speech. An INTERNAL pause longer than
-# GAP_MIN is dead air, not a performance beat, so it is cut down to GAP_KEEP on each side and the
-# rest is deleted — picture and sound together, syllable-locked. A pause shorter than GAP_MIN is
-# a breath and is left exactly where the performance put it.
-GAP_KEEP = float(os.environ.get("GAP_KEEP", "0.25"))     # the breath left on each side of a cut
-GAP_MIN = float(os.environ.get("GAP_MIN", "0.80"))       # a pause longer than this is dead air
+PRE = float(os.environ.get("PRE", "0.50"))       # the beat kept before the first spoken line
+POST = float(os.environ.get("POST", "0.60"))     # ... and after the last one
+# 250-3500 Hz carries a human voice; a clip's own dynamic range in that band says whether it
+# SPEAKS. The dadi reel measured 26.1-39.9 dB on its four spoken clips and 16.5 on the wordless
+# sunrise sweep — and level alone cannot tell them apart, because the sweep's ambience bridges a
+# -35dB silence gate and its loud fraction matches a spoken clip's.
+VOICE_RANGE = float(os.environ.get("VOICE_RANGE", "20"))
 
 
 def _run(cmd):
@@ -90,58 +104,72 @@ def _silences(p):
     return list(zip(st, en))
 
 
+def _merge(sil, bridge=0.50):
+    """Silences with less than `bridge` of sound between them are ONE hole. Measured on clip_002,
+    the sounds this bridges over are 19-29 dB below that clip's own line — room tone and creaks,
+    not words. ponytail: a genuinely short (sub-0.5s) word spoken in a quiet passage would be
+    bridged away with them; the fix is a level-aware bridge, and it needs a second clip that
+    actually has one."""
+    out = []
+    for s, e in sil:
+        if out and s - out[-1][1] <= bridge:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [(s, e) for s, e in out]
+
+
+def _has_voice(p):
+    """Does this clip SPEAK? Answered by the clip's own dynamic range in the voice band, measured
+    in 0.1s windows. False (or too short to measure) means no voice: the sound must not cut that
+    clip at all — there the picture decides, and a human's eye settles it."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", p, "-af",
+                          "highpass=f=250,lowpass=f=3500", "-f", "s16le", "-ac", "1", "-ar",
+                          "16000", "-"], capture_output=True).stdout
+    a = np.frombuffer(raw, "<i2").astype(np.float32) / 32768.0
+    n, k = 1600, len(raw) // 2 // 1600                 # 0.1s windows at 16kHz
+    if k < 5:
+        return False
+    db = 20 * np.log10(np.sqrt((a[:k * n].reshape(k, n) ** 2).mean(1)) + 1e-12)
+    return float(np.percentile(db, 95) - np.percentile(db, 10)) >= VOICE_RANGE
+
+
 def _keep_windows(p):
-    """The spans of a clip to KEEP, in the clip's own time — the complement of everything worth
-    cutting. Ends are cut to TRIM_KEEP (the same beat the ends-only trim always left); an
-    INTERNAL pause is cut down to GAP_KEEP on each side, and only when it is long enough
-    (> GAP_MIN) to be dead air rather than a breath. Returns None when there is no measurable
-    audio or nothing to cut, so the caller leaves the clip alone."""
-    segs = _silences(p)
-    if not segs:
+    """The ONE span of a clip to keep, in the clip's own time: from PRE before its first line to
+    POST after its last, and nothing else. A single late start reads as one continuous shot; a cut
+    inside the span reads as a jump, which is the jerk this replaced. Returns None when the clip
+    has no voice (the picture decides there, not the sound) or when the span is the whole clip."""
+    if not _has_voice(p):
         return None
     d = _dur(p)
-    cuts = []
-    for b, e in segs:
-        if b <= 0.15:                                    # opens silent — ends are cut harder
-            cuts.append((0.0, max(0.0, e - TRIM_KEEP)))
-        elif e >= d - 0.15:                              # closes silent
-            cuts.append((min(d, b + TRIM_KEEP), d))
-        elif e - b > GAP_MIN:                            # longer than a breath: it is dead air
-            cuts.append((b + GAP_KEEP, e - GAP_KEEP))    # keep a breath, delete the rest
-    cuts = sorted((s, e) for s, e in cuts if e - s > 0.05)
-    if not cuts:
+    sil = _merge(_silences(p))
+    if not sil:
         return None
-    merged = [list(cuts[0])]
-    for s, e in cuts[1:]:                                # merge overlapping cuts
-        if s <= merged[-1][1] + 0.02:
-            merged[-1][1] = max(merged[-1][1], e)
-        else:
-            merged.append([s, e])
-    keep, prev = [], 0.0                                 # what is left between the cuts
-    for s, e in merged:
-        if s - prev > 0.30:
-            keep.append((prev, s))
-        prev = max(prev, e)
-    if d - prev > 0.30:
-        keep.append((prev, d))
-    return keep or None
+    a = max(0.0, sil[0][1] - PRE) if sil[0][0] <= 0.15 else 0.0        # opens silent: start late
+    b = min(d, sil[-1][0] + POST) if sil[-1][1] >= d - 0.15 else d     # closes silent: end early
+    if b - a < 0.30 or (a <= 0.05 and b >= d - 0.05):
+        return None
+    return [(a, b)]
 
 
 def compress_gaps(clips, keep_windows=None):
-    """Rebuild each clip from its keep-windows — ends and internal gaps in ONE pass — and return
-    (shortened clips, total cut seconds, [(head offset, new length)]).
+    """Rebuild each clip from its keep-window — the head, the tail and any long hole in ONE pass —
+    and return (shortened clips, total cut seconds, [(head offset, new length)], wordless clips).
 
-    Speech atoms and silence atoms are concatenated alternately, so no audio is time-stretched:
-    lip-sync cannot move and a line is never clipped mid-word. Doing ends and gaps together is
-    what lets the xfade chain and the card windows stay simple downstream — a clip is just a clip
-    with a real length again, instead of a length plus a trim offset to track."""
+    Kept atoms are concatenated without time-stretching, so lip-sync cannot move and a line is
+    never clipped mid-word. Doing it here is what lets the xfade chain and the card windows stay
+    simple downstream — a clip is just a clip with a real length again, instead of a length plus a
+    trim offset to track. A clip the sound may not cut comes back in `wordless` so the caller can
+    say so out loud: "we could not decide this one, look at it"."""
     if not TRIM:
-        return list(clips), 0.0, [(0.0, _dur(c)) for c in clips]
-    out, cut, info = [], 0.0, []
+        return list(clips), 0.0, [(0.0, _dur(c)) for c in clips], []
+    out, cut, info, wordless = [], 0.0, [], []
     for c in clips:
-        wins = (keep_windows or _keep_windows)(c)
+        wins = keep_windows(c) if keep_windows else _keep_windows(c)
         d = _dur(c)
         if not wins:
+            if not _has_voice(c):
+                wordless.append(c)
             out.append(c); info.append((0.0, d)); continue
         v = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in wins)
         a = v
@@ -161,7 +189,7 @@ def compress_gaps(clips, keep_windows=None):
         cut += d - nd
         out.append(tmp)
         info.append((wins[0][0], nd))          # the head that was dropped, and the new length
-    return out, cut, info
+    return out, cut, info, wordless
 
 
 def _dur(p):
@@ -234,6 +262,91 @@ def verify_playable(path, expect):
     return probs
 
 
+def _sample(clip, fps=4.0):
+    """A handful of frames from one clip, already FITTED to the reel canvas — the same FIT the
+    filter graph applies, so a pixel here is the pixel `removelogo` will see."""
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", clip,
+                        "-vf", f"{FIT},fps={fps}", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+                       capture_output=True)
+    a = np.frombuffer(r.stdout, np.uint8)
+    k = len(a) // (W * H * 3)
+    return a[:k * W * H * 3].reshape(k, H, W, 3).astype(np.float32) if k else None
+
+
+def _mark_mask(clips, work):
+    """Find the logo the site baked into these clips. -> (pgm_path, info) or (None, None).
+
+    Frames from EVERY clip are pooled into one temporal range image: the mark is static, so it is
+    the same suppression in each of them, and pooling makes the range — and the alpha it implies —
+    steadier than any single clip could.
+
+    Removal is an INPAINT (`removelogo`), not an exact un-blend. An un-blend needs alpha and the
+    mark's colour, and where the mark straddles a strong spatial edge — this reel's sparkle sits
+    on the table leg — alpha, colour and the unknown background are not separable from one view:
+    the least-squares fit of them was tried against the real clip and is ill-conditioned. The
+    inpaint invents the ~800 px under the mark; a motion-compensated temporal fill would use real
+    pixels instead and is the upgrade if this ever shows.
+    """
+    x0, y0 = int(W * WM_ROI[0]), int(H * WM_ROI[1])
+    lo = hi = None
+    for c in clips:
+        f = _sample(c)
+        if f is None or not len(f):
+            continue
+        lo = f.min(0) if lo is None else np.minimum(lo, f.min(0))
+        hi = f.max(0) if hi is None else np.maximum(hi, f.max(0))
+    if lo is None:
+        return None, None
+    rng = (hi - lo).mean(-1)
+    # the background's OWN range, from a median far wider than the mark: read on a 4x downscale so
+    # the ~124px box costs nothing and can never sit entirely inside a ~55px logo.
+    ref = np.asarray(Image.fromarray(rng, "F").resize((W // 4, H // 4), Image.BOX)
+                     .filter(ImageFilter.MedianFilter(31)).resize((W, H), Image.BILINEAR), np.float32)
+    # ref < 3 is a background that does not move; a still background cannot tell us alpha, and
+    # guessing one there would invent a mark in an empty corner.
+    a = np.where(ref < 3.0, 0.0, np.clip(1.0 - rng / np.maximum(ref, 1e-3), 0.0, 0.95))
+    roi = a[y0:, x0:]
+    if roi.size == 0:
+        return None, None
+    py, px = np.unravel_index(np.argmax(roi), roi.shape)
+    peak, cy, cx = float(roi[py, px]), y0 + int(py), x0 + int(px)
+    if peak < WM_MIN_A:
+        return None, None
+    yy, xx = np.mgrid[0:H, 0:W]
+    # the alpha contour at half its own peak IS the mark's silhouette; the disc drops a stray
+    # speck of noise far from the peak. Dilated by 2px to take the anti-aliased rim with it — a
+    # tight mask leaves the rim behind as a visible ghost outline of the star.
+    m = (a > peak / 2) & ((xx - cx) ** 2 + (yy - cy) ** 2 <= 50 ** 2)
+    m = np.asarray(Image.fromarray(m.astype(np.float32), "F")
+                   .filter(ImageFilter.MaxFilter(5)), np.float32) > 0.5
+    ys, xs = np.where(m)
+    if not len(ys):
+        return None, None
+    # Guards against a bright STATIC thing in the corner being mistaken for an overlay: a logo is
+    # small, compact, and its alpha is one flat plate — scene content is bigger, and either
+    # sprawls into a stripe (testsrc's moving strip reads as alpha 0.95 down one band) or shades.
+    w_, h_ = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
+    r = 0.5 * float(np.std(a[m])) / peak
+    if len(ys) > WM_MAX_PX or r > WM_FLAT or not WM_SHAPE <= w_ / h_ <= 1 / WM_SHAPE:
+        print(f"  bottom-right blob at ({cx},{cy}) is not an overlay "
+              f"({w_}x{h_}px {len(ys)}px alpha {peak:.2f} spread {r:.2f}) — left alone")
+        return None, None
+    # the argmax lands on one noisy pixel of the blob; the mask's own box is what the mark's
+    # position actually is, and it is that box the report and the self-check should name.
+    cx, cy = int(xs.min() + w_ // 2), int(ys.min() + h_ // 2)
+    pgm = os.path.join(work, "wm_mask.pgm")
+    with open(pgm, "wb") as fh:
+        fh.write(b"P5\n%d %d\n255\n" % (W, H))
+        fh.write((m * 255).astype(np.uint8).tobytes())
+    return pgm, {"cx": cx, "cy": cy, "alpha": round(peak, 3), "px": int(len(ys)),
+                 "box": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]}
+
+
+def _wm_filter(pgm):
+    # a filter argument list is ':'-separated, so a colon in the path has to be escaped
+    return "removelogo=filename=" + pgm.replace("\\", "\\\\").replace(":", "\\:")
+
+
 def _heal(path):
     tmp = path + ".heal.mp4"
     subprocess.run(["ffmpeg", "-y", "-i", path, "-c:v", "libx264", "-profile:v", "high",
@@ -249,34 +362,76 @@ def _vision():
     return vision
 
 
+class StyleDrift(Exception):
+    """A build STOPPED because named clips do not match the reel's look.
+
+    It carries the clip paths and the reason because the caller's job is NOT to try the same build
+    again — that was the old behaviour and it livelocked: assemble raised, the stitch loop deleted
+    the partial cut and rebuilt the identical cut from the identical clips, forever. The caller
+    re-shoots THESE clips, so the finding has to leave the build with the names on it."""
+
+    def __init__(self, bad):
+        self.bad = list(bad)                       # [(clip_path, reason)]
+        self.reason = "; ".join(f"{os.path.basename(p)} {r}" for p, r in self.bad)
+        super().__init__(f"BUILD REJECTED — style drift; requeue {len(self.bad)} clip(s): "
+                         f"{self.reason}")
+
+
 def style_preflight(clips):
     """The prompt saying '3-D' is not evidence — the RENDERED frame is. One ambiguous frame (an
     AR filter over a face, a phone-screen inset) must not burn a re-render, while a real
-    photoreal clip is always caught."""
+    photoreal clip is always caught.
+
+    Returns [] when the look holds, else [(clip_path, reason)] naming the clips to re-shoot
+    (raise StyleDrift on it, don't guess which clip the message meant).
+
+    TWO questions, because they fail separately: (1) is each clip the house medium, classified
+    per clip; (2) do the clips match EACH OTHER, asked pairwise against the first clip. (2) is
+    not redundant — `medium_of` buckets a frame four ways and read a whole photoreal clip as '3d'
+    next to 3-D neighbours, which is how a reel arrived at the gate carrying three different
+    renders (dadi-ki-dhansuchi, 2026-10-12). The first frame of each clip is asked both questions,
+    so the second one costs no extra ffmpeg call.
+    """
     if os.environ.get("STYLE_CHECK") == "0":
         print("style pre-flight skipped (STYLE_CHECK=0)")
-        return True
+        return []
     vis = _vision()
-    bad = []
+    bad, frames = [], []
     for p in clips:
-        samples = []
+        samples, first = [], None
         for frac in (0.35, 0.7):
             r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{_dur(p) * frac:.2f}", "-i", p,
                                 "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
                                capture_output=True)
             if r.stdout:
                 samples.append(vis.medium_of(r.stdout))
+                first = first or r.stdout
         verdict, ev = vis.medium_verdict(samples, expected="3d")
         print(f"  {os.path.basename(p)} -> {verdict} ({samples})")
         if verdict in ("drift", "wrong-medium"):
-            bad.append(f"{os.path.basename(p)}: {ev}")
+            bad.append((p, ev))
         elif verdict == "unknown":
             print(f"  WARNING: {os.path.basename(p)} could not be classified — check it by eye")
+        if first:
+            frames.append((p, first))
+    if len(frames) >= 2:
+        scan = vis.style_scan([f for _, f in frames])
+        if scan is None:
+            print("  WARNING: clip-against-clip look could not be reviewed — check it by eye")
+        elif scan["whole_reel"]:
+            # MORE than half differ from clip 0, so clip 0 is the odd one out — re-shooting the
+            # rest would be re-shooting the reel. Never auto-rejected: that is the owner's call.
+            print(f"  NOTE: every clip differs from the first ({scan['detail']}) — that is the "
+                  "whole reel's look, not one bad clip; building, the owner settles this")
+        else:
+            for i in scan["flagged"]:
+                bad.append((frames[i][0], f"does not match the reel's look ({scan['detail']})"))
     if bad:
-        print("STYLE DRIFT — refusing to build: " + "; ".join(bad))
-        return False
-    print("style pre-flight OK — no clip reads photoreal")
-    return True
+        print("STYLE DRIFT — refusing to build: "
+              + "; ".join(f"{os.path.basename(p)}: {e}" for p, e in bad))
+    else:
+        print("style pre-flight OK — one look across every clip")
+    return bad
 
 
 def _absorb(project_dir):
@@ -349,17 +504,29 @@ def build(project_dir, clips_dir=None, absorb=True):
     xf = float(os.environ.get("XFADE", "0.40"))
 
     print("style pre-flight…")
-    if not style_preflight(clips):
-        raise RuntimeError("BUILD REJECTED — style drift; requeue the offending clip")
+    drift = style_preflight(clips)
+    if drift:
+        raise StyleDrift(drift)
 
     # ---- one pass turns each generated clip into what it should have been: the ends trimmed and
     #      the dead air between spoken lines compressed. `clips` becomes the shortened files and
     #      every downstream window is in this new timeline, so nothing has to carry a trim offset.
-    clips, cut, winfo = compress_gaps(clips)
+    clips, cut, winfo, wordless = compress_gaps(clips)
     durs = [_dur(c) for c in clips]
     eff = list(durs)
     if cut:
-        print(f"  dead air: cut {cut:.2f}s (clip ends + the gaps between spoken lines)")
+        print(f"  dead air: cut {cut:.2f}s (started late, ended early — no splice inside a clip)")
+    if wordless:
+        print(f"  no vocals in {len(wordless)} clip(s) — left whole, because there the picture "
+              f"decides and not the sound: {', '.join(os.path.basename(w) for w in wordless)}")
+
+    work = tempfile.mkdtemp(prefix="reelwm-")
+    wm_pgm, wm = _mark_mask(clips, work)
+    if wm:
+        print(f"  baked logo at ({wm['cx']},{wm['cy']}) alpha {wm['alpha']}, {wm['px']}px, "
+              f"box {wm['box']} — inpainted away")
+    else:
+        print("  no baked logo found — clips left untouched")
 
     fc, inputs = [], []
     for c in clips:
@@ -371,13 +538,13 @@ def build(project_dir, clips_dir=None, absorb=True):
     # ~2s of picture before its sound, and every card window was timed against a reel that did
     # not exist. Verified against ffprobe: 3 clips of 5s, xf 0.4 -> 14.2s on both streams.
     seg = [eff[0]] + [eff[i] - xf for i in range(1, n)]
-    FIT = f"scale={W}:{H}:force_original_aspect_ratio=decrease," \
-          f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black"
     for i in range(n):
         # FIT is an identity for a clip that is already 9:16, and saves the reel when a site
         # returns a square or 16:9 generation — a mixed-size join otherwise mis-frames silently.
         vf = f"{FIT},format=yuv420p,fps=30,setsar=1"
-        fc.append(f"[{i}:v]{vf},{DELOGO}[v{i}]")
+        if wm_pgm:
+            vf += "," + _wm_filter(wm_pgm)
+        fc.append(f"[{i}:v]{vf}[v{i}]")
         af = "aformat=sample_rates=48000:channel_layouts=stereo"
         if _has_audio(clips[i]):
             af += ",asetpts=PTS-STARTPTS"
@@ -575,33 +742,90 @@ if __name__ == "__main__":
         _absorb = lambda _d: None                       # never touch the real brain from a test
         d = tempfile.mkdtemp()
         pdir, cdir = os.path.join(d, "demo"), os.path.join(d, "clips", "demo")
+        xdir = os.path.join(d, "trim")                  # trim fixtures: NOT clips of the reel
         os.makedirs(pdir)
         os.makedirs(cdir)
+        os.makedirs(xdir)
         for i in range(3):
             subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=5",
                             "-f", "lavfi", "-i", "sine=frequency=440:d=5",
                             "-pix_fmt", "yuv420p", "-shortest",
                             os.path.join(cdir, f"clip_{i:03d}.mp4")],
                            check=True, capture_output=True)
-        # clip 0 gets the dead air a generated clip really ships with: 1.2s of nothing at the
-        # head, 1.0s at the tail, a spoken middle — plus a 1.4s hole IN the middle, which is the
-        # owner's "a lot of gap between the dialogues". All three must go; a solid clip must not.
-        _say = "0.5*sin(2*PI*300*t)*(between(mod(t\\,5)\\,1.2\\,3.0)+between(mod(t\\,5)\\,3.95\\,4.4))"
-        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=5",
-                        "-f", "lavfi", "-i", f"aevalsrc={_say}:d=5",
+
+        def _clip(name, secs, af):
+            p = os.path.join(xdir, name)
+            subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=s=720x1280:d={secs}",
+                            "-f", "lavfi", "-i", af, "-pix_fmt", "yuv420p", "-shortest",
+                            "-c:a", "aac", p], check=True, capture_output=True)
+            return p
+
+        # clip 0 of the reel is shaped like a generated clip really ships: 1.2s of nothing at the
+        # head, a line, a 0.95s pause, a second line, 3.4s of nothing at the tail. The head and
+        # the tail go; the pause between the two lines is a breath and MUST survive — the rule
+        # this replaced spliced it, 2-4 times per clip, and the owner saw "abrupt back-to-back
+        # cuts" (nine of them across one reel).
+        say = ("0.5*sin(2*PI*300*t)*(between(mod(t\\,9)\\,1.2\\,2.6)"
+               "+between(mod(t\\,9)\\,3.55\\,5.0))")
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=9",
+                        "-f", "lavfi", "-i", f"aevalsrc={say}:d=9",
                         "-pix_fmt", "yuv420p", "-shortest",
                         os.path.join(cdir, "clip_000.mp4")],
                        check=True, capture_output=True)
         kw = _keep_windows(os.path.join(cdir, "clip_000.mp4"))
-        assert kw, "the keep-windows must be found for a clip with ends and an inner gap"
-        assert kw[0][0] >= 0.9, f"the silent head was not dropped (starts {kw[0][0]:.2f})"
-        assert kw[-1][1] <= 4.65, f"the silent tail was not dropped (ends {kw[-1][1]:.2f})"
-        assert len(kw) >= 2 and kw[1][0] - kw[0][1] < 0.60, \
-            f"the inner gap was not compressed (kept {kw[1][0] - kw[0][1]:.2f}s of its ~1s)"
-        assert _keep_windows(os.path.join(cdir, "clip_001.mp4")) is None, \
-            "a clip with no dead air must be left completely alone"
-        print(f"OK: ends AND the gaps between lines are cut, a solid clip untouched "
-              f"({len(kw)} keep-windows)")
+        assert kw and len(kw) == 1, f"ONE span per clip, never a splice inside it ({kw})"
+        assert 0.4 <= kw[0][0] <= 0.8, f"must start ~PRE before the line, got {kw[0][0]:.2f}"
+        assert 5.3 <= kw[0][1] <= 5.9, f"must end ~POST after the line, got {kw[0][1]:.2f}"
+        assert kw[0][0] < 1.2 and kw[0][1] > 5.0, \
+            f"the span must RUN THROUGH both lines and the pause between them, got {kw[0]}"
+        # A clip that speaks and has no dead air at all is left whole too (dadi clip_001): the
+        # gate opens and shuts faster than silencedetect's 0.30s, so there is nothing to find.
+        solid = _clip("solid.mp4", 5, "aevalsrc=0.5*sin(2*PI*300*t)*between(mod(t\\,0.4)\\,0.0\\,0.2):d=5")
+        assert _has_voice(solid), "a gated line must still read as a voice"
+        assert _keep_windows(solid) is None, \
+            "a clip that speaks with no dead air must be left completely alone"
+        # No voice at all: steady ambience, no line. The sound must not cut it — there the picture
+        # decides and a human's eye settles it (owner: "taken care of by seeing the video"). Level
+        # alone cannot tell these apart, so the dynamic range of the voice band must.
+        wordless = _clip("wordless.mp4", 5, "anoisesrc=c=pink:a=0.02:d=5")
+        assert not _has_voice(wordless), "steady ambience is not a voice, however loud it is"
+        assert _has_voice(os.path.join(cdir, "clip_000.mp4")), "a spoken clip must read as spoken"
+        assert _keep_windows(wordless) is None, "a clip with no voice must never be cut by the sound"
+        assert len(compress_gaps([wordless])[3]) == 1, \
+            "a wordless clip must be reported, not silently left whole"
+        print("OK: one span per clip — start late, end early, the pause inside left alone, and a "
+              "wordless clip untouched")
+        # ---- the baked site logo is FOUND, never hard-coded (and a clean corner is left alone).
+        # A scrolling ramp gives every pixel a wide, uniform temporal range; a translucent star is
+        # drawn over the corner a site burns its mark into, then the detector must place it there.
+        yy, xx = np.mgrid[0:H, 0:W]
+        star = ((np.abs(xx - 600) / 26.0) ** (2 / 3)
+                + (np.abs(yy - 1150) / 26.0) ** (2 / 3)) <= 1.0
+
+        def _ramp(name, alpha):
+            p = os.path.join(d, name)
+            enc = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo",
+                                    "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", "25",
+                                    "-i", "-", "-crf", "10", "-pix_fmt", "yuv420p", p],
+                                   stdin=subprocess.PIPE)
+            for t in range(40):
+                base = (255.0 * ((np.arange(W) + t * 18) % W) / W)[None, :, None]
+                fr = base * np.ones(3)[None, None, :] * (1 - alpha * star[..., None])
+                enc.stdin.write(np.clip(fr, 0, 255).astype(np.uint8).tobytes())
+            enc.stdin.close()
+            enc.wait()
+            return p
+
+        _, wm = _mark_mask([_ramp("wm.mp4", 0.40)], d)
+        assert wm and abs(wm["cx"] - 600) <= 6 and abs(wm["cy"] - 1150) <= 6, \
+            f"the baked logo was not found where it was drawn: {wm}"
+        assert abs(wm["alpha"] - 0.40) < 0.10, f"the logo's alpha was misread: {wm['alpha']}"
+        assert 500 < wm["px"] < 1600, f"the logo's silhouette is the wrong size: {wm['px']}px"
+        print(f"OK: the baked logo is found from the clips alone — ({wm['cx']},{wm['cy']}) "
+              f"alpha {wm['alpha']}, {wm['px']}px, box {wm['box']} — not a hard-coded box")
+        assert _mark_mask([_ramp("plain.mp4", 0.0)], d) == (None, None), \
+            "a corner with nothing static in it must NOT be inpainted"
+        print("OK: a clean corner yields no mask, so the clip is passed through untouched")
         subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=220:d=20",
                         "-c:a", "libmp3lame", os.path.join(pdir, "music_raw.mp3")],
                        check=True, capture_output=True)
@@ -615,7 +839,7 @@ if __name__ == "__main__":
         assert os.path.exists(out), "no reel built"
         assert not verify_playable(out, _dur(out)), "the built reel must actually play"
         # the trimmed reel must be shorter than the naive join of the untrimmed clips
-        naive = 3 * 5 - 2 * 0.40
+        naive = sum(_dur(c) for c in glob.glob(os.path.join(cdir, "clip_*.mp4"))) - 2 * 0.40
         assert _dur(out) < naive - 1.2, \
             f"dead air was not cut: reel {_dur(out):.2f}s vs untrimmed {naive:.2f}s"
         got = sorted(f for f in os.listdir(pdir)
