@@ -762,6 +762,23 @@ if __name__ == "__main__":
         assert "still wrong again" in _cr[0][1]["detail"], _cr[0][1]
         assert {c["slug"] for c in st.candidates()} >= {"missing-check-preflight-style-uniform"}, \
             "the cap must file the check that would have caught it, keyed by that check"
+
+        # A CLIP OUT OF RETRIES is the other end of the same rule: its job goes to 'failed', and a
+        # 'failed' job is a reel that can never assemble — while the reel is locked to ONE site, so
+        # there is no other site to try. That is a person's, and it must not be just a row.
+        st.set_credits("kling", "a1", remaining=100)
+        cid = st.add_job("crisistest", 0, "a clip that never lands")
+        st.db.execute("UPDATE jobs SET retries=? WHERE id=?", (runner.MAX_RETRIES - 1, cid))
+        st.db.execute("UPDATE lessons SET cooldown_until=0")     # the site is available again
+        st.db.commit()
+        calls["n"] = 0                                           # the adapter walls on the poll
+        _cjob = st.db.execute("SELECT * FROM jobs WHERE id=?", (cid,)).fetchone()
+        assert runner.process_job(st, br, _cjob, headless=True) == "walled"
+        assert st.db.execute("SELECT status FROM jobs WHERE id=?", (cid,)).fetchone()[0] == "failed"
+        _c = [r for _, r in crisis.open_crises() if r["kind"] == "clip-failed"]
+        assert _c and _c[0]["subject"] == "crisistest", crisis.open_crises()
+        assert "one reel, one source" in " ".join(_c[0]["tried"]), \
+            "the record must say why no other site was tried: the reel is locked to one"
         print("OK: a gate finding requeues the named clip with the reason, moves the rejected cut, "
               "and STOPS at the cap instead of looping")
         print("OK: hermetic self-check (temp dirs) + craft-gate verdict persisted")
