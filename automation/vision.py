@@ -42,6 +42,20 @@ _MODEL = ENV.get("VISION_MODEL", "gemini-3.8-flash")
 # /models list 2026-10-13: 'gemini-3-flash-latest' is NOT one of them (404), and a 404 used to
 # cool the whole endpoint — see the 404 branch in _ask.
 _FALLBACK_MODELS = ["gemini-flash-latest", "auto/pro-vision"]
+
+# Vision models the configured gateways really serve, best judgement first, asked ONLY when the
+# pin cannot answer. Rate limits are per MODEL and per KEY, so a spent model is not a spent
+# gateway: FreeLLMAPI's own catalog (2026-10-13) lists 45 enabled vision models over 14 platforms
+# with separate pools — google's flash family rpd 20 x 3 keys, groq qwen3.8-27b 250, requesty 200,
+# cohere aya-vision 33, cloudflare 10k neurons/day, nvidia 40 rpm x 3 keys. This pipeline asked
+# ONE of them ('gemini-3.8-flash'); when that pool ran dry the craft gate lost its eyes for the
+# day while 44 models sat idle. Every name here is a real seeing model — 'auto' is deliberately
+# NOT among them (a router's pick returned 6,900 characters of prose and no JSON, 2026-10-10).
+_FALLBACK_VISION = [
+    "gemini-2.5-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash",
+    "gemini-2.5-flash-lite", "qwen/qwen3.8-27b", "Qwen2.5-VL-72B-Instruct",
+    "meta/llama-3.2-90b-vision-instruct", "command-a-vision-07-2025", "glm-4.6v-flash",
+]
 _TRANSIENT = (429, 503)                 # throttle / high-demand -> worth a short retry, not a give-up
 
 
@@ -59,8 +73,13 @@ def _models_for(url):
     gemini-*, OmniRoute wants auto/vision routes, FreeLLMAPI (and generic auto-routers) want 'auto'."""
     u = (url or "").lower()
     if "generativelanguage" in u or "googleapis" in u:
-        gem = [m for m in [_MODEL] + _FALLBACK_MODELS if m.startswith("gemini")]
-        return gem or ["gemini-flash-latest"]
+        gem = [m for m in [_MODEL] + _FALLBACK_MODELS + _FALLBACK_VISION if m.startswith("gemini")]
+        seen, out = set(), []
+        for m in gem:
+            if m not in seen:
+                seen.add(m)
+                out.append(m)
+        return out or ["gemini-flash-latest"]
     if "20128" in u or "omniroute" in u:
         return ["auto/vision", "auto/pro-vision", "auto/best-vision"]
     # A PINNED model beats the router's own pick. 'auto' on a router may answer with a DIFFERENT
@@ -70,13 +89,14 @@ def _models_for(url):
     # resort, never the default. (FreeLLMAPI does serve gemini-3.8-flash, so the fast local
     # route is kept AND the model is fixed.)
     if _MODEL and _MODEL != "auto":
-        # The pin is the ONLY model asked for here. 'auto' must NOT be a silent fallback: measured
-        # 2026-10-10, a rate-limited pin fell through to 'auto', which returned 6,900 characters of
-        # reasoning prose and no JSON — compare_character then reported "vision gateway
-        # unavailable" while the gateway was answering fine. A fallback the caller cannot parse is
-        # worse than none, because it hides the real cause. A busy pin fails over to the NEXT
-        # ENDPOINT (Gemini direct), which is a real capacity pool, not a different model.
-        return [_MODEL]
+        # The pin leads, and 'auto' is never in the list: a router's pick may be a NON-SEEING
+        # model that answers anyway — measured 2026-10-10, a rate-limited pin fell through to
+        # 'auto', which returned 6,900 characters of reasoning prose and no JSON, so
+        # compare_character reported "vision gateway unavailable" while the gateway was
+        # answering fine. What follows the pin is not 'auto' but a list of NAMED seeing models,
+        # and the route only gives up when every one of them is throttled (see _ask): the pin
+        # still decides every verdict it can answer, so its determinism is untouched.
+        return [_MODEL] + [m for m in _FALLBACK_VISION if m != _MODEL]
     return ["auto"]                                 # nothing pinned: let the router choose
 
 
@@ -127,7 +147,9 @@ def _ask(png: bytes, prompt: str, max_tokens: int = 600, patience: int = 2) -> s
             if until:
                 last = last or RuntimeError(f"{url} cooling {int(until - time.time())}s: {why}")
                 continue
+            tried = throttled = 0
             for model in _models_for(url):          # … each with a model dialect it accepts
+                tried += 1
                 body = json.dumps({
                     "model": model, "max_tokens": max_tokens, "temperature": 0,
                     "messages": [{"role": "user", "content": [
@@ -159,12 +181,22 @@ def _ask(png: bytes, prompt: str, max_tokens: int = 600, patience: int = 2) -> s
                         # list is not a dead route.
                         continue
                     last = e
-                    routerhealth.note_failure(url, f"HTTP {e.code}")
                     if e.code in _TRANSIENT:
+                        # A 429 on an aggregator is a PER-MODEL, PER-KEY pool (gemini flash rpd 20,
+                        # groq 250, requesty 200): the next model is a different, unspent pool. So
+                        # try it, and wall the route only when EVERY model on it was throttled —
+                        # otherwise one exhausted model takes the whole gateway down with it, which
+                        # is exactly how the craft gate lost its eyes on 2026-10-13.
                         transient = True
+                        throttled += 1
+                        continue
+                    routerhealth.note_failure(url, f"HTTP {e.code}")
                 except Exception as e:
                     last = e
                     routerhealth.note_failure(url, e)
+                    break         # a connection error is about the ENDPOINT: every model hits it
+            if throttled and throttled == tried:
+                routerhealth.note_failure(url, getattr(last, "code", "429"))
         if not transient or sweep == patience:
             break
         time.sleep(4 * (sweep + 1))     # 4s, 8s backoff on a transient spike
@@ -775,9 +807,7 @@ if __name__ == "__main__":
     if "--selfcheck" in sys.argv:
         # offline half — `python3 automation/vision.py` (no flag) also runs the live gateway
         # round-trip below, which spends a couple of vision tokens.
-        # Fault-injected: a 404 is a bad MODEL NAME and must not cool the gateway (2026-10-13 a
-        # stale alias third in _FALLBACK_MODELS took Google direct out of the rotation for the
-        # whole vision role while the endpoint answered 200 on its other models).
+        # Fault-injected, one assertion per way this cost the gate its eyes on 2026-10-13.
         import io
         import urllib.error
         import routerhealth as _rh
@@ -792,31 +822,104 @@ if __name__ == "__main__":
             return io.BytesIO(json.dumps(
                 {"model": m, "choices": [{"message": {"content": "{}"}}]}).encode())
 
+        def _throttle_first(req, timeout=90):
+            m = json.loads(req.data)["model"]
+            hits.append(m)
+            if m == "spent-model":
+                raise urllib.error.HTTPError(req.full_url, 429, "Too Many", {}, None)
+            return io.BytesIO(json.dumps(
+                {"model": m, "choices": [{"message": {"content": "{}"}}]}).encode())
+
         def _throttled(req, timeout=90):
             raise urllib.error.HTTPError(req.full_url, 429, "Too Many", {}, None)
 
+        def _dead(req, timeout=90):
+            hits.append(json.loads(req.data)["model"])
+            raise OSError("connection refused")
+
+        def _mixed(req, timeout=90):
+            m = json.loads(req.data)["model"]
+            hits.append(m)
+            raise urllib.error.HTTPError(req.full_url, 429 if m == "spent-model" else 404,
+                                         "x", {}, None)
+
         try:
+            # (1) THE CAPACITY FIX. 45 vision models sit behind these gateways with separate
+            # per-model, per-key pools; asking one is what ran a whole day's gate dry.
+            for _u in ("http://localhost:3001/v1", "https://api.example.com/v1"):
+                _ms = _models_for(_u)
+                assert len(_ms) > 1, f"a vision gateway must offer its other pools too: {_ms}"
+                assert _ms[0] == _MODEL, f"the pin still leads: {_ms}"
+                assert "auto" not in _ms, f"'auto' may pick a model that cannot see: {_ms}"
+            _ms = _models_for("https://generativelanguage.googleapis.com/v1beta/openai")
+            assert len(_ms) > 1 and all(m.startswith("gemini") for m in _ms), _ms
+            # (2) a 404 is a bad NAME; a route whose only name is stale must not be walled for it
             urllib.request.urlopen = _fake
             globals()["_endpoints"] = lambda: [("http://t/v1", "k")]
+            globals()["_models_for"] = lambda u: ["dead-name"]
+            _rh.clear()
+            try:
+                _ask(b"x", "hi", patience=0)
+            except Exception:
+                pass
+            assert not _rh.cooling("http://t/v1")[0], "a stale model name is not a dead gateway"
+            # …and a list that has a live name after the stale one still answers
             globals()["_models_for"] = lambda u: ["dead-name", "good-name"]
+            hits.clear()
             _rh.clear()
             assert _ask(b"x", "hi") == "{}", "a 404 on one model must fall through to the next"
             assert hits == ["dead-name", "good-name"], hits
-            assert not _rh.cooling("http://t/v1")[0], "a 404 on one model must not wall the route"
+            # (3) a 429 on an aggregator is a PER-MODEL pool: the next model is unspent
+            urllib.request.urlopen = _throttle_first
+            globals()["_models_for"] = lambda u: ["spent-model", "fresh-model"]
+            hits.clear()
+            _rh.clear()
+            assert _ask(b"x", "hi") == "{}", "a spent model must fall through to an unspent one"
+            assert hits == ["spent-model", "fresh-model"], hits
+            assert not _rh.cooling("http://t/v1")[0], \
+                "one exhausted model must not take the whole gateway out of the rotation"
+            # a route is walled for being OUT OF CAPACITY, not merely for having a spent model
+            # beside a stale name: if not every model was throttled, the wall would hide whatever
+            # the next call could still reach
+            globals()["_models_for"] = lambda u: ["spent-model", "dead-name"]
+            urllib.request.urlopen = _mixed
+            hits.clear()
+            _rh.clear()
+            try:
+                _ask(b"x", "hi", patience=0)
+            except Exception:
+                pass
+            assert not _rh.cooling("http://t/v1")[0], \
+                "only an every-model throttle is a route out of capacity"
+            # (4) …but a gateway whose every model is throttled IS out of capacity, and is
+            # remembered, so the next call does not re-walk all of them
             urllib.request.urlopen = _throttled
-            globals()["_models_for"] = lambda u: ["good-name"]
+            globals()["_models_for"] = lambda u: ["m1", "m2"]
             _rh.clear()
             try:
                 _ask(b"x", "hi", patience=0)
             except Exception:
                 pass                          # out of routes: the caller handles it
-            assert _rh.cooling("http://t/v1")[0], "a 429 IS about the route and must wall it"
+            assert _rh.cooling("http://t/v1")[0], "429 on EVERY model must wall the route"
+            # (5) a connection error is the ENDPOINT's problem, so it must not be re-discovered
+            # once per model name — that is 90s of timeout each
+            hits.clear()
+            urllib.request.urlopen = _dead
+            globals()["_models_for"] = lambda u: ["m1", "m2", "m3"]
+            _rh.clear()
+            try:
+                _ask(b"x", "hi", patience=0)
+            except Exception:
+                pass
+            assert hits == ["m1"], f"a dead gateway must be walled once, not per model: {hits}"
+            assert _rh.cooling("http://t/v1")[0], "a connection error must wall the route"
         finally:
             urllib.request.urlopen = _o_open
             globals()["_endpoints"], globals()["_models_for"] = _o_ends, _o_models
             _rh.clear()
-        print("OK: vision --selfcheck is offline (a 404 skips the model, a 429 walls the gateway; "
-              "live gateway round-trip: run without the flag)")
+        print("OK: vision --selfcheck is offline (a 404 skips the model, a spent model skips to the "
+              "next pool, a dead gateway is walled once; live gateway round-trip: run without the "
+              "flag)")
         raise SystemExit(0)
 
     # self-check: a real image round-trip proves the vision plumbing (base64 encode,
