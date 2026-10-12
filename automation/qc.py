@@ -406,10 +406,21 @@ def check_character_consistency(reel):
     scan = vision.style_scan_cached(frames)
     pairs_drift = [i for i, same in (scan or {}).get("people", {}).items() if not same]
     scan_ok = scan is not None
-    if res is None and not scan_ok:
-        return [Unreviewed("character consistency could NOT be reviewed (vision gateway "
-                           "unavailable) — check by eye that the same face and hair appear in "
-                           "every scene")]
+    if res is None or not scan_ok:
+        # One voice down is neither a pass nor a defect — it is a check that could not be run
+        # (WAVELENGTH §6). The old guard here (`res is None and not scan_ok`) required BOTH to be
+        # down, so on 2026-10-13 the pairwise scan convicted clip 3 ("different facial features …
+        # bindi present only on the right") while the sheet was an outage, and the conviction fell
+        # straight through to `return []`. One voice missing, the other is the coin flip the
+        # cross-check exists for: unreviewed, and the drift it did find goes in the message.
+        missing = "the panel review" if res is None else "the clip-against-clip scan"
+        found = (scan or {}).get("person_detail") or (res or {}).get("detail") or ""
+        drift = bool(pairs_drift) or bool(res is not None and not res["consistent"])
+        return [Unreviewed(
+            f"character consistency could NOT be reviewed — {missing} could not run, so the two "
+            f"views cannot be cross-checked; the voice that did run reported "
+            f"{'a drift (' + found + ')' if drift else 'no drift'}. Look at the frames and confirm "
+            f"the same face and hair appear in every scene")]
     if res is not None and not res["consistent"] and pairs_drift:
         idxs = [i for i in (_idx_of(_clip_paths(reel)[i]) for i in pairs_drift) if i is not None]
         return [Reject(
@@ -1179,6 +1190,18 @@ if __name__ == "__main__":
                 f"an unavailable comparison must gate go_live (not pass): {v7c['gate']}"
             assert not any("could NOT be reviewed" in b for b in v7c["block"]), \
                 f"an OUTAGE is not a craft defect — it must not block the ship: {v7c['block']}"
+            # …and ONE voice down is still not a pass: on 2026-10-13 the pairwise scan convicted
+            # clip 3 while the sheet was an outage, and the old both-down guard let it fall through
+            # to `return []` — a real drift, discarded, on a reel that read CLEAN.
+            vision.compare_character = lambda png: None
+            _scan({"flagged": [], "whole_reel": False, "detail": "",
+                   "people": {2: False}, "person_detail": "bindi only on the right"})
+            v7e = run(d7, st)
+            assert any("could NOT be reviewed" in g for g in v7e["gate"]), \
+                f"a sheet outage must never pass on the scan's word alone: {v7e['gate']}"
+            assert not v7e["block"], f"a missing voice is not a craft defect: {v7e['block']}"
+            assert any("bindi only on the right" in g for g in v7e["gate"]), \
+                f"the drift the surviving voice DID find must reach the person: {v7e['gate']}"
             vision.compare_character = lambda png: {"consistent": True, "detail": ""}
 
             # REJECT — a finding the MACHINE can fix. The pairwise scan names the odd clip, and

@@ -84,22 +84,30 @@ _SHOT = {"title": "पुराना फ़ोन", "slug": "purana-phone", "as
          "music_mood": "warm, nostalgic", "music_want": "soft instrumental"}
 
 # The clean cards (aligned with the script, one beat each) and the PLANTED ones. The planted set
-# carries two defects the judge was explicitly built to catch: a card that contradicts the script
+# carries the defects the judge was explicitly built to catch: a card that contradicts the script
 # (a treasure, a moral about money) and one word spelled two ways in one reel (ख़ज़ाना / खज़ाना).
+#
+# The "clean" set has to be clean BY THE HOUSE RULES or it measures nothing: the first version put
+# a platitude moral on it ("यादें हमेशा साथ रहती हैं" — memories are always with us), which
+# WAVELENGTH's hard nevers forbid, so every candidate objected to it, every candidate lost the same
+# mark, and five models scored an identical 0.67 for the same CORRECT reason. The moral below is
+# specific to the beats, one line, and earned; the hook is idiomatic; the CTA is the bare domain
+# (the card has a character limit and the address alone is the last thing on screen anyway).
 _CLEAN_CAPS = {"font": "rounded",
-               "hook": {"lines": ["पुराने फ़ोन में एक आवाज़ बंद है"]},
-               "moral": {"lines": ["यादें हमेशा साथ रहती हैं"]},
-               "cta": {"lines": ["standardsunrisefoundation.org पर आएँ"]}}
+               "hook": {"lines": ["पुराने फ़ोन में एक आवाज़ कैद है"]},
+               "moral": {"lines": ["पिता की आवाज़ कभी नहीं जाती"]},
+               "cta": {"lines": ["standardsunrisefoundation.org"]}}
 _PLANTED_CAPS = {"font": "rounded",
                  "hook": {"lines": ["पुराने फ़ोन में ख़ज़ाना छिपा है"]},
                  "moral": {"lines": ["पैसा ही सब कुछ है", "खज़ाना सबसे बड़ा सच है"]},
                  "cta": {"lines": ["standardsunrisefoundation.org पर आएँ"]}}
 
-# dadi-ki-dhansuchi's source clips are the labelled truth for the vision role: three different
-# women play the grandmother, clip 002 is nearly photoreal, so 2 MUST be flagged against the
-# anchor. Only the first three clips are sampled — the anchor plus two — to keep this cheap.
+# dadi-ki-dhansuchi's source clips are the labelled truth for the vision role, and the label is the
+# EYE's verdict on the sampled frames (2026-10-13), not a machine's: clip 000 and clip 002 are the
+# same woman (002 only ADDED a bindi, bangles and a watch — the additions defect the identity lock's
+# negatives exist for), while clip 001 is a visibly different woman — a longer face, a heavier
+# brow, a different nose. So the reel is drifted, and the clip to know about is 1.
 _VISION_REEL = "dadi-ki-dhansuchi"
-_VISION_TRUTH = 2
 
 
 def _lines(caps):
@@ -156,11 +164,18 @@ def _score_judge(bad: dict, good: dict) -> float:
 
 
 def _score_vision(scan) -> float:
-    """The labelled frame must be flagged. None (the gateway could not answer) is UNMEASURED, not
-    a zero — handled by the caller, which passes None straight through."""
+    """The labelled reel HAS a drift, and the scan answers both questions a drift can show up in —
+    the look and the person — in one call. The gate sends a clip back on EITHER, so a scan that
+    finds it either way has done the job. What scores zero is answering "everything matches" about
+    a reel that doesn't, which is what both measured routes did: they called clip 001 — a visibly
+    different woman — the same person as the anchor.
+
+    None (the gateway could not answer) is UNMEASURED, not a zero — handled by the caller, which
+    passes None straight through."""
     if scan is None:
         return None
-    return 1.0 if _VISION_TRUTH in (scan.get("flagged") or []) else 0.0
+    caught = bool(scan.get("flagged")) or any(v is False for v in (scan.get("people") or {}).values())
+    return 1.0 if caught else 0.0
 
 
 # ---- the trials: one real call per candidate ------------------------------------------------
@@ -227,7 +242,11 @@ def _t_vision(url, key, model) -> float:
     (gateway, model) pair mid-call and score the wrong thing."""
     frames = _frames()
     if len(frames) < 2:
-        return None
+        # Raising (not returning None) so the report says WHY: a row that renders as nothing at
+        # all is a role you cannot tell apart from one that was never asked (2026-10-13 — the
+        # labelled reel's clips were swept after publish and `== vision` printed a blank line).
+        raise RuntimeError(f"the labelled reel {_VISION_REEL!r} has no frames on disk (clips/ is "
+                           "swept once a reel publishes) — unmeasured, never a zero")
     o_url, o_model = vision._endpoints, vision._MODEL
     try:
         vision._endpoints = lambda: [(url, key)]
@@ -252,8 +271,13 @@ TRIALS = {
 
 def best(rows: list):
     """The winner: highest score, ties broken by the faster route. Rows that could not be RUN are
-    skipped entirely — a blip must not hand a role to whichever candidate happened to answer."""
-    measured = [r for r in rows if r.get("score") is not None]
+    skipped entirely — a blip must not hand a role to whichever candidate happened to answer.
+
+    So is a row that scored ZERO: that is a candidate that ran and produced nothing the role's own
+    contract accepts, and leading with it is worse than keeping the plain order. A role whose best
+    answer is zero has no winner this run — the same rule as an outage, one rung down: a measured
+    failure is not a measurement."""
+    measured = [r for r in rows if (r.get("score") or 0) > 0]
     if not measured:
         return None
     return max(measured, key=lambda r: (r["score"], -r["secs"]))
@@ -282,14 +306,21 @@ def measure(roles, dry=False):
                 print(f"  [dry] {role:13s} {_label(cand, role)}")
                 continue
             t0 = time.time()
+            err = ""
             try:
                 score = trial(*cand)
             except Exception as e:  # noqa: BLE001 — unmeasured, never a failure
                 score = None
-                print(f"  {role:13s} {_label(cand, role):34s} NOT MEASURED: {str(e)[:110]}")
+                err = str(e)[:110]
             secs = time.time() - t0
             rows.append({"route": cand[0], "model": cand[-1], "score": score, "secs": secs})
-            if score is not None:
+            if score is None:
+                # EVERY candidate gets a line. A row that prints nothing is a role you cannot
+                # tell apart from one nobody asked about (2026-10-13: `== vision` was blank
+                # because style_scan answered None and the printer only spoke for scored rows).
+                print(f"  {role:13s} {_label(cand, role):34s} NOT MEASURED: "
+                      f"{err or 'the gateway answered nothing usable — a blip, not a score'}")
+            else:
                 print(f"  {role:13s} {_label(cand, role):34s} {score:.2f}  ({secs:.0f}s)")
         if dry:
             continue
@@ -349,9 +380,12 @@ if __name__ == "__main__":
                             {"problems": ["nitpick"], "captions": {}}) == 2 / 3, \
             "inventing a problem on clean cards must cost the mark"
         assert abs(_score_judge(named_fixed, {"problems": [], "captions": {}}) - 1.0) < 1e-9
-        # vision: the labelled clip, and the outage that must NOT read as a zero
+        # vision: the labelled reel's drift, caught by EITHER half of the one call it costs
         assert _score_vision({"flagged": [1, 2]}) == 1.0, "the labelled clip must be found"
-        assert _score_vision({"flagged": [1]}) == 0.0, "missing the labelled clip is a zero"
+        assert _score_vision({"flagged": [], "people": {1: False}}) == 1.0, \
+            "the drift is a PERSON drift too: a clip the scan calls a different person is caught"
+        assert _score_vision({"flagged": [], "people": {1: True, 2: True}}) == 0.0, \
+            "answering 'everything matches' about a drifted reel is the zero — both routes did it"
         assert _score_vision(None) is None, \
             "a gateway that could not answer is UNMEASURED — never a zero, or a blip becomes " \
             "a permanent assignment"
@@ -362,6 +396,20 @@ if __name__ == "__main__":
         assert best([down]) is None, "no measured candidate means no pick"
         assert best([fast_bad, {"route": "c", "model": "m", "score": 0.4, "secs": 1}])["route"] == "c", \
             "a tie is broken by the faster route"
+        assert best([down, {"route": "d", "model": "m", "score": 0.0, "secs": 1}]) is None, \
+            "a candidate that RAN and scored zero is not a winner either: leading a role with a " \
+            "measured failure is worse than keeping the plain order"
+        # a role that cannot run must SAY so, or its blank row is indistinguishable from a role
+        # nobody asked about
+        _of = globals()["_frames"]
+        globals()["_frames"] = lambda: []
+        try:
+            _t_vision("u", "k", "m")
+            raise AssertionError("a vision run with no frames must not return quietly")
+        except RuntimeError as e:
+            assert _VISION_REEL in str(e), f"the reason must name the missing reel: {e}"
+        finally:
+            globals()["_frames"] = _of
         print("OK: measure.py — the scorers score, an unmeasured candidate never wins, and a tie "
               "goes to the faster route")
         raise SystemExit(0)

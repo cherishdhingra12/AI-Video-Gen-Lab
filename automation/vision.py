@@ -38,8 +38,10 @@ ENV = _env()
 # vision endpoints: try the pinned one first, then fail over across the other configured gateways
 # so a single gateway being down doesn't blind the self-heal — the backend self-heals too.
 _MODEL = ENV.get("VISION_MODEL", "gemini-3.8-flash")
-# extra routes to try if the primary 404s/errors (Google aliases; harmless 404 on other gateways).
-_FALLBACK_MODELS = ["gemini-flash-latest", "gemini-3-flash-latest", "auto/pro-vision"]
+# extra routes to try if the primary 404s/errors (Google aliases). Checked against the live
+# /models list 2026-10-13: 'gemini-3-flash-latest' is NOT one of them (404), and a 404 used to
+# cool the whole endpoint — see the 404 branch in _ask.
+_FALLBACK_MODELS = ["gemini-flash-latest", "auto/pro-vision"]
 _TRANSIENT = (429, 503)                 # throttle / high-demand -> worth a short retry, not a give-up
 
 
@@ -149,6 +151,13 @@ def _ask(png: bytes, prompt: str, max_tokens: int = 600, patience: int = 2) -> s
                         return txt
                     routerhealth.note_failure(url, "empty content")
                 except urllib.error.HTTPError as e:
+                    if e.code == 404:
+                        # 404 is about the MODEL NAME, not the gateway — this endpoint answers 200
+                        # on its other models. Cooling the route for it took Google direct out of
+                        # the rotation entirely on 2026-10-13 while a stale alias sat third in
+                        # _FALLBACK_MODELS, and the two local gateways were 429: a dead name in a
+                        # list is not a dead route.
+                        continue
                     last = e
                     routerhealth.note_failure(url, f"HTTP {e.code}")
                     if e.code in _TRANSIENT:
@@ -764,9 +773,50 @@ if __name__ == "__main__":
         _ask = _orig
 
     if "--selfcheck" in sys.argv:
-        # offline half only — `python3 automation/vision.py` (no flag) also runs the live
-        # gateway round-trip below, which spends a couple of vision tokens.
-        print("OK: vision --selfcheck is offline (live gateway round-trip: run without the flag)")
+        # offline half — `python3 automation/vision.py` (no flag) also runs the live gateway
+        # round-trip below, which spends a couple of vision tokens.
+        # Fault-injected: a 404 is a bad MODEL NAME and must not cool the gateway (2026-10-13 a
+        # stale alias third in _FALLBACK_MODELS took Google direct out of the rotation for the
+        # whole vision role while the endpoint answered 200 on its other models).
+        import io
+        import urllib.error
+        import routerhealth as _rh
+        _o_open, _o_ends, _o_models = urllib.request.urlopen, _endpoints, _models_for
+        hits = []
+
+        def _fake(req, timeout=90):
+            m = json.loads(req.data)["model"]
+            hits.append(m)
+            if m == "dead-name":
+                raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+            return io.BytesIO(json.dumps(
+                {"model": m, "choices": [{"message": {"content": "{}"}}]}).encode())
+
+        def _throttled(req, timeout=90):
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many", {}, None)
+
+        try:
+            urllib.request.urlopen = _fake
+            globals()["_endpoints"] = lambda: [("http://t/v1", "k")]
+            globals()["_models_for"] = lambda u: ["dead-name", "good-name"]
+            _rh.clear()
+            assert _ask(b"x", "hi") == "{}", "a 404 on one model must fall through to the next"
+            assert hits == ["dead-name", "good-name"], hits
+            assert not _rh.cooling("http://t/v1")[0], "a 404 on one model must not wall the route"
+            urllib.request.urlopen = _throttled
+            globals()["_models_for"] = lambda u: ["good-name"]
+            _rh.clear()
+            try:
+                _ask(b"x", "hi", patience=0)
+            except Exception:
+                pass                          # out of routes: the caller handles it
+            assert _rh.cooling("http://t/v1")[0], "a 429 IS about the route and must wall it"
+        finally:
+            urllib.request.urlopen = _o_open
+            globals()["_endpoints"], globals()["_models_for"] = _o_ends, _o_models
+            _rh.clear()
+        print("OK: vision --selfcheck is offline (a 404 skips the model, a 429 walls the gateway; "
+              "live gateway round-trip: run without the flag)")
         raise SystemExit(0)
 
     # self-check: a real image round-trip proves the vision plumbing (base64 encode,
