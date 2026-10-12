@@ -71,6 +71,29 @@ class Brain:
         """A clean run — drop any lingering cooldown so we return at full speed."""
         self.st.record_lesson(site, "success", account=account, cooldown_s=0)
 
+    def wait_for_bid(self, site: str) -> bool:
+        """Should a reel WAIT for this site rather than fail the whole reel over to a lower tier?
+
+        This is the difference the bid branch of runner.process_job was missing — a soft
+        `want_site` fell straight through the moment the primary cooled, so ONE `selector` wall
+        (120s cooldown) moved a 12-credit Google Vids reel onto vibes: silent, 464x832, and the
+        reel came back with no narration and its dialogue burned in as garbled subtitles.
+
+        True only when the site is not usable RIGHT NOW but is still worth waiting for. A site
+        that is ready returns False (go straight to it); so do the two real dead ends — dry, and
+        hard-`block`ed (_WALL_BASE: 1h and escalating, which means "go elsewhere", not "come back
+        shortly"). No bid at all returns False: the waterfall picks freely."""
+        if not site:
+            return False
+        if self.pick(want_site=site, strict=True):
+            return False                       # ready now — nothing to wait for
+        if not self.st.site_has_credit(site):
+            return False                       # dry — a real dead end
+        recent = self.st.recent_lessons(site, limit=1)
+        if recent and recent[0]["kind"] == "block":
+            return False                       # hard-blocked — a real dead end
+        return True                            # funded but cooling: worth the wait
+
     def pick(self, want_site: str = None, strict: bool = False) -> tuple:
         """Scheduler helper: best (site,account) that has credit AND isn't cooling.
         want_site is a soft PREFERENCE (tried first), not a filter — a job whose last

@@ -195,7 +195,20 @@ def render(lines, out, y, font="rounded", size=41, color="#FFF3D6", bg="rgba(18,
     box-shadow:0 10px 30px rgba(0,0,0,0.28)}}
   p{{margin:0;color:{color};font-size:{size}px;line-height:1.5;font-weight:600}}
   p+p{{margin-top:8px}}
-</style></head><body><div class="card">{body}</div></body></html>"""
+</style></head><body><div class="card">{body}</div>
+<script>
+// A card must FIT. CARD_CHARS counts characters, which is a fair proxy for Devanagari and a bad
+// one for one long Latin token: the 29-char brand domain rendered wider than the box and spilled
+// out of the card on BOTH sides. Shrink the line until it fits instead of asking a model to guess
+// a width. Blocked text wraps, so scrollWidth only exceeds clientWidth on an unbreakable word.
+for (const p of document.querySelectorAll('p')) {{
+  let s = parseFloat(getComputedStyle(p).fontSize);
+  while (p.scrollWidth > p.clientWidth + 1 && s > 18) {{
+    s -= 1;
+    p.style.fontSize = s + 'px';
+  }}
+}}
+</script></body></html>"""
     tmp = out + ".html"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(html)
@@ -288,6 +301,20 @@ if __name__ == "__main__":
         assert alpha.max() == 255, "card has no opaque pixels — the text did not render"
         assert alpha[0, 0] == 0, "card background must stay transparent outside the scrim"
         print("OK: a Devanagari card renders to a transparent 720x1280 PNG")
+        # A card must FIT. CARD_CHARS is a character count, which is a fair proxy for Devanagari
+        # and a bad one for one long Latin token — a 29-char domain rendered wider than the box
+        # and spilled out of the card on both sides. The card page shrinks the line until it fits;
+        # this is the assertion that keeps it honest. The box is the mid-alpha scrim, the ink is
+        # the opaque text, and the ink must sit inside the box.
+        wide = os.path.join(d, "wide.png")
+        render(["standardsunrisefoundation.org", "पर आएँ"], wide, y=y2)
+        a = np.asarray(Image.open(wide).convert("RGBA"))[..., 3]
+        scrim, ink = np.argwhere((a > 150) & (a < 235)), np.argwhere(a > 250)
+        assert ink.size and scrim.size, "the wide card did not render box and text"
+        assert ink[:, 1].min() >= scrim[:, 1].min() and ink[:, 1].max() <= scrim[:, 1].max(), \
+            (f"a long domain spills out of the card: ink x {ink[:, 1].min()}-{ink[:, 1].max()} "
+             f"vs box {scrim[:, 1].min()}-{scrim[:, 1].max()}")
+        print("OK: a 29-char Latin domain is shrunk to fit the card, not spilled out of it")
     else:
         print("SKIP: render (Chrome not installed here)")
     print("caption --selfcheck OK")
