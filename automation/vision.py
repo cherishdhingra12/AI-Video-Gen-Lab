@@ -126,6 +126,71 @@ STATES = ("rendering", "done", "error", "captcha", "rate_limited", "login", "unk
 ANSWERED = []
 
 
+def _post(url: str, key: str, model: str, png: bytes, prompt: str, max_tokens: int):
+    """One request to one (gateway, model). Returns (text, the model the SERVER reports) and raises
+    whatever urllib raises, so the caller classifies the failure. Shared by _ask and _sees so a
+    probe travels the same road a real question does."""
+    body = json.dumps({
+        "model": model, "max_tokens": max_tokens, "temperature": 0,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url",
+             "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode()}},
+        ]}],
+    }).encode()
+    req = urllib.request.Request(
+        url.rstrip("/") + "/chat/completions", data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        d = json.load(r)
+    txt = (d.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    return txt, (d.get("model") or model)
+
+
+_SEES = {}          # (url, model) -> bool, decided once per process
+
+
+def _probe_image() -> bytes:
+    """A solid green frame, built rather than committed. The answer counts as 'I can see' only if
+    the model names a colour it was never told."""
+    import io as _io
+    from PIL import Image
+    buf = _io.BytesIO()
+    Image.new("RGB", (160, 120), (0, 200, 0)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _sees(url: str, key: str, model: str) -> bool:
+    """Has THIS (gateway, model) ever named the colour of an image it was sent?
+
+    The dangerous failure is not a gateway that is down — that scores 'not reviewed'. It is a
+    gateway that answers while BLIND: a router whose vision route resolves to a text model
+    (OmniRoute's auto/vision answered as claude-fable-5) returns a perfectly well-formed
+    {"same_person": true, "defects": []} for a frame it never saw, and every check downstream reads
+    that as a clean reel. An outage is loud; a blind 'clean' is invisible, which is why the route
+    has to prove it can see before its silence is believed.
+
+    Cached per (gateway, model) per process. A throttle on the PROBE is not blindness — the route
+    just answered a real question with an image attached — so it is not cached and not held
+    against it; a definite answer without the colour, or a hard error, is."""
+    k = (url, model)
+    if k not in _SEES:
+        prompt = "What single colour fills this image? Answer with just the colour word."
+        try:
+            txt, _ = _post(url, key, model, _probe_image(), prompt, 16)
+            _SEES[k] = "green" in txt.lower()
+        except urllib.error.HTTPError as e:
+            if e.code in _TRANSIENT:
+                return True                     # busy, not blind: let this answer stand
+            _SEES[k] = False
+        except Exception:
+            _SEES[k] = False
+        if not _SEES.get(k, True):
+            print(f"  [vision] {url} {model} cannot see (no colour named for the probe image) — "
+                  f"its 'clean' verdicts are discarded")
+    return _SEES[k]
+
+
 def _ask(png: bytes, prompt: str, max_tokens: int = 600, patience: int = 2) -> str:
     """Ask a vision model, failing over across gateways and routes. On a transient throttle /
     high-demand code (429/503), retry the whole sweep a few times with backoff — so a momentary
@@ -135,7 +200,6 @@ def _ask(png: bytes, prompt: str, max_tokens: int = 600, patience: int = 2) -> s
     sweep backoff make a dead gateway the most expensive thing in the run, and the craft gate
     makes dozens of vision calls per reel (routerhealth). If everything is cooling, everything is
     tried anyway — a memory of failure must never be the reason a check cannot run."""
-    b64 = base64.b64encode(png).decode()
     last = None
     for sweep in range(patience + 1):
         transient = False
@@ -150,25 +214,15 @@ def _ask(png: bytes, prompt: str, max_tokens: int = 600, patience: int = 2) -> s
             tried = throttled = 0
             for model in _models_for(url):          # … each with a model dialect it accepts
                 tried += 1
-                body = json.dumps({
-                    "model": model, "max_tokens": max_tokens, "temperature": 0,
-                    "messages": [{"role": "user", "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}},
-                    ]}],
-                }).encode()
                 try:
-                    req = urllib.request.Request(
-                        url.rstrip("/") + "/chat/completions", data=body,
-                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-                    with urllib.request.urlopen(req, timeout=90) as r:
-                        d = json.load(r)
-                    txt = (d.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+                    txt, served = _post(url, key, model, png, prompt, max_tokens)
                     if txt.strip():
+                        if not _sees(url, key, model):
+                            last = RuntimeError(f"{url} {model} answered without seeing the image")
+                            continue    # a blind route's answer is an outage wearing a verdict
                         # the model the SERVER reports, not the one we asked for: a gateway is free
                         # to route 'auto', and the difference is exactly what a failover hides
-                        ANSWERED.append({"url": url, "asked": model,
-                                         "model": d.get("model") or model})
+                        ANSWERED.append({"url": url, "asked": model, "model": served})
                         routerhealth.note_success(url)
                         return txt
                     routerhealth.note_failure(url, "empty content")
@@ -814,21 +868,33 @@ if __name__ == "__main__":
         _o_open, _o_ends, _o_models = urllib.request.urlopen, _endpoints, _models_for
         hits = []
 
+        def _reply(model, prompt, blind=False):
+            """A seeing stub names the probe's colour; a blind one answers everything with prose,
+            which is exactly how a router whose 'vision' route is a text model behaves."""
+            if "colour" in prompt:
+                return "I cannot see any image here." if blind else "green"
+            return "{}"
+
+        def _body(model, prompt, blind=False):
+            return io.BytesIO(json.dumps(
+                {"model": model, "choices": [{"message": {"content": _reply(model, prompt, blind)}}]}
+            ).encode())
+
         def _fake(req, timeout=90):
             m = json.loads(req.data)["model"]
+            prompt = req.data.decode()
             hits.append(m)
             if m == "dead-name":
                 raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
-            return io.BytesIO(json.dumps(
-                {"model": m, "choices": [{"message": {"content": "{}"}}]}).encode())
+            return _body(m, prompt)
 
         def _throttle_first(req, timeout=90):
             m = json.loads(req.data)["model"]
+            prompt = req.data.decode()
             hits.append(m)
             if m == "spent-model":
                 raise urllib.error.HTTPError(req.full_url, 429, "Too Many", {}, None)
-            return io.BytesIO(json.dumps(
-                {"model": m, "choices": [{"message": {"content": "{}"}}]}).encode())
+            return _body(m, prompt)
 
         def _throttled(req, timeout=90):
             raise urllib.error.HTTPError(req.full_url, 429, "Too Many", {}, None)
@@ -868,14 +934,14 @@ if __name__ == "__main__":
             hits.clear()
             _rh.clear()
             assert _ask(b"x", "hi") == "{}", "a 404 on one model must fall through to the next"
-            assert hits == ["dead-name", "good-name"], hits
+            assert hits[:2] == ["dead-name", "good-name"], hits
             # (3) a 429 on an aggregator is a PER-MODEL pool: the next model is unspent
             urllib.request.urlopen = _throttle_first
             globals()["_models_for"] = lambda u: ["spent-model", "fresh-model"]
             hits.clear()
             _rh.clear()
             assert _ask(b"x", "hi") == "{}", "a spent model must fall through to an unspent one"
-            assert hits == ["spent-model", "fresh-model"], hits
+            assert hits[:2] == ["spent-model", "fresh-model"], hits
             assert not _rh.cooling("http://t/v1")[0], \
                 "one exhausted model must not take the whole gateway out of the rotation"
             # a route is walled for being OUT OF CAPACITY, not merely for having a spent model
@@ -913,13 +979,37 @@ if __name__ == "__main__":
                 pass
             assert hits == ["m1"], f"a dead gateway must be walled once, not per model: {hits}"
             assert _rh.cooling("http://t/v1")[0], "a connection error must wall the route"
+            # (6) A ROUTE THAT ANSWERS WHILE BLIND IS AN OUTAGE, NOT A CLEAN REEL. A router whose
+            # 'vision' route is really a text model returns well-formed JSON for a frame it never
+            # saw — and 'no defects, same person' downstream is a reel nobody checked.
+            def _blind(req, timeout=90):
+                m = json.loads(req.data)["model"]
+                hits.append(m)
+                return _body(m, req.data.decode(), blind=True)
+
+            urllib.request.urlopen = _blind
+            globals()["_models_for"] = lambda u: ["blind-model"]
+            hits.clear(), _rh.clear(), _SEES.clear()
+            try:
+                _ask(b"x", "hi", patience=0)
+                raise AssertionError("a blind route's answer must never be returned as a verdict")
+            except RuntimeError as e:
+                assert "without seeing" in str(e), e
+            assert hits == ["blind-model"] * 2, f"one real call, then one probe: {hits}"
+            hits.clear()                     # …and the verdict is remembered, not re-bought
+            try:
+                _ask(b"x", "hi", patience=0)
+            except RuntimeError:
+                pass
+            assert hits == ["blind-model"], f"the probe is asked once per route: {hits}"
         finally:
             urllib.request.urlopen = _o_open
             globals()["_endpoints"], globals()["_models_for"] = _o_ends, _o_models
+            _SEES.clear()
             _rh.clear()
         print("OK: vision --selfcheck is offline (a 404 skips the model, a spent model skips to the "
-              "next pool, a dead gateway is walled once; live gateway round-trip: run without the "
-              "flag)")
+              "next pool, a dead gateway is walled once, a blind route is discarded; live gateway "
+              "round-trip: run without the flag)")
         raise SystemExit(0)
 
     # self-check: a real image round-trip proves the vision plumbing (base64 encode,
