@@ -381,21 +381,31 @@ def _anti(style: str) -> str:
 # A character tag is an ALL-CAPS word — the shot-lister is told to write the recurring subject
 # that way, and it is the only handle code has on WHO must not change.
 _CHAR_TAG = re.compile(r"\b[A-Z]{3,}\b")
+_CHAR_CUE = re.compile(r"\b(?:subject|character|protagonist|cast|person|figure)s?\b", re.I)
 _SENT = re.compile(r"(?<=[.!?।])\s+")
 
 
 def _char_clauses(world: str) -> list:
-    """The sentences of `world` that describe a character — the ones naming an ALL-CAPS tag.
-    A plan that writes no tag (the model does not always) still deserves a lock, so the opening
-    sentence is the fallback: the subject of a `world` is always its first line.
+    """The sentences of `world` that describe a CHARACTER — the ones naming an ALL-CAPS tag, or
+    otherwise saying "subject"/"character". A plan that writes neither (the model does not
+    always) still deserves a lock, and the sentence to fall back to is the LAST one, not the
+    first: `world` is specified as setting/place/time/light FIRST and "the recurring subject's
+    fixed description" LAST, so the opening sentence is the room.
+
+    Quoting the opening sentence (what this did) told the generator "the characters are exactly
+    these, verbatim: A cozy living-room in a small Indian town..." — the cast description never
+    reached the prompt at all, which is the same hole that let dadi ship three different women
+    playing one character. `dadaji-ka-kahani` (whose world names no tag) locked the ROOM and
+    left the grandfather to the model's memory.
 
     ponytail: the quoted description is capped (240 chars, 4 clauses) so a rambling `world`
     cannot make the lock longer than the prompt it is appended to. Raise the cap if a measured
     cast description is being cut mid-way and the faces drift."""
     sents = [s.strip() for s in _SENT.split((world or "").strip()) if s.strip()]
     named = [s for s in sents if _CHAR_TAG.search(s)]
+    cued = [s for s in sents if _CHAR_CUE.search(s)]
     out = []
-    for s in (named or sents[:1])[:4]:
+    for s in (named or cued or sents[-1:])[:4]:
         out.append(s if len(s) <= 240 else s[:240].rsplit(" ", 1)[0])
     return out
 
@@ -1105,6 +1115,14 @@ if __name__ == "__main__":
         assert _char_lock(_note), "a cast with no ALL-CAPS tag must still be locked"
         assert all(_char_lock(_note) in pr for pr in clip_prompts(_note, "flow")), \
             "the fallback lock must reach every clip prompt too"
+        # …and the fallback quotes the CAST, not the room. `world` is written setting-first,
+        # subject-LAST, so taking the opening sentence locked the room and never described the
+        # man — the lock said "the characters are exactly these: A cozy living-room…", which is
+        # the same hole the tag-less fallback exists to close (dadaji-ka-kahani shipped it).
+        _room = {"world": "A cozy living-room at dusk, amber light through the curtains. "
+                          "The recurring subject is an elderly grandfather in a white kurta."}
+        assert "grandfather" in _char_lock(_room), \
+            "a `world` with no ALL-CAPS tag must lock the SUBJECT, not the room it sits in"
         print("OK: one identity lock per reel, quoted from the character's own description and "
               "repeated VERBATIM on every clip — and it survives the length trim")
         print("OK: Vids and Flow get the labelled Veo brief, every other site the plain "
