@@ -498,14 +498,20 @@ def medium_verdict(samples, expected=None):
 # caller's job (qc._pair / assemble's sampler), because only the caller knows what to compare.
 
 _STYLE_PROMPT = (
-    "These are two frames from the SAME short film, side by side (left, right). Answer two "
-    "separate questions. (1) art style: are the two frames rendered in the SAME technique and "
-    "the same level of realism/detail, or is one clearly more photoreal, or more cartoonish, "
-    "than the other? (2) person: is the human in both frames the same individual — same face "
-    "shape, eyes, age, features? Clothing, lighting and pose may legitimately differ, and a "
-    "film may be 3-D animation: never report 'this is animation' as a difference. "
-    'Reply ONLY JSON: {"same_style": true|false, "style_detail": "short phrase", '
-    '"same_person": true|false, "person_detail": "short phrase"}'
+    "These are two frames from the SAME short film, side by side (left, right). Answer three "
+    "separate questions. (0) presence: is a PERSON clearly visible in the left frame, and in the "
+    "right frame? A room, a piece of furniture, a landscape, or a framed photograph hanging on a "
+    "wall is NOT a person in the frame. (1) art style: are the two frames rendered in the SAME "
+    "technique and the same level of realism/detail, or is one clearly more photoreal, or more "
+    "cartoonish, than the other? Ask this only when a person is visible in BOTH frames — a "
+    "still-life and a face have no common style to compare, and answering anyway turns the room "
+    "into a false 'style drift'. (2) person: is the human in both frames the same individual — "
+    "same face shape, eyes, age, features? Clothing, lighting and pose may legitimately differ, "
+    "and a film may be 3-D animation: never report 'this is animation' as a difference. "
+    'Reply ONLY JSON: {"people_visible": [true|false, true|false], "same_style": true|false, '
+    '"style_detail": "short phrase", "same_person": true|false|null, '
+    '"person_detail": "short phrase"}. If either frame shows no person, same_person MUST be null '
+    "— an absent person is not a different person."
 )
 
 
@@ -519,6 +525,15 @@ def compare_style(png_pair: bytes):
     if not isinstance(d.get("same_style"), bool):
         return None                                   # unparseable -> not reviewed
     out = {"same_style": d["same_style"]}
+    # WHICH FRAMES HAVE A PERSON IN THEM. The style and person questions are both about how a
+    # CHARACTER is rendered, so a pair where one frame is furniture cannot answer either — asked
+    # anyway, the model says "one is photorealistic, the other is cartoonish" and the room is
+    # convicted as style drift (measured 2026-10-14: the wall of framed photographs in dadaji clip
+    # 1 was flagged as a reel whose clips do not match). None when unanswered -> the caller keeps
+    # the old, stricter behaviour rather than quietly widening the gate.
+    vis = d.get("people_visible")
+    out["people_visible"] = ([bool(x) for x in vis] if isinstance(vis, list) and len(vis) == 2
+                             and all(isinstance(x, bool) for x in vis) else None)
     for k in ("style_detail", "person_detail"):
         v = str(d.get(k) or "").strip()
         out[k] = "" if v.lower() in _NON_DEFECT or v.lower() in _ECHO else v[:160]
@@ -546,7 +561,7 @@ def style_scan(frames, anchor=0):
     clip 0, the first one finished, which is what locks the site and the character for the reel —
     and return:
 
-        {'flagged': [indices], 'whole_reel': bool, 'detail': str,
+        {'flagged': [indices], 'unreviewed': [indices], 'whole_reel': bool, 'detail': str,
          'people': {index: bool}, 'person_detail': str}
 
     or None when the gateway could not answer. The SAME comparison answers two questions —
@@ -555,22 +570,35 @@ def style_scan(frames, anchor=0):
     character, keyed by clip index, so a drifting face can be named as precisely as a drifting
     style.)
 
+    Both questions are about how a CHARACTER is drawn, so a pair where one frame holds no person
+    answers neither: `unreviewed` names those clips. They are not a pass — a person should still
+    look — so the caller must say so out loud rather than let silence read as clean.
+
     `whole_reel` is the honest guard: when MORE than half the clips differ from the anchor the
     anchor itself is the odd one out, and re-shooting the majority would be re-shooting the reel.
     That is a decision for a human, not a requeue, so those come back flagged as whole-reel and
     the caller must not auto-regenerate. It also protects the grandfathered photoreal reels: a
     photoreal reel whose scenes read 'different' to each other is never silently re-shot."""
     if len(frames) < 2:
-        return {"flagged": [], "whole_reel": False, "detail": "", "people": {},
+        return {"flagged": [], "unreviewed": [], "whole_reel": False, "detail": "", "people": {},
                 "person_detail": ""}
     a = frames[anchor]
-    flagged, detail, people, pdetail = [], "", {}, ""
+    flagged, unreviewed, detail, people, pdetail = [], [], "", {}, ""
     for i, f in enumerate(frames):
         if i == anchor:
             continue
         r = compare_style(_pair(a, f))
         if r is None:
             return None                               # not reviewed, never a silent pass
+        seen = r.get("people_visible")
+        if seen is not None and not all(seen):
+            # ONE FRAME HAS NO PERSON IN IT, so this pair cannot testify about the character's
+            # look or identity — that is the question it was asked. It is not a pass (a person
+            # should still look), so it comes back in its own channel. The per-clip medium check
+            # is what catches a still-life that rendered photoreal in an animated reel; this
+            # comparison only ever judged character shots against each other.
+            unreviewed.append(i)
+            continue
         if not r["same_style"]:
             flagged.append(i)
             detail = detail or r["style_detail"]
@@ -579,7 +607,7 @@ def style_scan(frames, anchor=0):
             if not r["same_person"]:
                 pdetail = pdetail or r["person_detail"]
     whole = len(flagged) * 2 > len(frames)
-    return {"flagged": flagged, "whole_reel": whole,
+    return {"flagged": flagged, "unreviewed": unreviewed, "whole_reel": whole,
             "detail": detail or "every clip matches the anchor",
             "people": people, "person_detail": pdetail}
 
@@ -819,6 +847,30 @@ if __name__ == "__main__":
             s = style_scan(_f(4))
             assert s["flagged"] == [2] and not s["whole_reel"], f"the odd clip must be named: {s}"
             assert s["detail"] == "much more realist2", "the reason must travel with the blame"
+            # A FRAME WITH NO PERSON IN IT CANNOT TESTIFY. A still-life (a table, a wall of framed
+            # photographs) against a character close-up is a comparison with no common subject,
+            # and the model still answers "one is photorealistic, the other is cartoonish" — which
+            # is how dadaji clip 1 was convicted on 2026-10-14 for a frame that was a photo wall.
+            # It is not a pass: the clip comes back in the unreviewed channel, and a person looks.
+            globals()["compare_style"] = lambda p: {"same_style": False, "style_detail": "one photoreal",
+                                                    "same_person": False, "person_detail": "no face",
+                                                    "people_visible": [True, False]}
+            s = style_scan(_f(4))
+            assert s["flagged"] == [] and s["unreviewed"] == [1, 2, 3] and s["people"] == {}, \
+                f"a pair with no person in one frame convicts nobody: {s}"
+            assert not s["whole_reel"], "an unreviewed clip is not a whole-reel problem either"
+            globals()["compare_style"] = lambda p: {"same_style": False, "style_detail": "one photoreal",
+                                                    "same_person": False, "person_detail": "no face",
+                                                    "people_visible": [False, False]}
+            assert style_scan(_f(4))["unreviewed"] == [1, 2, 3], "neither frame has a person"
+            # two CHARACTER shots that differ are still convicted, and an ANSWERLESS presence
+            # question keeps the old stricter behaviour rather than quietly widening the gate
+            globals()["compare_style"] = lambda p: {"same_style": False, "style_detail": "much more realist2",
+                                                    "same_person": True, "person_detail": "",
+                                                    "people_visible": [True, True]}
+            s = style_scan(_f(4))
+            assert s["flagged"] == [1, 2, 3] and s["unreviewed"] == [], \
+                f"both frames hold a person -> the look question is answerable: {s}"
             globals()["compare_style"] = lambda p: None
             assert style_scan(_f(2)) is None, "gateway down -> None, never a silent pass"
             assert style_scan(_f(1))["flagged"] == [], "one clip has nothing to compare against"

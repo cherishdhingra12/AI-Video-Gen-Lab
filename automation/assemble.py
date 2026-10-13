@@ -424,6 +424,11 @@ def style_preflight(clips):
             print(f"  NOTE: every clip differs from the first ({scan['detail']}) — that is the "
                   "whole reel's look, not one bad clip; building, the owner settles this")
         else:
+            for i in scan.get("unreviewed") or []:
+                # a clip whose sampled frame holds no person: the look check had nothing to
+                # compare, which is not a pass — say so, and let the eye be the backstop.
+                print(f"  WARNING: clip {i} could not be compared to clip 0 (no person in its "
+                      f"frame) — check it by eye")
             for i in scan["flagged"]:
                 bad.append((frames[i][0], f"does not match the reel's look ({scan['detail']})"))
     if bad:
