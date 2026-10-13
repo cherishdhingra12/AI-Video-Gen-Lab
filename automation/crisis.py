@@ -51,6 +51,7 @@ CRISES = os.path.join(_ROOT, "crises")          # runtime state, gitignored (a t
 
 KINDS = {
     "no-gateway": "no LLM route answered — a reel cannot even be written",
+    "bad-plan": "the shot list cannot be filmed as written — nothing was queued, nothing spent",
     "clip-failed": "a clip spent every retry: its reel can never assemble on its own",
     "requeue-capped": "the gate rejected the same clip twice: the feedback is not the problem",
 }

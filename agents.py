@@ -497,14 +497,16 @@ MEDIUM_REQUIREMENT = ("REQUIRED OUTPUT: 3-D ANIMATED VIDEO — a stylized animat
 VEO_SITES = ("flow", "googlevids", "veo")
 
 
-def _fit(lead: str, body: str, tail: str, chars: int, sep: str) -> str:
+def _fit(lead: str, body: str, tail: str, chars: int, sep: str, floor: str = "") -> str:
     """Trim to `chars` in the order that keeps the GUARANTEES.
 
     The tail is the guarantee set (look, no-text, anti-photoreal, the identity lock) and the
     lead carries the medium requirement, so neither is what gives: a shorter action still
     renders the same person in the same look, a lock trimmed off the end of a prompt does not.
-    The SHOT shortens first, then the lead goes (the LOOK line restates the whole style
-    anyway), and only a tail that cannot fit on its own falls back to a hard cut.
+    The SHOT shortens first, then the lead goes (the LOOK line restates the whole style anyway)
+    — but `floor`, the irreducible part of the lead, stays. Dropping the whole lead used to drop
+    MEDIUM_REQUIREMENT with it, which IS the 3-D rule: the longest clip in the plan, the one
+    that most needed telling, was the one that could render photoreal.
     """
     seg = sep.join(x for x in (lead, body, tail) if x)
     if len(seg) <= chars:
@@ -514,12 +516,12 @@ def _fit(lead: str, body: str, tail: str, chars: int, sep: str) -> str:
         fitted = sep.join(x for x in (lead, body[:keep].rsplit(" ", 1)[0], tail) if x)
         if len(fitted) <= chars:
             return fitted
-    seg = sep.join(x for x in (body, tail) if x)
+    seg = sep.join(x for x in (floor, body, tail) if x)
     if len(seg) <= chars:
         return seg
-    keep = chars - len(tail) - len(sep) - 1
+    keep = chars - len(floor) - len(tail) - 2 * len(sep) - 1
     if keep > 0:
-        fitted = sep.join(x for x in (body[:keep].rsplit(" ", 1)[0], tail) if x)
+        fitted = sep.join(x for x in (floor, body[:keep].rsplit(" ", 1)[0], tail) if x)
         if len(fitted) <= chars:
             return fitted
     return seg[:chars - 1].rsplit(" ", 1)[0] + "."
@@ -590,8 +592,59 @@ def clip_prompts(shot: dict, site: str = "") -> list:
             body = [world, action, says]
             tail = [style, NO_TEXT, anti, lock]
         out.append(_fit(lead, sep.join(x for x in body if x),
-                        sep.join(x for x in tail if x), PROMPT_CHARS, sep))
+                        sep.join(x for x in tail if x), PROMPT_CHARS, sep,
+                        floor=MEDIUM_REQUIREMENT))
     return out
+
+
+# The shot-list contract build_shotlist asks for, enforced in code by validate_plan.
+CLIPS_MIN, CLIPS_MAX = 3, 6
+
+
+def validate_plan(shot: dict, prompts: list = None) -> dict:
+    """Lint the plan BEFORE a credit is spent on it (owner fix, 2026-10-14).
+
+    Every item here is a defect that used to be found by a person watching a finished reel —
+    four to six generations later, all of them already paid for. `prompts` is what will actually
+    be pasted into a site, so a caller cannot lint a plan it is not shipping; when it is not
+    given it is built here. bad = refuse to enqueue, warn = the reel can still be made but not
+    the one that was asked for.
+    """
+    bad, warn = [], []
+    clips = shot.get("clips") or []
+    if not CLIPS_MIN <= len(clips) <= CLIPS_MAX:
+        bad.append(f"{len(clips)} clips — a reel is {CLIPS_MIN}-{CLIPS_MAX}")
+    idx = [c.get("idx") for c in clips]
+    if sorted(idx) != list(range(len(clips))):
+        bad.append(f"clip idx should be 0..{len(clips) - 1}, got {idx}")
+    for c in clips:
+        if not (c.get("prompt") or "").strip():
+            bad.append(f"clip {c.get('idx')}: empty prompt")
+    if not (shot.get("world") or "").strip():
+        bad.append("no world — every clip shares one set, and the identity lock is built from it")
+    style = (shot.get("style") or "").strip()
+    if not _is_animated(style):
+        warn.append("style is missing or not animation — the house 3-D look replaces it, so the "
+                    "reel loses the one thing the plan was written to look like")
+    if clips and not any((c.get("dialogue") or "").strip() for c in clips):
+        warn.append("no clip speaks — the reel will have no narration")
+    prompts = clip_prompts(shot) if prompts is None else prompts
+    if len(prompts) != len(clips):
+        bad.append(f"{len(prompts)} prompts built for {len(clips)} clips")
+    else:
+        lock = _char_lock(shot)
+        for i, pr in enumerate(prompts):
+            if not pr.startswith(MEDIUM_REQUIREMENT[:40]):
+                bad.append(f"clip {i}: the 3-D medium requirement is gone from the prompt")
+            if NO_TEXT not in pr:
+                bad.append(f"clip {i}: the no-text rule is gone from the prompt")
+            if not _anti(style if _is_animated(style) else HOUSE_STYLE) in pr:
+                bad.append(f"clip {i}: the anti-photoreal negation is gone from the prompt")
+            if lock and lock not in pr:
+                bad.append(f"clip {i}: the identity lock is gone from the prompt")
+            if len(pr) > PROMPT_CHARS:
+                bad.append(f"clip {i}: {len(pr)} chars overflows the site's box ({PROMPT_CHARS})")
+    return {"bad": bad, "warn": warn}
 
 
 _PRESENTATION_SCHEMA = """{
@@ -997,6 +1050,34 @@ if __name__ == "__main__":
         _blk = _char_lock(_big)
         assert _blk and all(_blk in pr for pr in clip_prompts(_big)), \
             "the identity lock must survive the length trim — the shot gives, the lock does not"
+        # …and so must the medium requirement. When the guarantees alone nearly fill the box the
+        # old trim dropped the lead WHOLE — MEDIUM_REQUIREMENT, the rule that the frame is 3-D at
+        # all, went with it and the clip was free to render photoreal. The lead has a floor now.
+        _fat = dict(_shot, style="Soft stylized 3-D animation. " + ("very detailed render note. " * 120))
+        assert all(pr.startswith(MEDIUM_REQUIREMENT) for pr in clip_prompts(_fat, "googlevids")), \
+            "a prompt whose tail fills the box must still lead with the medium requirement"
+        assert any("no-text" in b for b in validate_plan(_fat)["bad"]), \
+            "a plan whose own style eats the box must be REFUSED before it is queued, not " \
+            "shipped with its no-text rule and identity lock cut off the end"
+
+        # THE PLAN LINT. These are the defects that used to be found by a person watching the
+        # finished reel, four to six paid-for generations later.
+        assert not validate_plan(_shot)["bad"], "a well-formed plan must pass the lint"
+        assert any("clips" in b
+                   for b in validate_plan(dict(_shot, clips=_shot["clips"][:2]))["bad"]), \
+            "a two-clip plan must be refused before it is queued, not after it renders"
+        assert any("idx" in b for b in validate_plan(dict(_shot, clips=[
+            {"idx": 0, "prompt": "one"}, {"idx": 3, "prompt": "two"},
+            {"idx": 4, "prompt": "three"}]))["bad"]), "idx must be a continuous 0..n-1"
+        assert any("world" in b for b in validate_plan(dict(_shot, world=""))["bad"]), \
+            "a plan with no shared world has no identity lock either"
+        _nw = validate_plan(dict(_shot, style="photoreal live action, real film grain"))
+        assert not _nw["bad"] and any("style" in w for w in _nw["warn"]), \
+            "code repairs a non-animated style, so it is a warning, not a refusal"
+        # the lint has to BITE on what it exists to catch — a prompt that lost a guarantee
+        _stripped = [p.replace(MEDIUM_REQUIREMENT, "", 1) for p in clip_prompts(_shot)]
+        assert any("medium" in b for b in validate_plan(_shot, _stripped)["bad"]), \
+            "the lint must catch a prompt that lost the 3-D rule — otherwise it is decoration"
 
         # --- the SITE SHAPE: same words, written the way Vids and Flow read a prompt ---------
         # Vids and Flow are both Veo 3.1 and the waterfall's two primaries, so they get a

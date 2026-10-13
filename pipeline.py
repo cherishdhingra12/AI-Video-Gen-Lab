@@ -48,12 +48,12 @@ def _slug(title: str) -> str:
     return "reel-" + hashlib.sha1(raw).hexdigest()[:8]
 
 
-def main():
+def main(st=None):
     idea = " ".join(sys.argv[1:]).strip() or input("Idea: ").strip()
     if not idea:
         sys.exit("need an idea")
 
-    st = State()
+    st = st or State()
     # The brain fires BEFORE anything is written: its learned craft rules are put in front of all
     # three agents (agents._brief), and re-seeding here means a lesson added to qc.LESSONS since
     # the last run reaches this one. This is the pre-generation trigger the owner asked for — the
@@ -96,6 +96,31 @@ def main():
         f.write(f"# {shot.get('title')}\n\nIDEA: {idea}\n\n{script}")
     with open(os.path.join(pdir, "shotlist.json"), "w") as f:
         json.dump(shot, f, indent=2)
+
+    # THE PLAN LINT — the last gate before a credit is committed (owner fix, 2026-10-14). Until
+    # now a plan that could not be filmed was found by watching the finished reel: four to six
+    # generations, all of them paid for. The prompts linted here are the ones that would be
+    # pasted into a site, so nothing is queued that has lost a guarantee — and the plan is on
+    # disk first, so a refusal leaves the evidence in front of whoever re-runs it.
+    plan = agents.validate_plan(shot, prompts)
+    for w in plan["warn"]:
+        print(f"  ! {w}")
+    if plan["bad"]:
+        import crisis
+        print("\nthe shot list cannot be filmed as written — nothing was queued:")
+        for b in plan["bad"]:
+            print(f"   - {b}")
+        crisis.raise_crisis(
+            "bad-plan", subject=shot.get("title") or idea[:40],
+            detail="; ".join(plan["bad"])[:480],
+            tried=[f"{len(shot.get('clips') or [])} clips",
+                   f"style: {(shot.get('style') or 'none')[:60]}"],
+            check="a shot list the model can actually film",
+            needs=f"re-run the kickoff, or fix projects/{slug}/shotlist.json and queue it "
+                  f"yourself — no credit has been spent either way",
+            st=st)
+        st.close()
+        raise SystemExit(2)
 
     # agent 3 — the reel's identity + its caption cards. These are the two files the owner used
     # to hand-write per reel, which is why the engine could never finish one on its own. The
@@ -155,5 +180,53 @@ if __name__ == "__main__":
         assert a == _slug("स्मृतियों का धागा"), "the fallback must be stable across runs"
         assert _slug("") != _slug("   "), "even empty titles must not collide"
         print("OK: a Hindi title gets a stable unique folder, never the shared 'project'")
+
+        # THE PLAN LINT RUNS BEFORE THE ENQUEUE. The kickoff is driven end to end with the LLM
+        # stubbed and a one-clip shot list, so the only acceptable outcome is a refusal with
+        # NOTHING queued — the whole point is that this costs no generation.
+        import tempfile
+        import crisis as _crisis
+        class _St:
+            def __init__(self):
+                self.queued = []
+            def film_lessons(self):
+                return []
+            def learn_lesson(self, *a, **k):
+                return []
+            def other_identities(self, slug):
+                return []
+            def propose_lesson(self, **k):
+                pass
+            def add_job(self, *a, **k):
+                self.queued.append(a)
+            def close(self):
+                pass
+        _bad = {"title": "एक", "slug": "lint-check", "aspect": "9:16",
+                "world": "A room at night. BABUJI sits alone.",
+                "style": "soft stylized 3-D animation, rounded shapes",
+                "clips": [{"idx": 0, "prompt": "He smiles.", "dialogue": ""}]}
+        _tmp, _dir, _argv = tempfile.mkdtemp(), _DIR, sys.argv
+        _orig = agents.write_script, agents.build_shotlist, music.choose, _crisis.CRISES
+        _st = _St()
+        try:
+            globals()["_DIR"] = _tmp                     # never litter the real projects/
+            _crisis.CRISES = os.path.join(_tmp, "crises")
+            sys.argv = ["pipeline.py", "a test reel"]
+            agents.write_script = lambda idea: "script"
+            agents.build_shotlist = lambda script: _bad
+            music.choose = lambda *a, **k: None
+            try:
+                main(st=_st)
+                raise AssertionError("a one-clip plan must be refused, never queued")
+            except SystemExit as e:
+                assert e.code == 2, f"a bad plan exits 2, got {e.code}"
+            assert not _st.queued, "nothing may be queued for a plan that cannot be filmed"
+            assert os.path.exists(os.path.join(_tmp, "projects", "lint-check", "shotlist.json")), \
+                "the bad plan is left on disk — a refusal nobody can inspect is just a crash"
+        finally:
+            globals()["_DIR"] = _dir
+            sys.argv = _argv
+            agents.write_script, agents.build_shotlist, music.choose, _crisis.CRISES = _orig
+        print("OK: a shot list that cannot be filmed is refused by name, before anything is queued")
     else:
         main()
