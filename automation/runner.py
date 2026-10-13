@@ -37,6 +37,7 @@ CLIPS_DIR = os.path.join(ROOT, "clips")            # per-project downloaded clip
 PROJECTS_DIR = os.path.join(ROOT, "projects")      # finished reels land here (final.mp4)
 MAX_RETRIES = 3
 REQUEUE_CAP = 2                              # times the GATE may send one clip back, then a human
+DOWNLOAD_TRIES = 3                           # in-session fetch attempts before a wall (the clip exists)
 POLL_EVERY = 8.0                             # seconds between poll looks
 POLL_TIMEOUT = 12 * 60                       # give a render up to 12 min
 
@@ -99,6 +100,74 @@ def _gave_up(job, site: str, detail: str) -> None:
         needs=f"a person: render clip {job['idx']} by hand on {site} (or replace that shot)")
 
 
+def _early_look(project: str, dest: str) -> list:
+    """Look at the reel's FIRST clip before paying for the second one (owner fix, 2026-10-14).
+
+    Every craft check today runs on the FINISHED reel, so a source that renders this reel frozen
+    or photoreal is discovered four to six generations later — all of them already paid for. The
+    first clip is the cheap tell: one ffmpeg pass and a handful of VISION calls (free-tier, not
+    video credits).
+
+    The checks are qc's OWN, run against this one clip as if it were the whole reel, so what this
+    asks for and what the gate asks for can never be two different things. An UNREVIEWED (gateway
+    down) is NOT a defect here — it is an outage, the gate would say the same, and a person
+    decides; parking a reel on a gateway outage is the bug, not the fix."""
+    import qc
+    probs = []
+    try:
+        if qc._frozen_still(dest):
+            probs.append("the clip is a frozen still (all sampled frames identical)")
+    except Exception as e:                                  # noqa: BLE001 — a look that could not
+        print(f"  first-look playability skipped ({str(e)[:80]})")     # run is not a defect
+    try:
+        reel = qc.Reel(os.path.join(PROJECTS_DIR, project))
+        reel.final = dest                                   # THIS clip, judged as the reel
+        probs += [p for p in qc.check_style_uniform(reel) if not isinstance(p, qc.Unreviewed)]
+    except Exception as e:                                  # noqa: BLE001
+        print(f"  first-look style check skipped ({str(e)[:80]})")
+    return probs
+
+
+def _duration(path: str) -> float:
+    """A file ffprobe can time is a file that got there. 0 = missing, or not a video."""
+    try:
+        import qc
+        return qc._duration(path)
+    except Exception:                                       # noqa: BLE001
+        return 0.0
+
+
+def _already_downloaded(job) -> str:
+    """The finished clip a row is ALREADY holding — '' when there is nothing to keep.
+
+    Only a mid-DOWNLOAD row can be holding one: 'downloading' is the step immediately before
+    'done', so a shutdown there leaves a complete file and re-driving the row would buy the same
+    clip twice. A QUEUED row is never one, however tempting the file looks — the gate requeues a
+    clip it rejected while the rejected file is still on disk, and keeping that file would skip
+    the re-shoot the gate asked for.
+
+    ponytail: 'ffprobe can time it' stands in for 'the fetch finished'. A truncated download that
+    still carries a readable header would be kept as done — the assembly gate's own playability
+    check refuses such a cut, which is where it gets caught. Upgrade to a .part file + rename if
+    a truncated clip ever reaches the gate."""
+    dest = os.path.join(CLIPS_DIR, job["project"], f"clip_{job['idx']:03d}.mp4")
+    return dest if job["status"] == "downloading" and _duration(dest) > 0 else ""
+
+
+def _park_reel(st: State, project: str, why: str) -> int:
+    """Stop spending on a reel whose first clip will not come right.
+
+    A 'failed' row is not a retry — the queue skips it and a resume does not re-drive it — so the
+    reel costs nothing more until a person looks. Without this the loop simply moves on to clip 1
+    and renders the other four scenes of a film that can never assemble."""
+    n = 0
+    for c in st.project_clips(project):
+        if c["status"] == "queued":
+            st.set_status(c["id"], "failed", error=f"reel parked: {why}"[:300])
+            n += 1
+    return n
+
+
 def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
     """Drive one clip end to end. Returns final status. Any Wall -> cool down +
     requeue (not a failure). Each step commits before the next, so a crash resumes."""
@@ -155,19 +224,54 @@ def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
             st.spend_credit(site, account, adapter.credit_cost)
 
             deadline = time.time() + POLL_TIMEOUT
-            while time.time() < deadline:
+            while True:
+                # The deadline is tested AFTER the poll, so it stops the next SLEEP rather than the
+                # look: one more poll lands past the timeout instead of one POLL_EVERY before it.
+                # That look is worth a generation — a render that finishes in the last seconds used
+                # to be walled and re-submitted from scratch, buying the same clip twice.
                 state = adapter.poll(s)
                 if state == "done":
                     st.set_status(job["id"], "downloading")
-                    adapter.download(s, dest)
+                    # The clip EXISTS on the site now. A failed fetch must never cost a second
+                    # generation, so the download is retried while the page is still open and
+                    # alive — a wall here requeues the clip, and the retry submits a brand-new
+                    # render for something the site has already made.
+                    for attempt in range(DOWNLOAD_TRIES):
+                        try:
+                            adapter.download(s, dest)
+                            break
+                        except Wall as w:
+                            if attempt == DOWNLOAD_TRIES - 1:
+                                raise
+                            print(f"  download of clip {job['idx']} failed ({w.detail[:70]}) — "
+                                  f"retrying in-session, the render is already on the site")
+                            time.sleep(5)
+                    # THE FIRST LOOK: the reel's own first clip, before the other scenes are bought
+                    if job["idx"] == 0:
+                        look = _early_look(job["project"], dest)
+                        if look:
+                            why = "; ".join(look)[:300]
+                            print(f"  {job['project']}: the FIRST clip came back wrong — stopping "
+                                  f"the reel here instead of rendering the rest: {why}")
+                            os.replace(dest, f"{dest}.rejected-{int(time.time())}")
+                            kept = _regenerate(st, os.path.join(PROJECTS_DIR, job["project"]),
+                                               [job["idx"]], reason=f"the first look: {why}",
+                                               check="early-look")
+                            if not kept:                      # the re-shoot budget is spent
+                                n = _park_reel(st, job["project"], why)
+                                print(f"  {job['project']}: parked — {n} clip(s) it no longer "
+                                      f"needs will not be rendered")
+                                st.set_status(job["id"], "failed", error=f"first look: {why}"[:300])
+                            return "reshoot"
                     st.set_status(job["id"], "done", video_path=dest)
                     br.note_success(site, account)
                     return "done"
                 if state in ("captcha", "rate_limited", "login", "error"):
                     kind = {"rate_limited": "rate_limit"}.get(state, state)
                     raise Wall(kind, f"seen while polling ({state})")
+                if time.time() >= deadline:
+                    raise Wall("block", "render timed out")
                 time.sleep(POLL_EVERY)
-            raise Wall("block", "render timed out")
 
     except Wall as w:
         if w.kind == "credits":
@@ -205,6 +309,8 @@ def _archive_cut(project_dir):
     honest: the signature a human put on that cut (qc eye_review, keyed to qc.Reel.fp) is a
     signature on a picture that no longer exists."""
     moved = []
+    if not os.path.isdir(project_dir):
+        return moved                    # nothing on disk to move (the first look can fire first)
     for f in os.listdir(project_dir):
         if f in ("final_veo.mp4", "final.mp4"):
             d = os.path.join(project_dir, "rejected")
@@ -433,6 +539,14 @@ def loop(once: bool = False, headless: bool = True):
         print(f"  brain preflight skipped ({str(e)[:100]})")
     # 1) resume anything caught mid-flight by a shutdown — as if it never happened
     for job in st.resume():
+        # NEVER RE-SUBMIT A RENDER THAT ALREADY EXISTS: a shutdown between the download and the
+        # 'done' commit leaves the finished clip on disk, and re-driving that row buys it again.
+        kept = _already_downloaded(job)
+        if kept:
+            st.set_status(job["id"], "done", video_path=kept)
+            print(f"  clip {job['idx']} of {job['project']} was already downloaded — keeping it, "
+                  f"not rendering it again")
+            continue
         print(f"resuming clip {job['project']}#{job['idx']} (was {job['status']})")
         st.set_status(job["id"], "queued")          # re-drive from a clean step
     # 2) drain the queue
@@ -476,6 +590,12 @@ if __name__ == "__main__":
         br = Brain(st)
         st.set_credits("kling", "a1", remaining=100)
 
+        # The first look judges clip 0 with qc's OWN medium check, which is a live vision call —
+        # and this self-check promises no network. Stub it once for the whole block: the
+        # classifier is qc's dependency and qc's own self-check is where it is tested.
+        import vision
+        vision.medium_of = lambda png: "3d"
+
         # a fake adapter: first call walls (captcha), second succeeds and writes a clip
         calls = {"n": 0}
         fake = types.SimpleNamespace(name="kling", credit_cost=10)
@@ -487,8 +607,9 @@ if __name__ == "__main__":
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             import subprocess
             # a real clip CARRIES ITS OWN AUDIO — that is where the narration lives
-            # (WAVELENGTH.md §3), and a silent clip is a defect the assembler must reject.
-            subprocess.run(["ffmpeg","-y","-f","lavfi","-i","color=c=blue:s=720x1280:d=6",
+            # (WAVELENGTH.md §3), and a silent clip is a defect the assembler must reject — and it
+            # MOVES: a solid colour is a frozen still, which the first look now catches.
+            subprocess.run(["ffmpeg","-y","-f","lavfi","-i","testsrc=size=720x1280:rate=24:duration=6",
                             "-f","lavfi","-i","sine=frequency=440:d=6",
                             "-pix_fmt","yuv420p","-shortest",dest],
                            capture_output=True, check=True)
@@ -583,7 +704,7 @@ if __name__ == "__main__":
         def fake2_dl(s, dest):
             import subprocess as _sp
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-            _sp.run(["ffmpeg","-y","-f","lavfi","-i","color=c=green:s=720x1280:d=4",
+            _sp.run(["ffmpeg","-y","-f","lavfi","-i","testsrc=size=720x1280:rate=24:duration=4",
                      "-f","lavfi","-i","sine=frequency=440:d=4",
                      "-pix_fmt","yuv420p","-shortest",dest],
                     capture_output=True, check=True)
@@ -825,6 +946,99 @@ if __name__ == "__main__":
             "the record must say why no other site was tried: the reel is locked to one"
         print("OK: a gate finding requeues the named clip with the reason, moves the rejected cut, "
               "and STOPS at the cap instead of looping")
+
+        # THE FIRST LOOK (owner fix, 2026-10-14). Every craft check runs on the FINISHED reel, so a
+        # source that renders this reel photoreal is found four to six generations later — all of
+        # them paid for. The reel's OWN first clip is the cheap tell: it is judged by qc's own
+        # medium check, the rejection goes into clip 0's prompt as a re-shoot, and when that budget
+        # is spent the rest of the reel is PARKED instead of rendered into a film that cannot
+        # assemble.
+        import subprocess
+        import qc as _q
+        est = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+        ebr = Brain(est)
+        est.set_credits("googlevids", "g1", remaining=20)
+        bought = []
+        elook = types.SimpleNamespace(name="googlevids", credit_cost=1)
+        elook.submit = lambda s, prompt: bought.append(prompt)
+        elook.poll = lambda s: "done"
+        def elook_dl(s, dest):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            subprocess.run(["ffmpeg", "-y", "-f", "lavfi",
+                            "-i", "testsrc=size=720x1280:rate=24:duration=4",
+                            "-f", "lavfi", "-i", "sine=frequency=440:d=4",
+                            "-pix_fmt", "yuv420p", "-shortest", dest],
+                           capture_output=True, check=True)
+            return dest
+        elook.download = elook_dl
+        runner._adapter = lambda site: elook
+        _q._CLIPS_ROOT = runner.CLIPS_DIR              # the clips this test just wrote
+        vision.medium_of = lambda png: "photoreal"     # the source ignored the 3-D requirement
+        for i in range(3):
+            est.add_job("firstlook", i, f"scene {i}", site="googlevids")
+        e0 = est.db.execute("SELECT * FROM jobs WHERE project='firstlook' AND idx=0").fetchone()
+        assert runner.process_job(est, ebr, e0, headless=True) == "reshoot"
+        r0 = est.db.execute("SELECT * FROM jobs WHERE project='firstlook' AND idx=0").fetchone()
+        assert r0["status"] == "queued" and r0["requeues"] == 1, dict(r0)
+        assert "RE-SHOOT —" in r0["prompt"] and "3-D" in r0["prompt"], \
+            "the rejection is folded into the re-shoot's prompt, once"
+        assert len(bought) == 1, "the first look must not buy a second clip"
+        assert est.project_clips("firstlook")[1]["status"] == "queued", \
+            "the reel's other scenes wait while clip 0 is re-shot"
+        # …and when the re-shoot budget is spent, the reel STOPS costing generations
+        est.db.execute("UPDATE jobs SET requeues=? WHERE project='firstlook' AND idx=0",
+                       (runner.REQUEUE_CAP,))
+        est.db.commit()
+        e0 = est.db.execute("SELECT * FROM jobs WHERE project='firstlook' AND idx=0").fetchone()
+        assert runner.process_job(est, ebr, e0, headless=True) == "reshoot"
+        statuses = {c["idx"]: c["status"] for c in est.project_clips("firstlook")}
+        assert set(statuses.values()) == {"failed"}, \
+            f"a reel whose first clip will not come right must be parked, not rendered: {statuses}"
+        assert len(bought) == 2, \
+            f"it buys exactly one more render, never the other scenes: {len(bought)}"
+        print("OK: the reel's FIRST clip is judged before the rest are bought — a photoreal or "
+              "frozen opener re-shoots once, then PARKs the reel instead of rendering four more "
+              "scenes of a film that can never assemble")
+
+        # NEVER BUY THE SAME RENDER TWICE (owner fix, 2026-10-14). The clip EXISTS on the site the
+        # moment the poll says done, so a failed fetch is retried while the page is still open — a
+        # wall there requeues the clip and the retry submits a brand-new render for something the
+        # site has already made. And a shutdown between the download and the 'done' commit leaves
+        # a finished file on disk, which the resume path must KEEP.
+        dst = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+        dbr = Brain(dst)
+        vision.medium_of = lambda png: "3d"             # a good clip: the FETCH is what is tested
+        dst.set_credits("kling", "a1", remaining=20)
+        tried = {"fetch": 0, "submit": 0}
+        dad = types.SimpleNamespace(name="kling", credit_cost=1)
+        dad.submit = lambda s, prompt: tried.__setitem__("submit", tried["submit"] + 1)
+        dad.poll = lambda s: "done"
+        def dad_dl(s, dest):
+            tried["fetch"] += 1
+            if tried["fetch"] < 3:
+                raise Wall("selector", "download control not found")
+            return elook_dl(s, dest)
+        dad.download = dad_dl
+        runner._adapter = lambda site: dad
+        dst.add_job("fetchtest", 0, "a clip that downloads on the third try", site="kling")
+        _dj = dst.db.execute("SELECT * FROM jobs WHERE project='fetchtest'").fetchone()
+        assert runner.process_job(dst, dbr, _dj, headless=True) == "done"
+        assert tried["fetch"] == 3 and tried["submit"] == 1, \
+            f"a flaky fetch must not become a second render: {tried}"
+        # the resume rule: a mid-DOWNLOAD row holding a finished clip is kept, a QUEUED row is not
+        # (the gate requeues a clip it rejected while the rejected file is still sitting there)
+        _kept = os.path.join(runner.CLIPS_DIR, "fetchtest", "clip_000.mp4")
+        assert runner._already_downloaded({"project": "fetchtest", "idx": 0,
+                                           "status": "downloading"}) == _kept, \
+            "a shutdown mid-download leaves a clip worth keeping"
+        assert runner._already_downloaded({"project": "fetchtest", "idx": 0,
+                                           "status": "queued"}) == "", \
+            "a queued clip must be re-shot even though the rejected file is still on disk"
+        assert runner._already_downloaded({"project": "fetchtest", "idx": 7,
+                                           "status": "downloading"}) == "", \
+            "a row with no file on disk has nothing to keep"
+        print("OK: a failed fetch is retried in-session (the render already exists), and a clip "
+              "already downloaded is never re-submitted")
         print("OK: hermetic self-check (temp dirs) + craft-gate verdict persisted")
         print("OK: observed balance updates the count before spend; a failed read never blocks a job")
     else:
