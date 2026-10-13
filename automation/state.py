@@ -308,6 +308,15 @@ class State:
             (n, time.time(), site, account))
         self.db.commit()
 
+    def mark_dry(self, site: str, account: str, refill_at: float = 0.0):
+        """The SITE told us it is empty (quota, paywall, insufficient credits) — record the fact.
+
+        This is not the same as a cooldown and must not be treated as one: the pair is OUT until
+        its own refill time, so a ledger that says `remaining=0, resets_at=0` forever is what
+        made every dry site look hand-entered and every report call it 'manual'. Source is
+        'observed' because the site itself was the source."""
+        self.set_credits(site, account, 0, resets_at=refill_at, source="observed")
+
     def available(self, now: float = None) -> list:
         """(site,account) pairs with credit left and not in cooldown — for the
         scheduler. A pair whose resets_at has passed is treated as refillable
@@ -603,6 +612,23 @@ if __name__ == "__main__":
         st.observe_credits("krea", "a1", -1); assert False, "negative balance must be rejected"
     except ValueError:
         pass
+
+    # A SITE SAYING IT IS OUT IS A FACT, NOT A COOLDOWN (owner fix, 2026-10-14). Marked dry with
+    # the refill time it named: the scheduler stops offering it, and the moment that time passes
+    # it is offered again without anyone re-typing a number.
+    st.mark_dry("luma", "a1", refill_at=time.time() + 3600)
+    row = st.db.execute("SELECT remaining, resets_at, source FROM credits WHERE site='luma'").fetchone()
+    assert row["remaining"] == 0 and row["source"] == "observed", dict(row)
+    assert row["resets_at"] > time.time(), "the refill time the site named is held"
+    assert ("luma", "a1") not in {(r["site"], r["account"]) for r in st.available()}, \
+        "an empty site must not be offered to the scheduler"
+    assert not st.site_has_credit("luma"), "and it is not worth waiting for either"
+    st.mark_dry("hailuo", "a1")                      # a site that named no period at all
+    assert st.db.execute("SELECT resets_at FROM credits WHERE site='hailuo'").fetchone()[0] == 0, \
+        "no named refill stays unknown — 0 is 'not known', never a guessed date"
+    st.mark_dry("luma", "a1", refill_at=time.time() - 1)   # the refill time comes round
+    assert ("luma", "a1") in {(r["site"], r["account"]) for r in st.available()}, \
+        "once the refill time passes the site is offered again, with no re-typing"
 
     # lessons: a wall puts a pair in cooldown; escalation grows the wait
     st.record_lesson("kling", "captcha", account="a1", cooldown_s=300)

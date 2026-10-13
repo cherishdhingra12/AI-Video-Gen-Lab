@@ -219,7 +219,8 @@ class TensorArt(SiteAdapter):
         # task. Treat as a cooldown until the daily bucket refreshes (~2 free gens/day).
         for _ in range(4):
             if self._insufficient(session):
-                raise Wall("rate_limit", f"insufficient daily credits (have {self._daily()}, need ~{self.credit_cost}) — refreshes daily")
+                raise Wall("credits", f"insufficient daily credits (have {self._daily()}, need ~{self.credit_cost}) — refreshes daily",
+                               refill="daily")
             time.sleep(2)
 
     # ---- poll: match OUR render by prompt (finished works land in entry/list; tasks/query

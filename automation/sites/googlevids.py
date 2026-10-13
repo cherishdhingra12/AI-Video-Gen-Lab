@@ -116,7 +116,8 @@ class GoogleVids(SiteAdapter):
         time.sleep(7)
 
         if self._quota_blocked(session):
-            raise Wall("rate_limit", "Google Vids monthly quota reached — refreshes on the 1st")
+            raise Wall("credits", "Google Vids monthly quota reached — refreshes on the 1st",
+                       refill="monthly")
 
         # 4) prompt + fire. Real keyboard: Google SPAs ignore JS value injection.
         if not session.has(self.prompt_sel, timeout=8000):
@@ -131,7 +132,8 @@ class GoogleVids(SiteAdapter):
         gen.click()
         time.sleep(4)
         if self._quota_blocked(session):
-            raise Wall("rate_limit", "Google Vids monthly quota reached — refreshes on the 1st")
+            raise Wall("credits", "Google Vids monthly quota reached — refreshes on the 1st",
+                       refill="monthly")
 
     def poll(self, session) -> str:
         """CONFIRMED live: the AI-clip panel shows a NN% + Cancel while Veo renders; when

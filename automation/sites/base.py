@@ -22,10 +22,15 @@ from vision import read_state, find_control, read_credits as _credits_from_png, 
 
 
 class Wall(Exception):
-    """A blocker we should step back from. kind in captcha|rate_limit|login|block."""
-    def __init__(self, kind: str, detail: str = ""):
+    """A blocker we should step back from. kind in captcha|rate_limit|login|block|credits.
+
+    `refill` belongs to kind='credits' and is the period the site itself named — 'daily',
+    'monthly', or '' when it named none (a one-time grant, a paywall). Being OUT is not the
+    same as being rate-limited: the runner marks the pair dry in the ledger with that refill
+    time instead of cooling it for 15 minutes and coming back to an empty site."""
+    def __init__(self, kind: str, detail: str = "", refill: str = ""):
         super().__init__(f"{kind}: {detail}")
-        self.kind, self.detail = kind, detail
+        self.kind, self.detail, self.refill = kind, detail, refill
 
 
 class SiteAdapter:

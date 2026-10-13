@@ -123,7 +123,8 @@ class Flow(SiteAdapter):
             raise Wall("login", "flow signed out; re-run: import_login.py flow a1 --browser chrome --keyword google")
         self._guard(session)
         if self._QUOTA.search(self._body(session)):
-            raise Wall("rate_limit", "Google Flow daily credits spent — refreshes next day")
+            raise Wall("credits", "Google Flow daily credits spent — refreshes next day",
+                           refill="daily")
 
         if not self.click_or_heal(session, lambda: self._click_role(session, "New project"),
                                   "the 'New project' button or tile that starts a new video project"):
@@ -161,7 +162,8 @@ class Flow(SiteAdapter):
             raise Wall("selector", "Flow 'Start generation' not found — not even via vision self-heal")
         time.sleep(4)
         if self._QUOTA.search(self._body(session)):
-            raise Wall("rate_limit", "Google Flow daily credits spent — refreshes next day")
+            raise Wall("credits", "Google Flow daily credits spent — refreshes next day",
+                           refill="daily")
 
     def poll(self, session) -> str:
         pg = session.page

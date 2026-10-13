@@ -34,7 +34,30 @@ _WALL_BASE = {
     "rate_limit": 900.0,    # 15 min
     "block": 3600.0,        # 1 h — serious, wait long
     "selector": 120.0,      # UI probably changed; short wait, adapter may self-heal
+    "credits": 0.0,         # OUT, not cooling. Being empty is not a mistake to step back from,
+                            # and a cooldown here would just send the scheduler back in 15
+                            # minutes to the same empty site. The pair is marked dry in the
+                            # ledger instead (state.mark_dry) and returns at its REFILL time.
 }
+
+DAILY, MONTHLY = "daily", "monthly"
+
+
+def refill_at(period: str, now: float = None) -> float:
+    """When a dry site comes back — the wall says so in words, this turns it into a time.
+
+    '' = no known refill (a one-time signup grant, a paywall): stays 0, which `available()`
+    reads as "no refill time known" — dry until a person says otherwise. Local midnight is the
+    honest approximation for the daily and monthly buckets: Google resets on Pacific time, Krea
+    on its own, and being a few hours EARLY costs one retry while being late costs a run.
+    """
+    t = time.localtime(now or time.time())
+    if period == DAILY:
+        return time.mktime((t.tm_year, t.tm_mon, t.tm_mday + 1, 0, 0, 0, 0, 0, -1))
+    if period == MONTHLY:
+        y, m = (t.tm_year + 1, 1) if t.tm_mon == 12 else (t.tm_year, t.tm_mon + 1)
+        return time.mktime((y, m, 1, 0, 0, 0, 0, 0, -1))
+    return 0.0
 
 
 class Brain:
@@ -90,11 +113,12 @@ class Brain:
         if not self.st.site_has_credit(site):
             return False                       # dry — a real dead end
         recent = self.st.recent_lessons(site, limit=1)
-        if recent and recent[0]["kind"] == "block":
-            return False                       # hard-blocked — a real dead end
+        if recent and recent[0]["kind"] in ("block", "credits"):
+            return False                       # hard-blocked, or the site just said it is empty
         return True                            # funded but cooling: worth the wait
 
-    def pick(self, want_site: str = None, strict: bool = False) -> tuple:
+    def pick(self, want_site: str = None, strict: bool = False, need: int = 0,
+             cost_of=None) -> tuple:
         """Scheduler helper: best (site,account) that has credit AND isn't cooling.
         want_site is a soft PREFERENCE (tried first), not a filter — a job whose last
         site is now cooling must still reroute, or the whole waterfall stalls on it.
@@ -103,16 +127,32 @@ class Brain:
         source, so nothing else may add a scene to it (one reel, one look). None comes back
         when it is cooling or dry, and the caller waits rather than mixing the reel — a
         stall costs a delay, a mix costs the consistency the reel was built for.
-        Returns (site,account) or None."""
+        Returns (site,account) or None.
+
+        `need` is how many clips are still to be rendered for THIS reel and `cost_of(site)`
+        what one clip costs there: a site is then ranked by the clips it can AFFORD, not by its
+        raw balance. 1000 leftover credits are worthless for a 4-clip reel if one clip costs
+        134, and the reel that starts on a site with 2 left strands after clip 1 — locked to
+        that source (one reel, one source) and waiting for a refill to finish a half-made film.
+        Affordability outranks the house waterfall ONLY when it decides whether the reel can be
+        finished at all; among affordable sites the quality order still wins, and when nobody
+        can afford the whole reel the order is exactly what it was.
+        """
+        def afford(c) -> int:
+            cost = max(1, int(getattr(cost_of(c["site"]), "credit_cost", 1) if cost_of else 1))
+            return c["remaining"] // cost
+
         cands = self.st.available()
         # The house waterfall decides the ORDER: Vids before Flow before the rest, and within a
         # tier the most remaining credit first (spread load, delay hitting any one wall). This is
         # a QUALITY order, not a credit order — a small Vids bucket must not lose to a fat krea one.
-        cands.sort(key=lambda c: (_order(c["site"]), -c["remaining"]))
-        if want_site:
-            cands.sort(key=lambda c: c["site"] != want_site)     # stable: keeps the order above
-            if strict:
-                cands = [c for c in cands if c["site"] == want_site]
+        # Affordability sits ABOVE all of it (see `need`): it is the one thing that decides whether
+        # the reel can be finished at all, and a source that strands it is no source.
+        cands.sort(key=lambda c: (0 if afford(c) >= need else 1,
+                                  0 if want_site and c["site"] == want_site else 1,
+                                  _order(c["site"]), -afford(c)))
+        if strict:
+            cands = [c for c in cands if c["site"] == want_site]
         for c in cands:
             if self.before_action(c["site"], c["account"])["go"]:
                 return (c["site"], c["account"])
@@ -120,7 +160,7 @@ class Brain:
 
 
 if __name__ == "__main__":
-    import os, tempfile
+    import os, tempfile, types
     st = State(os.path.join(tempfile.mkdtemp(), "t.db"))
     br = Brain(st)
     st.set_credits("kling", "a1", remaining=6)
@@ -175,3 +215,38 @@ if __name__ == "__main__":
           f"scheduler routes around cooling accounts and reroutes off a dead want_site — "
           f"but a STRICT want_site (one reel, one look) waits instead of rerouting; "
           f"the waterfall is Vids->Flow->rest, not credit-ordered")
+
+    # THE CLIPS A SITE CAN AFFORD (owner fix, 2026-10-14). Raw balance is the wrong ranking: a
+    # reel that opens on a site with 2 clips left strands after clip 1 — locked to that source
+    # (one reel, one source), waiting for a refill to finish a half-made film, with every clip
+    # already rendered riding on it.
+    ast = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+    abr = Brain(ast)
+    ast.set_credits("googlevids", "g1", remaining=2)     # 1 credit/clip
+    ast.set_credits("vibes", "v1", remaining=100)        # 25 credits/clip (measured)
+    costs = types.SimpleNamespace(googlevids=types.SimpleNamespace(credit_cost=1),
+                                  vibes=types.SimpleNamespace(credit_cost=25))
+    cost_of = lambda site: costs.__dict__[site]          # noqa: E731
+    assert abr.pick(want_site="googlevids", need=2, cost_of=cost_of) == ("googlevids", "g1"), \
+        "a site that CAN finish the reel still wins on the house order"
+    assert abr.pick(want_site="googlevids", need=3, cost_of=cost_of) == ("vibes", "v1"), \
+        "a reel Vids cannot finish must open where it can — 2 clips of credit is not a source"
+    assert abr.pick(need=99, cost_of=cost_of) == ("googlevids", "g1"), \
+        "when NO site can afford the whole reel the order is what it always was, never nothing"
+
+    # A DRY SITE COMES BACK AT ITS OWN REFILL TIME, not after a cooldown. The site names the
+    # period in words; this turns it into a time the ledger can hold.
+    now = time.time()
+    d = refill_at(DAILY, now)
+    assert 0 < d - now <= 24 * 3600 + 60, f"a daily refill is within a day, got {d - now}"
+    assert time.localtime(d)[3:6] == (0, 0, 0), "a daily bucket refills at local midnight"
+    assert time.localtime(d)[2] >= time.localtime(now)[2], "and on the NEXT day"
+    m = refill_at(MONTHLY, now)
+    assert time.localtime(m)[2] == 1 and 0 < m - now <= 32 * 24 * 3600, "a monthly one on the 1st"
+    dec = time.mktime((2026, 12, 20, 10, 0, 0, 0, 0, -1))
+    assert time.localtime(refill_at(MONTHLY, dec))[:2] == (2027, 1), \
+        "December must roll into January, not month 13"
+    assert refill_at("") == 0.0, \
+        "a site that named no period stays UNKNOWN — 0 is never a guessed date"
+    print("OK: a site is ranked by the clips it can afford, and a dry one returns at the refill "
+          "time it named (or stays unknown when it named none)")

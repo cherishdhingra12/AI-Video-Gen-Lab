@@ -148,7 +148,7 @@ class Kling(SiteAdapter):
             body = pg.inner_text("body")[:4000].lower()
             if any(k in body for k in ("insufficient", "not enough credit", "quota",
                                        "run out of", "credits are used up")):
-                raise Wall("rate_limit", "insufficient credits toast")
+                raise Wall("credits", "insufficient credits toast", refill="daily")
         except Wall:
             raise
         except Exception:

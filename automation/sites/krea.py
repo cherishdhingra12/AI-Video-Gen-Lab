@@ -166,7 +166,8 @@ class Krea(SiteAdapter):
 
         bal = self._balance(pg)
         if bal is not None and bal < self.credit_cost:
-            raise Wall("rate_limit", f"only {bal} credits < {self.credit_cost} needed — refreshes daily")
+            raise Wall("credits", f"only {bal} credits < {self.credit_cost} needed — refreshes daily",
+                               refill="daily")
 
         self._set_portrait(session)
 

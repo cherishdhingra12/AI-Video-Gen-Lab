@@ -119,7 +119,7 @@ class Hailuo(SiteAdapter):
             body = pg.inner_text("body")[:4000].lower()
             if any(k in body for k in ("insufficient", "not enough", "run out",
                                        "no credit", "quota")):
-                raise Wall("rate_limit", "insufficient credits")
+                raise Wall("credits", "insufficient credits")   # one-time signup grant, never refills
         except Wall:
             raise
         except Exception:

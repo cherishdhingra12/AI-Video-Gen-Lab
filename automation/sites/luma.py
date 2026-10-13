@@ -139,7 +139,8 @@ class Luma(SiteAdapter):
             raise Wall("selector", "luma aspect did not flip to 9:16 — confirm live UI")
 
         if self._quota_blocked(session):
-            raise Wall("rate_limit", "luma monthly credits spent — refreshes monthly")
+            raise Wall("credits", "luma monthly credits spent — refreshes monthly",
+                               refill="monthly")
 
         ta = pg.locator("textarea").first
         if not ta.count():
@@ -155,10 +156,11 @@ class Luma(SiteAdapter):
         session._luma_baseline = self._newest_media(pg)
         pg.mouse.click(create["x"], create["y"]); time.sleep(5)
         if self._paywalled(session):
-            raise Wall("rate_limit", "luma free tier paywalled — Create opens the Upgrade "
+            raise Wall("credits", "luma free tier paywalled — Create opens the Upgrade "
                                      "Plan modal (free video is a one-time trial only)")
         if self._quota_blocked(session):
-            raise Wall("rate_limit", "luma monthly credits spent — refreshes monthly")
+            raise Wall("credits", "luma monthly credits spent — refreshes monthly",
+                               refill="monthly")
 
     def poll(self, session) -> str:
         """Done when a NEW (non-effect) result — different from the pre-submit newest — appears

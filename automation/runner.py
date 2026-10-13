@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.join(_DIR, "sites"))
 sys.path.insert(0, os.path.dirname(_DIR))       # project root, for stitch.py
 
 from state import State                     # noqa: E402
+import learn                                 # noqa: E402
 from learn import Brain                      # noqa: E402
 from base import Wall                        # noqa: E402  (same module identity as adapters' `from base import Wall`)
 
@@ -115,8 +116,13 @@ def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
     # soft preference, so pick() fell straight through to vibes the moment the primary cooled.
     # Wait it out instead; fail over only when the primary is genuinely dead.
     locked = st.project_site(job["project"])
+    # How many clips this reel still needs — the number that says whether a site can FINISH it.
+    # Handed to pick() so the reel starts on a source that can afford the whole thing instead of
+    # stranding half-made when the first site's bucket runs out (a strand costs every clip
+    # already rendered: the lock means the rest waits for a refill, and one reel is one source).
+    need = sum(1 for c in st.project_clips(job["project"]) if c["status"] != "done")
     if locked:
-        pick = br.pick(want_site=locked, strict=True)      # a reel in progress waits, never mixes
+        pick = br.pick(want_site=locked, strict=True, need=need, cost_of=_adapter)
         if not pick:
             return "waiting"
         site = pick[0]
@@ -126,7 +132,7 @@ def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
             # projects' queued jobs too. Fine while one reel is in flight at a time (how this
             # house runs); skip-to-the-next-project if a second reel is ever queued alongside.
             return "waiting"                               # a short cooldown is not a dead end
-        pick = br.pick(want_site=job["site"], strict=False)
+        pick = br.pick(want_site=job["site"], strict=False, need=need, cost_of=_adapter)
         if not pick:
             return "waiting"                                # nothing attackable right now
         site = pick[0]
@@ -164,6 +170,16 @@ def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
             raise Wall("block", "render timed out")
 
     except Wall as w:
+        if w.kind == "credits":
+            # The site said it is OUT. That is a fact about this account, not a cooldown — record
+            # it in the ledger with whatever refill time the site named, so the scheduler stops
+            # choosing it and the report can say when it comes back. Without this the balance sat
+            # at its hand-entered guess (or at 0 with no date) and the same empty site was picked
+            # again and again.
+            back = learn.refill_at(w.refill)
+            st.mark_dry(site, account, back)
+            print(f"  {site}/{account}: out of credits — dry until "
+                  + (time.strftime("%Y-%m-%d %H:%M", time.localtime(back)) if back else "a person says otherwise"))
         cd = br.hit_wall(site, account, w.kind, step=job["status"], detail=w.detail)
         n = st.bump_retry(job["id"])
         # step back: requeue unless we've exhausted retries on this clip
@@ -507,6 +523,34 @@ if __name__ == "__main__":
         # the observed balance drove the local count: 42 read off the page - 10 spent = 32
         row = st.db.execute("SELECT remaining, source FROM credits WHERE site='kling'").fetchone()
         assert row["remaining"] == 32 and row["source"] == "observed", dict(row)
+
+        # OUT OF CREDITS IS A FACT, NOT A COOLDOWN. A site that says it is empty must be marked dry
+        # in the ledger with the refill time it named — otherwise the balance keeps its hand-entered
+        # guess, the scheduler picks the same empty site again, and the report calls it 'manual'
+        # forever. The wall kind carries the period; the runner turns it into a time.
+        cst = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+        cbr = Brain(cst)
+        cst.set_credits("flow", "f1", remaining=5)          # funded ON PAPER
+        cst.set_credits("krea", "k1", remaining=40)         # where the reel must move to
+        cwall = types.SimpleNamespace(name="flow", credit_cost=1)
+        def cwall_submit(s, prompt):
+            raise Wall("credits", "Flow daily credits spent — refreshes next day", refill="daily")
+        cwall.submit, cwall.poll = cwall_submit, lambda s: "done"
+        cwall.download = lambda s, dest: dest
+        runner._adapter = lambda site: cwall if site == "flow" else fake
+        cst.add_job("dryreel", 0, "a clip on a site with nothing left")
+        _dj = cst.db.execute("SELECT * FROM jobs WHERE project='dryreel' AND idx=0").fetchone()
+        assert runner.process_job(cst, cbr, _dj, headless=True) == "walled"
+        row = cst.db.execute(
+            "SELECT remaining, resets_at, source FROM credits WHERE site='flow'").fetchone()
+        assert row["remaining"] == 0 and row["source"] == "observed", dict(row)
+        assert row["resets_at"] > time.time(), "the refill time the site named is in the ledger now"
+        assert ("flow", "f1") not in {(c["site"], c["account"]) for c in cst.available()}, \
+            "an empty site must not be offered again"
+        assert cbr.wait_for_bid("flow") is False, "an empty site is a dead end, not a wait"
+        assert cbr.pick(want_site="flow") == ("krea", "k1"), \
+            "the reel moves to a source that has credit"
+        print("OK: a site that says it is out of credits is marked dry with its own refill time")
 
         # ONE REEL, ONE SOURCE. "selftest" now has a done clip on kling, so kling is the reel's
         # lock. Put kling in cooldown and stand up a healthy other site: the next clip must WAIT
