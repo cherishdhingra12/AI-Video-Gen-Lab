@@ -213,15 +213,16 @@ def _t_judge(route, model) -> float:
     return _score_judge(bad, good)
 
 
-def _vision_candidates():
-    """What production would actually try, in order: each endpoint with the first model its
-    dialect accepts. Measuring a (gateway, model) pair that _models_for would never send is
-    measuring a route this pipeline cannot use."""
+def _vision_candidates(per_endpoint: int = 3):
+    """What production would actually try, in the order it would try it: each endpoint's first
+    models, because since the fan-out (2026-10-13) a gateway answers with whichever of them still
+    has quota, and "which pool can be trusted with the gate's eyes" is exactly what this role has
+    to measure. Measuring only the pin is what left the role unmeasured for a day: the pin's pool
+    was spent, so every row read NOT MEASURED while nine other pools sat idle."""
     out = []
     for url, key in vision._endpoints():
-        models = vision._models_for(url)
-        if models:
-            out.append((url, key, models[0]))
+        for model in vision._models_for(url)[:per_endpoint]:
+            out.append((url, key, model))
     return out
 
 
@@ -247,15 +248,24 @@ def _t_vision(url, key, model) -> float:
         # labelled reel's clips were swept after publish and `== vision` printed a blank line).
         raise RuntimeError(f"the labelled reel {_VISION_REEL!r} has no frames on disk (clips/ is "
                            "swept once a reel publishes) — unmeasured, never a zero")
-    o_url, o_model = vision._endpoints, vision._MODEL
+    o_url, o_model, o_models = vision._endpoints, vision._MODEL, vision._models_for
+    o_sees = dict(vision._SEES)
     try:
         vision._endpoints = lambda: [(url, key)]
         vision._MODEL = model
+        # Pin the MODEL list too. Since the fan-out (2026-10-13) a gateway offers its other pools
+        # behind the pin, so leaving _models_for alone would let a fallback answer for the model
+        # being scored — and the row would carry the wrong name.
+        vision._models_for = lambda u: [model]
+        vision._SEES.clear()
         vision._SCAN_CACHE.clear()
         routerhealth.clear()
         return _score_vision(vision.style_scan(frames))
     finally:
         vision._endpoints, vision._MODEL = o_url, o_model
+        vision._models_for = o_models
+        vision._SEES.clear()
+        vision._SEES.update(o_sees)
         vision._SCAN_CACHE.clear()
         agents._PIN = None
 
@@ -410,6 +420,24 @@ if __name__ == "__main__":
             assert _VISION_REEL in str(e), f"the reason must name the missing reel: {e}"
         finally:
             globals()["_frames"] = _of
+        # …and a scored row must name the model that ANSWERED, which since the fan-out means the
+        # fallback pools have to be pinned shut for the duration of the trial
+        _oframes, _oscan = globals()["_frames"], vision.style_scan
+        seen = []
+
+        def _scan(frames):
+            seen.append(list(vision._models_for("any")))
+            return {"flagged": [], "people": {}}
+
+        try:
+            globals()["_frames"] = lambda: [b"a", b"b"]
+            vision.style_scan = _scan
+            _t_vision("http://gw/v1", "k", "the-model")
+        finally:
+            globals()["_frames"], vision.style_scan = _oframes, _oscan
+        assert seen == [["the-model"]], f"a fallback must not answer for the model being scored: {seen}"
+        assert vision._models_for("http://localhost:3001/v1")[0] == vision._MODEL, \
+            "the pin must lead again once the trial is over"
         print("OK: measure.py — the scorers score, an unmeasured candidate never wins, and a tie "
               "goes to the faster route")
         raise SystemExit(0)

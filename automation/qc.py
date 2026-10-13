@@ -1365,6 +1365,56 @@ if __name__ == "__main__":
             finally:
                 agents.judge_captions = _orig_judge
 
+            # THE OUTAGE SWEEP (WAVELENGTH §6). Twice on 2026-10-13 a check that COULD NOT RUN
+            # reported clean: the character check discarded the pairwise scan's conviction when
+            # the sheet was down, and a blind route answered "same_person: true" for a frame it
+            # never saw. One rule, two symptoms — so don't test them one entry point at a time.
+            # Stub EVERY eye dead at once and prove the gate cannot call a reel clean off a
+            # gateway that never looked: the un-runnable checks reach the human, nothing blocks
+            # (an outage is not a craft defect), and the reel is shippable, never live.
+            d11 = tempfile.mkdtemp()
+            _cd = os.path.join(_CLIPS_ROOT, os.path.basename(d11))
+            os.makedirs(_cd)
+            for _i in range(3):
+                subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=4",
+                                "-f", "lavfi", "-i", "sine=frequency=440:d=4", "-pix_fmt",
+                                "yuv420p", "-shortest", os.path.join(_cd, f"clip_{_i:03d}.mp4")],
+                               check=True, capture_output=True)
+            for _f in ("caption_hook.png", "caption_moral.png", "caption_cta.png"):
+                open(os.path.join(d11, _f), "wb").write(_PNG)
+            open(os.path.join(d11, "music_raw.mp3"), "wb").write(b"x")
+            json.dump({"opener": "the outage sweep", "font": "Kalam", "quote": "Kabir",
+                       "structure": "sweep"},
+                      open(os.path.join(d11, "identity.json"), "w"))
+            subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=s=720x1280:d={_RL}",
+                            "-f", "lavfi",
+                            "-i", f"sine=frequency=440:duration={_RL},volume=0.25",
+                            "-pix_fmt", "yuv420p", "-shortest",
+                            os.path.join(d11, "final_veo.mp4")],
+                           check=True, capture_output=True)
+            # (a) with the eyes working this reel is CLEAN — so everything below is the outage
+            _scan({"flagged": [], "whole_reel": False, "detail": "", "people": {},
+                   "person_detail": ""})
+            vision.medium_of = lambda png: "3d"
+            vision.compare_character = lambda png: {"consistent": True, "detail": ""}
+            vision.review_frame = lambda png: []
+            assert run(d11, st)["ok"], "the sweep needs a reel that passes when it IS measured"
+            # (b) every eye goes dark at once
+            _scan(None)
+            vision.review_frame = lambda png: None
+            vision.medium_of = lambda png: None
+            vision.compare_character = lambda png: None
+            v11 = run(d11, st)
+            for _s in ("visual review", "style classification", "clip-against-clip",
+                       "character consistency"):
+                assert any(_s in e for e in v11["eye"]), \
+                    f"'{_s}' could not run — it must reach the human's list: {v11['eye']}"
+            assert not v11["block"], f"an outage is not a craft defect: {v11['block']}"
+            assert sorted(v11["gate"]) == sorted(v11["eye"]), \
+                f"only the un-runnable checks may gate a dark-gateway reel: {v11['gate']}"
+            assert not v11["ok"] and not v11["live"], \
+                "a reel nobody looked at is shippable by eye, never live"
+
             # the verdict is DURABLE state, keyed by reel, and a re-run overwrites it
             # (v6g, the GRANDFATHERED photoreal reel, is the passing one — v6, a NEW reel that
             #  declared photoreal, is now HELD; d3 is deliberately re-run as a defect just above,

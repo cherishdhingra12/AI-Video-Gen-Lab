@@ -182,6 +182,12 @@ def _sees(url: str, key: str, model: str) -> bool:
         except urllib.error.HTTPError as e:
             if e.code in _TRANSIENT:
                 return True                     # busy, not blind: let this answer stand
+            if e.code in (400, 404):
+                # The probe hit a name this gateway does not serve — a fact about the MODEL, not
+                # about anyone's eyes. Branding it "cannot see" would discard real verdicts over a
+                # typo, which is the same conflation as cooling a route for a stale alias.
+                _SEES[k] = True
+                return True
             _SEES[k] = False
         except Exception:
             _SEES[k] = False
@@ -227,12 +233,14 @@ def _ask(png: bytes, prompt: str, max_tokens: int = 600, patience: int = 2) -> s
                         return txt
                     routerhealth.note_failure(url, "empty content")
                 except urllib.error.HTTPError as e:
-                    if e.code == 404:
-                        # 404 is about the MODEL NAME, not the gateway — this endpoint answers 200
-                        # on its other models. Cooling the route for it took Google direct out of
-                        # the rotation entirely on 2026-10-13 while a stale alias sat third in
-                        # _FALLBACK_MODELS, and the two local gateways were 429: a dead name in a
-                        # list is not a dead route.
+                    if e.code in (400, 404):
+                        # A NAME, not the gateway. 404 is a model this endpoint does not serve;
+                        # a 400 here is its "unsupported/ambiguous model" — measured live on
+                        # 2026-10-13, OmniRoute answers one for a bare name it cannot map
+                        # ("Use a provider/model prefix"). This endpoint answers 200 on its other
+                        # models, and cooling the route for a name took Google direct out of the
+                        # vision rotation entirely while a stale alias sat third in
+                        # _FALLBACK_MODELS: a dead name in a list is not a dead route.
                         continue
                     last = e
                     if e.code in _TRANSIENT:
@@ -1002,6 +1010,44 @@ if __name__ == "__main__":
             except RuntimeError:
                 pass
             assert hits == ["blind-model"], f"the probe is asked once per route: {hits}"
+            # (7) A 400 IS ALSO A NAME. Measured live on 2026-10-13: OmniRoute answers 400
+            # ("Ambiguous model 'gemini-2.5-flash'. Use a provider/model prefix") for a bare name
+            # it cannot map, and treated as a route failure it cooled the gateway for the whole
+            # vision role — the stale-404 conflation, one status code over.
+            def _nameless(req, timeout=90):
+                m = json.loads(req.data)["model"]
+                hits.append(m)
+                if m == "bare-name":
+                    raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, None)
+                return _body(m, req.data.decode())
+
+            urllib.request.urlopen = _nameless
+            globals()["_models_for"] = lambda u: ["bare-name"]
+            hits.clear(), _rh.clear(), _SEES.clear()
+            try:
+                _ask(b"x", "hi", patience=0)
+            except Exception:
+                pass
+            assert not _rh.cooling("http://t/v1")[0], "an unmappable name is not a dead route"
+            globals()["_models_for"] = lambda u: ["bare-name", "provider/model"]
+            hits.clear()
+            assert _ask(b"x", "hi", patience=0) == "{}", "a 400 on one name must fall through"
+            assert hits[:2] == ["bare-name", "provider/model"], hits
+
+            # …and a probe that 404s is a fact about the NAME: it must not brand the route blind
+            # and throw away an answer the route really gave.
+            def _probe404(req, timeout=90):
+                m = json.loads(req.data)["model"]
+                hits.append(m)
+                if "colour" in req.data.decode():
+                    raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+                return _body(m, req.data.decode())
+
+            urllib.request.urlopen = _probe404
+            globals()["_models_for"] = lambda u: ["probe-404"]
+            hits.clear(), _SEES.clear()
+            assert _ask(b"x", "hi", patience=0) == "{}", "a 404 on the probe is not blindness"
+            assert _SEES == {("http://t/v1", "probe-404"): True}, _SEES
         finally:
             urllib.request.urlopen = _o_open
             globals()["_endpoints"], globals()["_models_for"] = _o_ends, _o_models
