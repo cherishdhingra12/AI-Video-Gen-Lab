@@ -220,6 +220,43 @@ def check_craft_layers(reel):
     return probs
 
 
+def check_reel_folder(reel):
+    """Does the folder hold EVERYTHING — one place to review a reel and post it from?
+
+    The owner's ask (2026-10-15), on dadaji-ka-kahani as the template: "the folder is exactly what
+    I want... right from the music to the caption, to the publishing, to the shotlist, to the
+    script, to the covers. Everything should be in this folder, just like this." A folder missing
+    its cover or its publishing sheet is not a broken reel — it is a reel nobody can post without
+    going back to the terminal — so this is a PUBLISH-GATE, not a block: it does not stop the
+    ship, it asks for the missing piece before go_live.
+
+    The list lives in publishing.FOLDER (one definition, next to the code that writes two of its
+    members), so a file nothing produces can never be demanded here.
+
+    It applies to reels THIS PIPELINE built, and captions.json is the marker: agents.presentation
+    writes it, so a folder holding one went through the build and owes the whole contract. A reel
+    hand-assembled before the contract existed (intezaar, janmeka, roz_ki_list, …) has no
+    captions.json and is not asked for a shot list and score provenance that no longer exist to
+    write — a gate item nothing can ever clear is how a gate gets ignored. ponytail: one proxy for
+    "the pipeline built this", enough to keep the item actionable; revisit if a hand-build ever
+    grows a captions.json."""
+    if not reel.final:
+        return []                                   # playable() already owns 'no video'
+    have = set(os.listdir(reel.dir))
+    if "captions.json" not in have:
+        return []                                   # not a pipeline folder — see above
+    import publishing
+    missing = [f for f in publishing.REQUIRED if f not in have
+               and not (f == "final_veo.mp4" and "final.mp4" in have)]
+    if not missing:
+        return []
+    how = "; ".join(f"{f} ({who})" for f, _, who in publishing.FOLDER if f in missing)
+    return [f"the reel's folder is incomplete — missing {', '.join(missing)}. The owner's template "
+            f"is projects/dadaji-ka-kahani: one folder with the script, the shot list, the cards, "
+            f"the score and its provenance, the cut, the cover and the publishing sheet. Write "
+            f"them with: python3 automation/publishing.py {reel.dir}   [{how}]"]
+
+
 _HOUSE_MEDIUM = "3d"        # WAVELENGTH.md §1 — every NEW reel is 3-D animation
 
 
@@ -613,6 +650,7 @@ def check_caption_wording(reel):
 CHECKS = {"playable": check_playable, "caption-safe-area": check_caption_safe_area,
           "caption-on-face": check_caption_on_face, "caption-wording": check_caption_wording,
           "realism": check_realism, "craft-layers": check_craft_layers,
+          "reel-folder": check_reel_folder,
           "no-synth-voiceover": check_no_synth_voiceover,
           "style-uniform": check_style_uniform,
           "character-consistency": check_character_consistency, "pacing": check_pacing,
@@ -623,6 +661,40 @@ CHECKS = {"playable": check_playable, "caption-safe-area": check_caption_safe_ar
 # Editing these + `python3 qc.py --seed` re-teaches the gate. The DB is the live source of
 # truth (owner can add/refine rows there); this list only bootstraps a fresh brain.
 LESSONS = [
+    dict(slug="reel-folder", check_id="reel-folder", severity="publish-gate",
+         title="Every reel folder is self-contained — one place to review it and post it from",
+         why="owner rule 2026-10-15, holding up projects/dadaji-ka-kahani as the template: 'right "
+             "from the music to the caption, to the publishing, to the shortlist, to the script, "
+             "to the covers — everything should be in this folder, just like this.' The folder is "
+             "the deliverable: script.md, shotlist.json, identity.json, captions.json, "
+             "music_raw.mp3 + its provenance in music_meta.json, final_veo.mp4, caption_place.json, "
+             "music_bed.json, cover.png and publishing.md. A missing one is not a broken reel, so "
+             "this gates go_live rather than blocking the ship — and publishing.py WRITES the "
+             "cover and the sheet, so the fix is a command, not homework (the list itself lives in "
+             "publishing.FOLDER, one definition, next to the code that produces two of them)"),
+    dict(slug="cover-is-a-real-frame", tier="judgment", severity="warn",
+         title="The cover is a real frame OF the reel, with its line inside the square the "
+               "Instagram grid keeps",
+         why="dadaji-ka-kahani's cover was hand-made and then turned into code "
+             "(publishing.cover, 2026-10-15). Two rules it encodes. (1) A real frame, never a "
+             "generated image: the cover is the one picture the owner picks the reel by, and a "
+             "cover that is not in the film is a promise the film does not keep. (2) The line "
+             "goes in the MIDDLE HALF of the frame — the profile grid shows a 1:1 CENTRE CROP of "
+             "a 9:16 reel, so a hook card near the top (where the reel itself puts it) is cropped "
+             "clean off the grid. The frame is taken from the shipped cut at a moment with no "
+             "card on screen (caption_place.json says where they are), so the cover cannot end up "
+             "carrying a second card under its own"),
+    dict(slug="publishing-sheet-per-reel", tier="judgment", severity="warn",
+         title="Titles, caption, description, keywords and hashtags are written from the reel "
+               "itself, into the reel's own folder",
+         why="the publishing copy used to be hand-written per reel in a terminal, so a reel could "
+             "be finished and still have nowhere to say what it was called. agents.publishing_copy "
+             "writes it from the reel's own script and cards (so the hook line leads the caption "
+             "VERBATIM, and the grid and the video say the same thing), and publishing.sheet "
+             "assembles it with the score's provenance and the cover's own note. An outage is not "
+             "a defect here either: the sheet falls back to the reel's own words so the folder is "
+             "never incomplete, and an existing publishing.md is never overwritten — the owner "
+             "edits it, and a rebuild must not undo that"),
     dict(slug="video-playback", check_id="playable", severity="block",
          title="The render must actually PLAY (not a frozen still / silent)",
          why="a valid-to-ffprobe file can freeze to a still + silence in QuickTime"),
@@ -990,6 +1062,18 @@ if __name__ == "__main__":
         _PNG = base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
 
+        def _complete_folder(d):
+            """Every file publishing.FOLDER demands, as one byte — this exercises reel-folder, which
+            reads names, not contents. The cut and the two files the gate PARSES are left alone:
+            final_veo.mp4 is the thing under test, and identity.json/captions.json must stay real
+            JSON or Reel() raises before any check gets to run."""
+            import publishing
+            for f in publishing.REQUIRED:
+                p = os.path.join(d, f)
+                if f not in ("final_veo.mp4", "identity.json", "captions.json") \
+                        and not os.path.exists(p):
+                    open(p, "wb").write(b"x")
+
         _orig_review = vision.review_frame
         _orig_medium = vision.medium_of
         _orig_cmp = vision.compare_character
@@ -1335,6 +1419,10 @@ if __name__ == "__main__":
                             "-f", "lavfi", "-i", f"sine=frequency=440:d={_RL}", "-pix_fmt", "yuv420p",
                             "-shortest", os.path.join(d9, "final_veo.mp4")],
                            check=True, capture_output=True)
+            # d9 carries a captions.json, so it reads as a PIPELINE folder and owes the full
+            # contract (reel-folder). The subject here is caption WORDING, so complete the folder
+            # rather than let a second gate item make the `live` assertions below unfalsifiable.
+            _complete_folder(d9)
             try:
                 agents.judge_captions = lambda s, c: {"problems": [], "captions": c}
                 assert not any("caption wording" in g for g in run(d9, st)["gate"]), \
@@ -1431,6 +1519,40 @@ if __name__ == "__main__":
             assert Reel(d4).final == new, "newest final wins the gate"
             os.utime(old, (20000, 20000))
             assert Reel(d4).final == old, "the newer craft-path cut wins back"
+
+            # THE REEL FOLDER (owner rule 2026-10-15, dadaji-ka-kahani as the template). Two
+            # directions, because the check is scoped: a folder this pipeline built is asked for
+            # the whole contract, a hand-build from before it is left alone. A gate item nothing
+            # can clear is how a gate gets ignored, so the second half is the load-bearing one.
+            d12 = tempfile.mkdtemp()
+            for _f in ("caption_hook.png", "caption_moral.png", "caption_cta.png",
+                       "captions.json"):
+                open(os.path.join(d12, _f), "wb").write(_PNG)
+            open(os.path.join(d12, "music_raw.mp3"), "wb").write(b"x")
+            json.dump({"opener": "the folder contract", "font": "Kalam", "quote": "Kabir",
+                       "structure": "every piece in one place"},
+                      open(os.path.join(d12, "identity.json"), "w"))
+            subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=s=720x1280:d=2",
+                            "-pix_fmt", "yuv420p", os.path.join(d12, "final_veo.mp4")],
+                           check=True, capture_output=True)
+            _f12 = [g for g in run(d12, st)["gate"] if "[reel-folder]" in g]
+            assert _f12, "a pipeline folder missing its cover and sheet must gate go_live"
+            for _m in ("cover.png", "publishing.md"):
+                assert _m in _f12[0], f"the missing file must be NAMED: {_f12[0]}"
+            assert "shotlist.json" in _f12[0] and "music_meta.json" in _f12[0], \
+                f"every missing member must be named, not just the first: {_f12[0]}"
+            assert "publishing.py" in _f12[0], "the item must carry the command that fixes it"
+            assert not any("[reel-folder]" in b for b in run(d12, st)["block"]), \
+                "an incomplete folder is not a broken reel — it gates, it never blocks"
+            _complete_folder(d12)
+            assert not any("[reel-folder]" in g for g in run(d12, st)["gate"]), \
+                "a complete folder must clear the gate"
+            # ...and a reel predating the contract is NOT asked for files it cannot have. Same
+            # folder, minus captions.json: the marker for "the pipeline built this".
+            os.remove(os.path.join(d12, "captions.json"))
+            _v12 = run(d12, st)
+            assert not any("[reel-folder]" in g for g in _v12["gate"]), \
+                f"a hand-build must not be gated on a folder contract it predates: {_v12['gate']}"
         finally:
             vision.review_frame = _orig_review
             vision.medium_of = _orig_medium
@@ -1446,6 +1568,8 @@ if __name__ == "__main__":
               "never a silent pass, never a block; a human's sign-off settles the objection")
         print("OK: a check that could not run is shippable-not-live until a human signs THIS cut; "
               "a rebuild voids the signature and no signature clears a real defect")
+        print("OK: a pipeline folder missing its cover/sheet gates go_live and names the fix; "
+              "a hand-build predating the contract is not asked for files it cannot have")
     elif "--seed" in sys.argv:
         st = State(); seed(st)
         print(f"seeded {len(st.craft_lessons())} craft lessons into state.db"); st.close()

@@ -454,13 +454,9 @@ def _absorb(project_dir):
 
 
 def _card_height(lines, font, width):
-    """Render once off-screen and measure the ink, so placement knows the card's real height
-    instead of guessing it from the line count."""
-    probe = os.path.join(tempfile.mkdtemp(), "probe.png")
-    caption.render(lines, probe, y=0, font=font, width=width, **CARD_STYLE)
-    a = np.asarray(Image.open(probe).convert("RGBA"))[..., 3]
-    rows = np.where(a.max(axis=1) > 8)[0]
-    return int(rows.max() - rows.min() + 1) if len(rows) else 220
+    """The card's real ink height — shared with publishing.cover, which places a card over a
+    single frame and must ask for the band with the same number the reel did."""
+    return caption.card_height(lines, font, width, **CARD_STYLE)
 
 
 def _place(lines, font, width, src_clip, t0, t1):
@@ -736,6 +732,15 @@ def build(project_dir, clips_dir=None, absorb=True):
         except OSError:
             pass
     print(f"OK -> {out}  ({_dur(out):.2f}s, {n} clips, {', '.join(layers)})  VERIFIED")
+    # ---- the folder is the deliverable: the cover and the publishing sheet are part of the
+    #      build, so the next reel has them because the pipeline wrote them (see publishing.py).
+    #      Never fatal and never silent: the cut, the gate and the sign-off are unaffected.
+    try:
+        import publishing
+        publishing.pack(project_dir)
+    except Exception as e:  # noqa: BLE001 — a missing pack must not cost a finished cut
+        print(f"  publishing pack skipped ({str(e)[:90]}) — write it later with "
+              f"python3 automation/publishing.py {project_dir}")
     if absorb:
         _absorb(project_dir)
     return out
@@ -744,6 +749,7 @@ def build(project_dir, clips_dir=None, absorb=True):
 if __name__ == "__main__":
     if "--selfcheck" in sys.argv:
         os.environ["STYLE_CHECK"] = "0"                 # offline: no vision gateway
+        os.environ["PUBLISH_LLM"] = "0"                 # offline: no LLM for the publish sheet
         _absorb = lambda _d: None                       # never touch the real brain from a test
         d = tempfile.mkdtemp()
         pdir, cdir = os.path.join(d, "demo"), os.path.join(d, "clips", "demo")

@@ -154,14 +154,18 @@ def _cost_map(png, face_boxes=()):
     return cost
 
 
-def find_empty_band(video, t0, t1, height, samples=5):
+def find_empty_band(video, t0, t1, height, samples=5, lo_frac=0.04, hi_frac=1 - BOTTOM_CLEAR):
     """The y (px) of the top of the emptiest band `height` tall that a card could occupy,
     searching only the safe vertical range. None when the frames cannot be read.
 
     Placement is the MINIMUM worst-case, not the minimum average. A card that covers a face for
     only a moment is still a card over a face, and averaging let one face sample hide behind four
     clean ones — so each candidate is scored by the most expensive window anywhere in its run and
-    the cheapest of those wins. A face box is priced so it can never be the cheapest."""
+    the cheapest of those wins. A face box is priced so it can never be the cheapest.
+
+    `lo_frac`/`hi_frac` narrow that search. Defaults are the full safe range every card uses; a
+    COVER passes the square the Instagram grid keeps (publishing.cover) — a cover's hook line has
+    to survive a 1:1 centre crop, and text near the top of a 9:16 frame is cropped away there."""
     frames = _sample(video, t0, t1, max(samples, FACE_SAMPLES))
     if not frames:
         return None
@@ -169,8 +173,8 @@ def find_empty_band(video, t0, t1, height, samples=5):
     cost = np.mean([_cost_map(p, fb[i] if i < len(fb) else ()) for i, p in enumerate(frames)],
                    axis=0)
     x0, x1 = int(0.10 * W), int(0.86 * W)       # the far-right edge is off-limits too
-    lo = int(0.04 * H)
-    hi = int((1 - BOTTOM_CLEAR) * H) - height
+    lo = int(lo_frac * H)
+    hi = int(hi_frac * H) - height
     if hi <= lo:
         return max(0, min(lo, H - height))
     # ponytail: sliding window over a mean-cost map, not a saliency model. Good enough to stop a
@@ -179,12 +183,29 @@ def find_empty_band(video, t0, t1, height, samples=5):
     return min(cands, key=lambda y: float(cost[y:y + height, x0:x1].max()))
 
 
+def card_height(lines, font, width, **style):
+    """Render once off-screen and measure the ink, so placement knows the card's real height
+    instead of guessing it from the line count. Shared by the assembler (cards in the reel) and
+    by publishing.cover (the cover's line) — both must ask for the band with the same number."""
+    import tempfile
+    probe = os.path.join(tempfile.mkdtemp(), "probe.png")
+    render(lines, probe, y=0, font=font, width=width, **style)
+    a = np.asarray(Image.open(probe).convert("RGBA"))[..., 3]
+    rows = np.where(a.max(axis=1) > 8)[0]
+    return int(rows.max() - rows.min() + 1) if len(rows) else 220
+
+
 def render(lines, out, y, font="rounded", size=41, color="#FFF3D6", bg="rgba(18,16,14,0.72)",
            width=560, left=None):
     """Write one card to a transparent PNG at (left, y). lines = a short list of strings —
     Devanagari or Roman Hinglish, whichever the line reads better in (WAVELENGTH.md)."""
     if not os.path.exists(CHROME):
         raise RuntimeError(f"Chrome not found at {CHROME} — cannot shape Devanagari")
+    # A RELATIVE out path must work: it is turned into a file:// URL below, and `file://x/y.html`
+    # is not a path — Chrome resolves it against a host called "x", loads nothing, and screenshots
+    # an empty page over a path that was never written. `publishing.py projects/<reel>` is the
+    # documented fix command, so a relative path here is normal, not an edge case.
+    out = os.path.abspath(out)
     left = (W - width) // 2 if left is None else left
     body = "".join(f"<p>{ln}</p>" for ln in lines if ln.strip())
     html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
@@ -291,6 +312,25 @@ if __name__ == "__main__":
         "the face region must be priced above every other band"
     print("OK: a detected face box out-bids a plainer band — the card never lands on it")
 
+    # ---- the COVER window: a real call, default range vs the grid square ----
+    # A cover's hook line is read off the Instagram grid, whose thumbnail is a 1:1 CENTRE CROP of
+    # the 9:16 frame — text near the top is cropped away there. So publishing.cover narrows the
+    # search to the square. Proved on a frame that is cheap at the top and busy through the
+    # middle: the default finds the top, the narrowed one cannot leave the square.
+    framed = np.full((H, W, 3), 30, np.uint8)
+    framed[300:1100] = 200                                   # busy: rows 300-1100
+    fpath = os.path.join(d, "framed.png")
+    Image.fromarray(framed).save(fpath)
+    vid = os.path.join(d, "framed.mp4")
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-loop", "1", "-i", fpath, "-t", "2",
+                    "-pix_fmt", "yuv420p", vid], check=True, capture_output=True)
+    top = find_empty_band(vid, 0.2, 1.2, 200)
+    sq = find_empty_band(vid, 0.2, 1.2, 200, lo_frac=0.25, hi_frac=0.75)
+    assert top is not None and top < 300, f"the default search should find the top: {top}"
+    assert sq is not None and 320 <= sq <= int(0.75 * H) - 200, \
+        f"the grid-square search must stay inside the square: {sq}"
+    print("OK: a cover's band can be confined to the square the IG grid keeps")
+
     # render: a real Chrome round-trip, skipped only where Chrome is absent
     if os.path.exists(CHROME):
         out = os.path.join(d, "card.png")
@@ -315,6 +355,14 @@ if __name__ == "__main__":
             (f"a long domain spills out of the card: ink x {ink[:, 1].min()}-{ink[:, 1].max()} "
              f"vs box {scrim[:, 1].min()}-{scrim[:, 1].max()}")
         print("OK: a 29-char Latin domain is shrunk to fit the card, not spilled out of it")
+        # A RELATIVE out path: `publishing.py projects/<reel>` is the documented fix command, and
+        # Chrome turns the path into a file:// URL — `file://projects/…` names a HOST, so it loads
+        # nothing and writes no screenshot. The card must come out whatever the cwd is.
+        rel_dir = os.path.relpath(d, os.getcwd())
+        rel = os.path.join(rel_dir, "rel.png")
+        render(["जुड़िये"], rel, y=y2)
+        assert os.path.exists(rel), "a relative out path must still write the card"
+        print("OK: a relative out path renders the card (Chrome file:// takes an absolute path)")
     else:
         print("SKIP: render (Chrome not installed here)")
     print("caption --selfcheck OK")

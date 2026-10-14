@@ -868,6 +868,90 @@ def judge_captions(script: str, caps: dict) -> dict:
     return {"problems": problems, "captions": fixed}
 
 
+_PUBLISHING_SCHEMA = """{
+  "youtube_title": "the SEARCHABLE title — the words a Hindi speaker would type, front-loaded",
+  "youtube_title_alt": "an alternate title, curiosity-led rather than search-led",
+  "caption": "the Instagram/Facebook caption: the hook line first, then the caption body",
+  "youtube_description": "the YouTube description",
+  "tags": "comma-separated YouTube tags",
+  "keywords": "comma-separated Instagram/Facebook keywords",
+  "hashtags": "#hashtags for IG/FB"
+}"""
+
+
+def publishing_copy(facts: dict) -> dict:
+    """The reel's publishing sheet — the words it goes out with, written from the reel itself.
+
+    The owner's template folder (dadaji-ka-kahani, 2026-10-14) carried a hand-written
+    publishing.md: titles, a caption, a description, per-platform keywords and hashtags. That is
+    copywriting, which is what the other three agents already do, so it comes from the same brain
+    and reads the same wavelength and craft lessons (`_system`). Independent of the render: an
+    outage here must never cost a reel, so the caller falls back to the reel's own words.
+
+    `facts` is the reel's OWN text — title, script, the caption cards, the shot plan's world, the
+    duration. Nothing is invented that is not in there, and the hook line is returned verbatim so
+    the profile grid and the reel's first frame say the same thing."""
+    system = _system(
+        "You write the publishing copy for a finished Hindi short reel for an Indian senior-care "
+        "NGO. It is posted to YouTube Shorts, Instagram Reels and Facebook. You write ONLY the "
+        "words it ships with. Output ONLY valid JSON, no prose."
+    )
+    hook = " / ".join((facts.get("cards") or {}).get("hook", {}).get("lines") or [])
+    user = (
+        f"REEL TITLE: {facts.get('title', '')}\n"
+        f"LENGTH: {facts.get('seconds', 0):.0f} seconds, vertical 9:16\n"
+        f"THE REEL'S OWN OPENING CARD (verbatim): {hook}\n\n"
+        f"SCRIPT:\n{facts.get('script', '')}\n\n"
+        f"CAPTION CARDS:\n{json.dumps(facts.get('cards') or {}, ensure_ascii=False)}\n\n"
+        f"WHAT IT IS (from the shot plan):\n{facts.get('plan', '')}\n\n"
+        f"Produce JSON with EXACTLY this shape:\n{_PUBLISHING_SCHEMA}\n\nRULES:\n"
+        "- Devanagari Hindi is the language of the audience. The titles, the caption and the "
+        "description are in Hindi (a Roman brand name or hashtag is fine inside Hindi text).\n"
+        "- 'youtube_title' front-loads what someone would actually TYPE to find this; keep it "
+        "under 90 characters.\n"
+        "- 'caption' MUST begin with the opening card's line VERBATIM, then a blank line, then "
+        "the body. The profile grid shows the first line, so it has to be the reel's own promise.\n"
+        "- The caption body: 2-4 short paragraphs or bullets drawn from the reel's actual lines, "
+        "then the moral, then ONE question that invites a comment, then the foundation's address "
+        f"{BRAND_URL} — spelled exactly like that, no other address, never invented or shortened.\n"
+        "- 'tags' and 'keywords' are comma-separated, 10-14 entries, covering what this reel is "
+        "about in the words people search. 'hashtags' is 12-15 hashtags, #-prefixed.\n"
+        "- Say only what the reel says. Never a statistic, a claim, a date or a promise that is "
+        "not in the text above.\n"
+        "- Return JSON ONLY."
+    )
+    text, _used = chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_tokens=3000, temperature=0.8, role="publishing",
+    )
+    out = _extract_json(text)
+    for k in ("youtube_title", "youtube_title_alt", "caption", "youtube_description"):
+        if isinstance(out.get(k), str):
+            out[k] = _fix_url(out[k])
+    for k in ("tags", "keywords", "hashtags"):
+        if isinstance(out.get(k), list):
+            out[k] = ", ".join(str(x) for x in out[k])
+    _publishing_selfcheck(out, hook)
+    return out
+
+
+def _publishing_selfcheck(obj: dict, hook: str = "") -> bool:
+    """OFFLINE contract for publishing_copy(). A sheet with no hook line, a hallucinated address
+    or no hashtags is worse than no sheet — it would go out. Asserted here, where it is free."""
+    for k in ("youtube_title", "caption", "youtube_description", "tags", "keywords", "hashtags"):
+        assert isinstance(obj.get(k), str) and obj[k].strip(), f"publishing: missing '{k}'"
+    if hook:
+        assert obj["caption"].strip().startswith(hook.strip()), \
+            "publishing: the caption must open with the reel's own hook line, verbatim"
+    assert BRAND_URL in obj["caption"] or BRAND_URL in obj["youtube_description"], \
+        "publishing: the foundation's address is missing from the copy"
+    assert re.search(r"\b(?:https?://)?(?:www\.)?[A-Za-z0-9-]+\.(?:org|com|in|net|co|io)\S*",
+                     obj["caption"]).group(0).startswith(BRAND_URL), \
+        "publishing: a different domain reached the copy"
+    assert len(obj["hashtags"].split()) >= 8, "publishing: too few hashtags"
+    return True
+
+
 def _presentation_selfcheck(obj: dict) -> bool:
     """OFFLINE contract for presentation(). A card that overflows, an empty card, or a reel that
     quietly declares itself photoreal would each reach the owner's screen — so they are asserted
@@ -1377,7 +1461,32 @@ if __name__ == "__main__":
         # this keeps the one rule the owner had to say twice from being edited away.
         assert "the agent's job, not a ticket for the owner" in _wavelength(), \
             "WAVELENGTH §6 no longer says the by-eye fallback is performed by the agent"
+        # §9: the folder contract is prose the build now ENFORCES (qc.check_reel_folder reads
+        # publishing.FOLDER), so the two must not drift. If the section is edited out, the gate
+        # keeps demanding files the wavelength no longer explains.
+        assert "The folder is the deliverable" in _wavelength() \
+            and "publishing.md" in _wavelength(), \
+            "WAVELENGTH §9 no longer states the folder contract the gate enforces"
         print("OK: any web address on a card is rewritten to the foundation's own")
+
+        # the publishing sheet's contract: a sheet that would go out must open on the reel's own
+        # hook line and carry the foundation's real address — never an invented one.
+        _sheet = {"youtube_title": "दादाजी की 4 बातें", "youtube_title_alt": "अकेले दादाजी",
+                  "caption": f"अस्सी की उम्र में मैंने ये बातें सीखीं…\n\n{BRAND_URL}\n",
+                  "youtube_description": "एक अकेले दादाजी की कहानी",
+                  "tags": "a, b", "keywords": "a, b",
+                  "hashtags": " ".join(f"#h{i}" for i in range(12))}
+        _publishing_selfcheck(_sheet, "अस्सी की उम्र में मैंने ये बातें सीखीं…")
+        for _bad in ({**_sheet, "caption": _sheet["caption"].replace("अस्सी", "पचास")},
+                     {**_sheet, "caption": f"जुड़िये standardsunrise.org पर\n"},
+                     {**_sheet, "hashtags": "#one #two"},
+                     {**_sheet, "youtube_title": "  "}):
+            try:
+                _publishing_selfcheck(_bad, "अस्सी की उम्र में मैंने ये बातें सीखीं…")
+            except AssertionError:
+                continue
+            raise AssertionError(f"publishing_sheet accepted a sheet it must refuse: {_bad}")
+        print("OK: a publishing sheet must open on the reel's own hook and the real address")
         print("OK: presentation() rejects overflow, an empty card, an English-only hook, "
               "a photoreal identity, and an unknown font")
         raise SystemExit(0)

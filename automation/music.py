@@ -284,19 +284,46 @@ def add(src, *, title=None, artist="unknown", source="unknown", source_url=None,
     return dest
 
 
+def provenance(name):
+    """The LIBRARY.md row for one shelf file — title, artist, source, licence — as a dict.
+
+    Provenance lives in LIBRARY.md (the human archive of record), but a reel's OWN folder has to
+    be able to say where its music came from: dadaji-ka-kahani (2026-10-14) is the folder the
+    owner made the template, and "right from the music" was in the ask. So install() copies this
+    in beside the bed and the answer travels with the reel. {} when the row is unknown — a
+    provenance record, never a gate (owner ruling 2026-10-10)."""
+    try:
+        rows = [ln for ln in open(os.path.join(LIB, "LIBRARY.md"), encoding="utf-8")
+                if ln.startswith("| ")]
+    except OSError:
+        return {}
+    for ln in rows:
+        cells = [c.strip() for c in ln.strip().strip("|").split(" | ")]
+        if len(cells) < 4 or cells[0] != name:
+            continue
+        title, _, artist = cells[1].partition(" / ")      # cells escape '|' as '\|', so the
+        m = re.match(r"\[([^\]]+)\]\(([^)]+)\)", cells[2])  # ' | ' split above cannot break one
+        return {"title": title.strip(), "artist": artist.strip(),
+                "source": (m.group(1) if m else cells[2]).replace("\\|", "|"),
+                "source_url": m.group(2) if m else "", "licence": cells[3]}
+    return {}
+
+
 def install(project_dir, track_path, track=None):
     """Copy a chosen track in as the project's music_raw.mp3 — the path the assembler mixes —
     and record HOW to place it (music_meta.json): the level skip for a slow intro, and the
     track's own loudness so the assembler can normalise a quietly-mastered bed. Without this
     the assembler can only guess from t=0, which is the defect that took darzi's bed silent
-    through its hook."""
+    through its hook. The track's PROVENANCE rides along, so the reel can name its own score."""
     dest = os.path.join(project_dir, "music_raw.mp3")
     if os.path.abspath(track_path) != os.path.abspath(dest):
         shutil.copy2(track_path, dest)
     if track:
+        meta = {"level_start": track.get("level_start", 0.0), "mean_db": track.get("mean_db"),
+                "file": os.path.basename(track_path)}
+        meta.update(provenance(os.path.basename(track_path)))
         with open(os.path.join(project_dir, "music_meta.json"), "w") as f:
-            json.dump({"level_start": track.get("level_start", 0.0),
-                       "mean_db": track.get("mean_db")}, f, indent=1)
+            json.dump(meta, f, ensure_ascii=False, indent=1)
     return dest
 
 
@@ -397,6 +424,22 @@ if __name__ == "__main__":
         assert sync_score(mb, [ons[1], ons[2]]) == 1.0, "cuts on beats must score 1.0"
         assert sync_score(mb, [ons[1] + 0.07]) > 0.0, "a near-miss inside tolerance still counts"
         assert sync_score(mb, []) == 0.0 and sync_score({}, [1.0]) == 0.0, "no data -> 0.0"
+
+        # provenance: a reel's folder must be able to NAME its own score without reading the
+        # library. Unknown files give {} (recorded, never a gate); a shelved one gives its row.
+        shelf = "memory-of-the-village__desifreemusic__pixabay.mp3"
+        if os.path.exists(os.path.join(LIB, shelf)):
+            pv = provenance(shelf)
+            assert pv.get("title") and "Pixabay" in pv.get("licence", ""), \
+                f"the LIBRARY.md row must parse: {pv}"
+            assert provenance("nothing-like-this.mp3") == {}, "an unknown track has no row"
+            pdir = os.path.join(d, "proj")
+            os.makedirs(pdir)
+            install(pdir, os.path.join(LIB, shelf), md)
+            meta = json.load(open(os.path.join(pdir, "music_meta.json"), encoding="utf-8"))
+            assert meta.get("title") == pv["title"] and meta.get("licence") == pv["licence"], \
+                f"install must carry the provenance into the reel: {meta}"
+            assert meta["level_start"] == md["level_start"], "placement is still recorded"
         print("OK: brightness, tempo and sync are measured from the audio, not the filename")
         raise SystemExit(0)
 

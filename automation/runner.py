@@ -769,6 +769,7 @@ if __name__ == "__main__":
         # (cards placed, score bed, verified) and that the gate records a real verdict for it.
         import json, vision, agents as _agents
         os.environ["STYLE_CHECK"] = "0"
+        os.environ["PUBLISH_LLM"] = "0"     # offline: no LLM for the publish sheet
         _orig_review, _orig_medium = vision.review_frame, vision.medium_of
         _orig_judge = _agents.judge_captions
         vision.review_frame = lambda png: []
@@ -796,6 +797,19 @@ if __name__ == "__main__":
         _sp.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=220:d=20",
                  "-c:a", "libmp3lame", os.path.join(_pd, "music_raw.mp3")],
                 capture_output=True, check=True)
+        # ...and the kickoff artifacts the engine authors beside it: agent 1's script, agent 2's
+        # shot list, and music.install's provenance row. A reel the pipeline BUILT carries all
+        # three, and qc gates go_live on the folder being complete (reel-folder) — a fixture that
+        # skips them is not the folder a finished reel has.
+        with open(os.path.join(_pd, "script.md"), "w", encoding="utf-8") as f:
+            f.write("# selftest\n\nHOOK: वो क्यों चुप थे?\nMORAL: वक़्त देना ही असली तोहफ़ा है\n")
+        with open(os.path.join(_pd, "shotlist.json"), "w", encoding="utf-8") as f:
+            json.dump({"title": "selftest", "world": "a warm living room",
+                       "style": "soft stylized 3-D animation", "music_mood": "warm",
+                       "shots": [{"line": "वो क्यों चुप थे?"}]}, f, ensure_ascii=False)
+        with open(os.path.join(_pd, "music_meta.json"), "w", encoding="utf-8") as f:
+            json.dump({"level_start": 0.0, "mean_db": -21.0, "file": "music_raw.mp3",
+                       "title": "self-check bed", "licence": "self-check"}, f)
         try:
             runner.stitch_done_projects(st)
         finally:
@@ -844,6 +858,7 @@ if __name__ == "__main__":
         st.set_status(nid2, "done", video_path=os.path.join(bare, "clip_001.mp4"))
 
         os.environ["STYLE_CHECK"] = "0"
+        os.environ["PUBLISH_LLM"] = "0"     # offline: no LLM for the publish sheet
         vision.review_frame = lambda png: []
         vision.medium_of = lambda png: "3d"
         _agents.judge_captions = lambda script, caps: {"problems": [], "captions": caps}

@@ -271,6 +271,45 @@ the same caption system, and it lands as the last thing on screen — carrying t
 other. A wrong domain is a fact the model got wrong, not a taste call, so the code rewrites any
 web address on a card to this one before the card is written (`agents._fix_url`).
 
+## 9. The reel's folder — everything in one place
+
+**The folder is the deliverable.** A reel is not finished when the cut plays; it is finished when
+one folder holds everything needed to review it, approve it and post it, with nothing left in a
+terminal or in someone's head. The owner's rule (2026-10-15), holding up `projects/dadaji-ka-kahani`
+as the template: *"right from the music to the caption, to the publishing, to the shotlist, to the
+script, to the covers — everything should be in this folder, just like this."*
+
+The list is one definition, `publishing.FOLDER`, beside the code that writes its members:
+
+| file | who writes it |
+|---|---|
+| `script.md` | `agents.write_script` |
+| `shotlist.json` | `agents.build_shotlist` |
+| `identity.json` | `agents.presentation` |
+| `captions.json` | `agents.presentation` |
+| `music_raw.mp3` | `music.choose` |
+| `music_meta.json` | `music.install` (where the score came from + how it is placed) |
+| `final_veo.mp4` | `assemble.build` |
+| `caption_place.json` | `assemble.build` (where each card landed) |
+| `music_bed.json` | `assemble.build` (the measured floor of the shipped cut) |
+| `cover.png` | `publishing.cover` |
+| `publishing.md` | `publishing.sheet` |
+
+- Two of these were previously made **by hand**, which is why the folder could be complete one reel
+  and not the next. Both are now written by the build (`assemble.build` calls `publishing.pack`),
+  so the next reel has them because the pipeline wrote them, not because someone remembered.
+- A missing member is a **publish-gate**, never a block: the reel may be perfect, it just cannot be
+  posted without going back to the terminal. `qc.check_reel_folder` names every missing file and the
+  command that writes them (`publishing.py <dir>`).
+- **The cover is a real frame of the reel**, never a generated image — it is the one picture the reel
+  is picked by, and a cover that is not in the film is a promise the film does not keep. Its hook
+  line sits in the **middle half of the frame**: the profile grid shows a 1:1 **centre crop**, so a
+  line near the top (where the reel itself puts it) is cropped away there. The frame is taken at a
+  moment `caption_place.json` says is card-free, so the cover never carries a second card.
+- `publishing.md` is written **once** and never overwritten without `--force`: the owner edits it,
+  and a rebuild must not undo that. An outage is not a defect here either — the sheet falls back to
+  the reel's own words rather than leaving the folder incomplete.
+
 ---
 
 ## Hard nevers
