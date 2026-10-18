@@ -126,7 +126,8 @@ STATES = ("rendering", "done", "error", "captcha", "rate_limited", "login", "unk
 ANSWERED = []
 
 
-def _post(url: str, key: str, model: str, png: bytes, prompt: str, max_tokens: int):
+def _post(url: str, key: str, model: str, png: bytes, prompt: str, max_tokens: int,
+          timeout: int = 30):
     """One request to one (gateway, model). Returns (text, the model the SERVER reports) and raises
     whatever urllib raises, so the caller classifies the failure. Shared by _ask and _sees so a
     probe travels the same road a real question does."""
@@ -141,7 +142,7 @@ def _post(url: str, key: str, model: str, png: bytes, prompt: str, max_tokens: i
     req = urllib.request.Request(
         url.rstrip("/") + "/chat/completions", data=body,
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=90) as r:
+    with urllib.request.urlopen(req, timeout=30) as r:
         d = json.load(r)
     txt = (d.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
     return txt, (d.get("model") or model)

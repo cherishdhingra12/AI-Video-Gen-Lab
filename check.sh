@@ -50,6 +50,7 @@ fi
 
 run "state (jobs/resume/credits/lessons/qc-verdicts)" "$PY" automation/state.py --selfcheck
 run "learn (backoff + scheduler routing)"             "$PY" automation/learn.py --selfcheck
+run "login (credit seeding + unclear reads)"          "$PY" automation/login.py --selfcheck
 run "agents (style-anchored clip prompts)"            "$PY" agents.py --selfcheck
 run "pipeline (idea -> a unique project folder)"      "$PY" pipeline.py --selfcheck
 run "runner (resume, wall->requeue, stitch, gate)"    "$PY" automation/runner.py --selfcheck

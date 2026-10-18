@@ -1,7 +1,10 @@
 """
-googlevids.py — Google Vids (vids.google.com), Veo 3.1 clips. MONTHLY-refresh, now
-in-scope (policy 2026-09-23: monthly accepted). The QUALITY pick of the fleet — Veo 3.1,
-~50 AI-clip gens/month, resets 12 AM PT on the 1st. 9:16 vertical supported since Oct 2025.
+googlevids.py — Google Vids (vids.google.com), Veo 3.1 clips. Documented as ~50 AI-clip
+gens/month resetting 12 AM PT on the 1st (policy 2026-09-23: a monthly bucket is accepted).
+The QUALITY pick of the fleet. 9:16 vertical supported since Oct 2025. That ~50/month is a
+DOC, not a measurement: the account hit the limit for the first time on 2026-10-16 after
+~50 generations this month, and the message it shows names no period — so treat the reset as
+unknown and let the ledger re-ask (quota_refill) rather than assume the 1st.
 
 FLOW (CONFIRMED live 2026-09-23 on profile googlevids__a1 — cookies imported via
 import_login.py; selectors exercised headless up to the enabled Generate button, NO gen
@@ -15,8 +18,10 @@ fired during recon):
      (spends 1 of the ~50 monthly clip gens; Veo render).
   5. Poll until the clip renders (vision), then export/download the vid as mp4.
 
-Quota gate: when the monthly pool is spent, Vids shows a limit message → Wall("rate_limit")
-so the runner cools it (ideally until the 1st; see learn.py note in memory).
+Quota gate: when the pool is spent the panel says so — "You've hit your limits for generating
+videos in Vids." with Try again / Remove — and that is a Wall("credits"), not a rate limit: it
+means the ACCOUNT is out until its refill, so the pair is marked dry in the ledger rather than
+cooled for a few minutes. The message names no period; see quota_refill.
 
 DOWNLOAD (fixed 2026-09-26): the finished Veo clip is served from *.usercontent.google.com
 (?...&filename=video.mp4) — 720x1280 9:16 h264 WITH audio. We capture that URL off the wire
@@ -43,8 +48,23 @@ class GoogleVids(SiteAdapter):
     prompt_sel = "textarea, [contenteditable='true']"     # AI-clip panel prompt box (1 match)
     generate_sel = "[aria-label='Generate' i]"            # send arrow; disabled until prompt non-empty
 
+    # OUT OF GENERATIONS, in the words the panel actually uses (seen live 2026-10-16): "You've hit
+    # your limits for generating videos in Vids." The second half of this pattern read
+    # `generation`, and "generating" is not "generation" — so the one sentence that means STOP
+    # matched NOTHING. Three submits read it as a render in progress, polled twelve minutes each,
+    # recorded it as a transient `block` (10 min, doubling), spent one of the clip's three retries
+    # and one generation apiece, and would have declared the clip dead. `generat` covers
+    # generate/generating/generation. Checked against that live sentence, and against all five of
+    # this reel's own prompts (they are typed into the panel, so they become page text) plus the
+    # panel's own labels, for false hits.
     _QUOTA = re.compile(r"(reached|out of|no more|limit).{0,40}"
-                        r"(credit|generation|clip|quota|limit)", re.I)
+                        r"(credit|generat|clip|quota|limit)", re.I)
+
+    # What that message means for the ledger. It names NO period — "Try again" is all it offers —
+    # so this is a RE-ASK interval, not a claim about Google's reset. Guessing 'monthly' would park
+    # a reel that already owns clips on this source until the 1st if the cap were really daily,
+    # while re-asking costs one refused browser run: no generation spent, and (runner) no retry.
+    quota_refill = "daily"
 
     # ---- passive capture of the rendered clip URL (gstatic.com/docs/... are promo decoys) ----
     def _watch(self, session):
@@ -83,11 +103,20 @@ class GoogleVids(SiteAdapter):
                     pass
         return False
 
-    def _quota_blocked(self, session) -> bool:
+    def _quota_line(self, session) -> str:
+        """The site's own out-of-generations sentence, or '' when the page says nothing of the kind.
+
+        The words matter twice over: they are why the wall fires, and they are what the job's
+        `last_error` and the report show a person — "credits: You've hit your limits for generating
+        videos in Vids." says exactly what happened, where a generic message would not."""
         try:
-            return bool(self._QUOTA.search(session.page.inner_text("body")))
+            body = session.page.inner_text("body")
         except Exception:
-            return False
+            return ""
+        return next((l.strip() for l in body.splitlines() if self._QUOTA.search(l)), "")
+
+    def _quota_blocked(self, session) -> bool:
+        return bool(self._quota_line(session))
 
     def submit(self, session, prompt: str):
         self._watch(session)
@@ -116,8 +145,8 @@ class GoogleVids(SiteAdapter):
         time.sleep(7)
 
         if self._quota_blocked(session):
-            raise Wall("credits", "Google Vids monthly quota reached — refreshes on the 1st",
-                       refill="monthly")
+            raise Wall("credits", self._quota_line(session) or "Google Vids is out of generations",
+                       refill=self.quota_refill)
 
         # 4) prompt + fire. Real keyboard: Google SPAs ignore JS value injection.
         if not session.has(self.prompt_sel, timeout=8000):
@@ -132,20 +161,28 @@ class GoogleVids(SiteAdapter):
         gen.click()
         time.sleep(4)
         if self._quota_blocked(session):
-            raise Wall("credits", "Google Vids monthly quota reached — refreshes on the 1st",
-                       refill="monthly")
+            raise Wall("credits", self._quota_line(session) or "Google Vids is out of generations",
+                       refill=self.quota_refill)
 
     def poll(self, session) -> str:
         """CONFIRMED live: the AI-clip panel shows a NN% + Cancel while Veo renders; when
         done the result action bar (Insert / Extend / Edit / Recreate / Remove) appears.
-        ~60s for a 10s clip. Quota message -> rate_limited so the runner cools it."""
+        ~60s for a 10s clip. Out of generations -> Wall('credits'), so the runner marks the
+        pair dry with its refill time instead of cooling it for a while."""
         pg = session.page
         try:
             body = pg.inner_text("body")
         except Exception:
             body = ""
         if self._QUOTA.search(body):
-            return "rate_limited"
+            # OUT, not throttled. Returning "rate_limited" here sent this to
+            # learn._WALL_BASE['rate_limit']: a 15-minute cooldown that spends one of the clip's
+            # three retries and never marks the pair dry — so the same empty account was picked
+            # again, and again, until the clip was declared dead and a crisis was filed over what
+            # is really just a refill. Being empty is not a mistake to step back from.
+            line = next((l.strip() for l in body.splitlines() if self._QUOTA.search(l)), "")
+            raise Wall("credits", line or "Google Vids is out of generations",
+                       refill=self.quota_refill)
         try:                                    # result bar up = render finished
             if (pg.get_by_role("button", name="Insert", exact=True).first.is_visible()
                     and pg.get_by_role("button", name="Recreate", exact=True).first.count()):
@@ -178,6 +215,23 @@ class GoogleVids(SiteAdapter):
         return dest
 
 
+    # ---- live balance: Vids does not have one to read ----
+    def read_credits(self, session):
+        """ALWAYS None: Vids shows no balance anywhere, so the generic vision reader must not be
+        pointed at it. Confirmed by eye (2026-10-16) at all three levels of the UI — the home page,
+        the editor, and the AI-video panel WITH a prompt typed, where the row reads only
+        'Omni · 720p · 3s' and a Generate arrow. Given nothing to read, the vision reader invents
+        a number: on the good-morning reel it answered 0, `observe_credits` stored that as an
+        OBSERVED fact, and the site went dry until the 1st with ~48 generations left — the same
+        dead-end a hand-entered 0 causes, now written by the machine.
+
+        None means "unknown", which is the truth here: it keeps the last known count and lets
+        `spend_credit` walk it down accurately (1 clip = 1 credit). When the pool really is
+        spent, Vids says so in words — `submit()` raises Wall('credits') and mark_dry() records
+        the month's reset. The site is asked, and it answers; nobody guesses on its behalf."""
+        return None
+
+
 ADAPTER = GoogleVids()
 
 
@@ -194,4 +248,35 @@ if __name__ == "__main__":  # self-check: capture state must reset + rebind ever
     assert a._mp4 == [], "download would re-save the previous scene's clip"
     assert s2.page.bound == 2, "listeners not rebound to the new scene's page"
     print("googlevids _watch reset ok")
+
+    # The vision reader must never be given this page: it answered 0 on a page with no balance
+    # and that 0 marked a funded site dry for a month. Unknown is the correct answer here.
+    assert a.read_credits(s2) is None, "Vids has no readable balance — never invent one"
+    print("googlevids reports an unknown balance, never a fabricated one")
+
+    # OUT OF GENERATIONS, in the site's own words. This is the sentence the pipeline READ AS A
+    # RENDER IN PROGRESS for three submits and 36 minutes of polling (2026-10-16): the pattern
+    # wanted "generation" and the panel says "generating". Both halves matter — a wall that never
+    # fires strands a reel, and one that fires on anything swallows good renders — so the live
+    # sentence is asserted IN, and the page text a healthy panel shows is asserted OUT.
+    class _P:
+        def __init__(self, body): self._b = body
+        def inner_text(self, *_a): return self._b
+    class _S:
+        def __init__(self, body): self.page = _P(body)
+    LIVE = "You've hit your limits for generating videos in Vids.\nTry again\nRemove"
+    assert a._quota_blocked(_S(LIVE)), "the site's own 'you are out' sentence must raise a wall"
+    assert "limits for generating videos" in a._quota_line(_S(LIVE)), \
+        "the wall must carry the site's words — they are what the report shows a person"
+    import learn
+    assert learn.refill_at(a.quota_refill) > time.time(), \
+        f"the ledger needs a real time from {a.quota_refill!r}"
+    HEALTHY = ("AI video clip\nOmni · 720p · 3s\nGenerate an AI video clip\nInsert\nRecreate\n"
+               "REQUIRED OUTPUT: 3-D ANIMATED VIDEO — a stylized animated-feature look in every "
+               "frame\nNo text of any kind anywhere in the frame EXCEPT on a phone or tablet "
+               "screen\nAll caption cards are added later.")
+    assert not a._quota_blocked(_S(HEALTHY)), \
+        "a render in progress must never be read as an empty account — the reel's own prompt is " \
+        "typed into this page, so it is page text too"
+    print("googlevids reads the site's real out-of-generations sentence as a wall, and nothing else")
 

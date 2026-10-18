@@ -131,7 +131,7 @@ def main(st=None):
     except Exception:  # noqa: BLE001 — a first reel has nothing to compare against
         prior = []
     try:
-        pres = agents.presentation(script, shot, prior=prior)
+        pres = agents.presentation(script, shot, prior=prior, brief=idea)
         pres["identity"]["reel"] = slug
         with open(os.path.join(pdir, "identity.json"), "w", encoding="utf-8") as f:
             json.dump(pres["identity"], f, indent=2, ensure_ascii=False)

@@ -63,11 +63,19 @@ def _match(jar, keywords) -> list:
     return [c for c in jar if any(k in (c.domain or "").lower() for k in keywords)]
 
 
-def _gather_chrome(keywords: list):
+def _gather_chrome(keywords: list, only: str = None):
     """Scan ALL Chrome profiles; return cookies from the profile with the most
-    matches (mixing sessions across profiles would clash), plus a per-profile report."""
+    matches (mixing sessions across profiles would clash), plus a per-profile report.
+
+    `only` pins one profile by name. That matters the moment a site has TWO accounts: account
+    labels exist to multiply a free ceiling, and a second Google account lives in a second Chrome
+    profile — but "most matches wins" hands back whichever profile happened to browse more, i.e.
+    account 1's session, so `a2` would silently be `a1` and hit the same generation limit.
+    """
     report, best_name, best = {}, None, []
     for name, fp in _chrome_cookie_files():
+        if only and name != only:
+            continue
         try:
             kept = _match(bc.chrome(cookie_file=fp, domain_name=""), keywords)
         except Exception as e:
@@ -108,6 +116,10 @@ def main():
     ap.add_argument("--credits", type=int, default=0)
     ap.add_argument("--keyword", action="append", default=[],
                     help="extra domain keyword(s) to match, e.g. --keyword kling")
+    ap.add_argument("--profile", default=None,
+                    help="pin which Chrome profile to import from (Default, 'Profile 1', ...) — "
+                         "needed as soon as one site has two accounts, or account 1's session is "
+                         "handed to account 2")
     args = ap.parse_args()
 
     adapter = importlib.import_module(f"sites.{args.site}").ADAPTER
@@ -122,12 +134,17 @@ def main():
         keywords.add("google")
     keywords = [k for k in keywords if k]
 
+    got, prof = None, None
     try:
         if args.browser == "chrome":
-            got, prof, report = _gather_chrome(keywords)
+            got, prof, report = _gather_chrome(keywords, only=args.profile)
             print(f"  chrome profiles scanned: {report}")
             if prof:
                 print(f"  using profile '{prof}' ({len(got)} matching cookies)")
+            if args.profile and not prof:
+                sys.exit(f"no cookies for {keywords} in Chrome profile {args.profile!r}. "
+                         f"Profiles scanned: {report or 'none'}. Sign that account in, or drop "
+                         f"--profile to let it pick the fullest profile.")
         else:
             got = _gather(args.browser, keywords)
     except Exception as e:
@@ -143,6 +160,14 @@ def main():
     # inject into our persistent profile, then verify we land logged-in
     with Session(args.site, args.account, headless=True) as s:
         s._ctx.add_cookies(pw_cookies)
+        if prof:
+            # Remember WHICH Chrome profile this account's session came from. The runner re-imports
+            # cookies before every run (Google rotates them fast), and without this note it would
+            # re-scan every profile and hand back the fullest one — which, now that this site has
+            # two accounts, is account 1's — silently signing a2 back out and into a1. A one-line
+            # file next to the session it describes needs no registry to stay in sync.
+            with open(os.path.join(s.profile, ".chrome-profile"), "w") as f:
+                f.write(prof)
         s.goto(home)
         time.sleep(3)
         state = read_state(s.screenshot())["state"]

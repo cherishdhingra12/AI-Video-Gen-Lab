@@ -51,6 +51,19 @@ def _session(site: str, account: str, headless: bool):
     return Session(site, account, headless=headless)
 
 
+def _chrome_pin(site: str, account: str) -> str:
+    """The Chrome profile this account's session was imported from, or '' when nothing recorded one.
+
+    import_login.py writes this beside the session it describes. Without it the re-import re-scans
+    every Chrome profile and takes the fullest — and once one site has two accounts, "fullest" is
+    account 1's, so a2 would be signed straight back into a1 and into the same generation limit."""
+    try:
+        with open(os.path.join(ROOT, "profiles", f"{site}__{account}", ".chrome-profile")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def _refresh_cookies(site: str, account: str, keywords) -> None:
     """Re-hydrate a profile from real Chrome right before a run. Some sites (Google Flow)
     rotate session cookies fast, so an old snapshot import signs out within minutes; a fresh
@@ -60,27 +73,46 @@ def _refresh_cookies(site: str, account: str, keywords) -> None:
     cmd = [sys.executable, os.path.join(_DIR, "import_login.py"), site, account, "--browser", "chrome"]
     for kw in keywords:
         cmd += ["--keyword", kw]
+    if (pin := _chrome_pin(site, account)):
+        cmd += ["--profile", pin]
     try:
-        subprocess.run(cmd, cwd=_DIR, timeout=90, capture_output=True)
+        r = subprocess.run(cmd, cwd=_DIR, timeout=90, capture_output=True, text=True)
     except Exception as e:
         print(f"  cookie refresh for {site}/{account} skipped: {e}")
+        return
+    if r.returncode:
+        # Best-effort means "carry on with the cookies we already have", not "never mention it" —
+        # a wrong pin would otherwise stop refreshing for good, in silence.
+        tail = (r.stderr or r.stdout or "").strip().splitlines()
+        print(f"  cookie refresh for {site}/{account} failed: {tail[-1][:160] if tail else '?'}")
+
+
+def read_balance(adapter, session):
+    """This account's balance as read off the page we are already on, or None when the page did
+    not say. None is the whole point of the function and the reason it is one function: an
+    unclear read must NEVER overwrite a known number, and both callers — the runner before it
+    spends, and `login.py --check` — have to hold that exact line, so they hold it here."""
+    reader = getattr(adapter, "read_credits", None)
+    if reader is None:
+        return None
+    try:
+        n = reader(session)
+    except Exception as e:
+        print(f"  credit read skipped: {str(e)[:120]}")
+        return None
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        return None                                  # not clear -> keep the last known number
+    return n
 
 
 def _observe_credits(st: State, adapter, session, site: str, account: str) -> None:
     """Best-effort: read this account's REAL balance off the page we're already on, before the
     local spend, so the scheduler and brain.report work from observed numbers instead of the
-    hand-entered signup guess. Fail-open — an unclear read (None / nonsense / gateway down)
-    keeps the last known number and never blocks the job."""
-    reader = getattr(adapter, "read_credits", None)
-    if reader is None:
+    hand-entered signup guess. Fail-open — an unclear read (None / nonsense / gateway down) keeps
+    the last known number and never blocks the job."""
+    n = read_balance(adapter, session)
+    if n is None:
         return
-    try:
-        n = reader(session)
-    except Exception as e:
-        print(f"  credit read skipped for {site}/{account}: {str(e)[:120]}")
-        return
-    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
-        return                                  # not clear -> keep the last known number
     st.observe_credits(site, account, n)
     print(f"  {site}/{account}: observed {n} credits on the site")
 
@@ -282,8 +314,18 @@ def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
             # again and again.
             back = learn.refill_at(w.refill)
             st.mark_dry(site, account, back)
-            print(f"  {site}/{account}: out of credits — dry until "
-                  + (time.strftime("%Y-%m-%d %H:%M", time.localtime(back)) if back else "a person says otherwise"))
+            when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(back)) if back
+                    else "a person says otherwise")
+            print(f"  {site}/{account}: out of credits — dry until {when}")
+            br.hit_wall(site, account, w.kind, step=job["status"], detail=w.detail)
+            # A DRY SITE IS NOT A FLAKY CLIP, so it must not spend the clip's retries. `retries`
+            # budgets the SITE's flakiness (state.requeue says so) and this attempt was refused
+            # before it cost anything. Spending one here meant the third refused submit marked the
+            # clip 'failed' and filed a crisis over an account that was merely empty until its
+            # refill — which is exactly what the 2026-10-16 good-morning run was two walls away
+            # from. The pair is dry in the ledger, so no run picks it again before `back`.
+            st.set_status(job["id"], "queued", error=f"credits: {w.detail} — dry until {when}"[:300])
+            return "dry"
         cd = br.hit_wall(site, account, w.kind, step=job["status"], detail=w.detail)
         n = st.bump_retry(job["id"])
         # step back: requeue unless we've exhausted retries on this clip
@@ -661,7 +703,12 @@ if __name__ == "__main__":
         runner._adapter = lambda site: cwall if site == "flow" else fake
         cst.add_job("dryreel", 0, "a clip on a site with nothing left")
         _dj = cst.db.execute("SELECT * FROM jobs WHERE project='dryreel' AND idx=0").fetchone()
-        assert runner.process_job(cst, cbr, _dj, headless=True) == "walled"
+        assert runner.process_job(cst, cbr, _dj, headless=True) == "dry"
+        _dj = cst.db.execute("SELECT * FROM jobs WHERE id=?", (_dj["id"],)).fetchone()
+        assert _dj["retries"] == 0 and _dj["status"] == "queued", \
+            f"a dry site must not spend the clip's retries — three refusals kill a clip: {dict(_dj)}"
+        assert "Flow daily credits spent" in _dj["last_error"], \
+            f"the site's own words must reach the report: {_dj['last_error']}"
         row = cst.db.execute(
             "SELECT remaining, resets_at, source FROM credits WHERE site='flow'").fetchone()
         assert row["remaining"] == 0 and row["source"] == "observed", dict(row)
@@ -671,7 +718,17 @@ if __name__ == "__main__":
         assert cbr.wait_for_bid("flow") is False, "an empty site is a dead end, not a wait"
         assert cbr.pick(want_site="flow") == ("krea", "k1"), \
             "the reel moves to a source that has credit"
+        # ...and a SECOND ACCOUNT on that same site un-blocks it WITHOUT moving the reel — which is
+        # the entire reason to keep a second account (the free ceiling is per account, not per site).
+        # It only works while the lock records the SITE: record the account and clips 1-4 follow a1's
+        # empty bucket onto another site, which is a different look and a strand.
+        assert cbr.pick(want_site="flow", strict=True) is None, \
+            "the reel's locked site is empty and alone — so the reel waits"
+        cst.set_credits("flow", "f2", remaining=50)
+        assert cbr.pick(want_site="flow", strict=True) == ("flow", "f2"), \
+            "a funded second account must be picked on the reel's own site"
         print("OK: a site that says it is out of credits is marked dry with its own refill time")
+        print("OK: a second account on the same site un-blocks the reel without changing its look")
 
         # ONE REEL, ONE SOURCE. "selftest" now has a done clip on kling, so kling is the reel's
         # lock. Put kling in cooldown and stand up a healthy other site: the next clip must WAIT
@@ -1054,6 +1111,21 @@ if __name__ == "__main__":
             "a row with no file on disk has nothing to keep"
         print("OK: a failed fetch is retried in-session (the render already exists), and a clip "
               "already downloaded is never re-submitted")
+
+        # The Chrome-profile pin is written by import_login.py and read here, from two files — so
+        # prove the two agree instead of trusting they do. Get the path wrong and a second account
+        # re-imports the first one's Google session: it looks signed in, and it hits the same limit.
+        import shutil, browser
+        _probe = browser.Session("pincheck", "a0").profile
+        with open(os.path.join(_probe, ".chrome-profile"), "w") as f:
+            f.write("Profile 7\n")
+        assert runner._chrome_pin("pincheck", "a0") == "Profile 7", \
+            f"import_login writes the pin to {_probe}; the runner must read it from there"
+        assert runner._chrome_pin("pincheck", "nosuch") == "", \
+            "an account with no recorded profile must fall back to scanning, not raise"
+        shutil.rmtree(_probe, ignore_errors=True)
+        print("OK: an imported account remembers its Chrome profile, so a second account cannot "
+              "silently inherit the first one's session")
         print("OK: hermetic self-check (temp dirs) + craft-gate verdict persisted")
         print("OK: observed balance updates the count before spend; a failed read never blocks a job")
     else:

@@ -215,8 +215,11 @@ def check_craft_layers(reel):
                      "not laid over it at assembly")
     if not any("moral" in os.path.basename(c).lower() for c in reel.captions):
         probs.append("no moral card (caption_moral.png) — the reel needs a stated takeaway")
-    if not glob.glob(os.path.join(reel.dir, "music_raw.mp3")):
-        probs.append("no background score (music_raw.mp3) — the reel plays silent/flat")
+    # A separate music_raw.mp3 is NOT required. The score may ride inside the generated clips —
+    # Google Vids bakes its own bed, and the owner rejected every track laid over it for
+    # dadi-ki-bucket-list (2026-10-18), so "no bed file" is a reel's choice, not a defect. The
+    # defect this line was a proxy for — a reel that plays flat — is measured directly by
+    # check_score_present, which reads the shipped cut's audio floor.
     return probs
 
 
@@ -247,10 +250,12 @@ def check_reel_folder(reel):
         return []                                   # not a pipeline folder — see above
     import publishing
     missing = [f for f in publishing.REQUIRED if f not in have
+               and f not in publishing.OPTIONAL
                and not (f == "final_veo.mp4" and "final.mp4" in have)]
     if not missing:
         return []
     how = "; ".join(f"{f} ({who})" for f, _, who in publishing.FOLDER if f in missing)
+    # publishing.OPTIONAL is not demanded: a reel may carry no bed file at all.
     return [f"the reel's folder is incomplete — missing {', '.join(missing)}. The owner's template "
             f"is projects/dadaji-ka-kahani: one folder with the script, the shot list, the cards, "
             f"the score and its provenance, the cut, the cover and the publishing sheet. Write "
@@ -413,6 +418,76 @@ def _contact_sheet(frames):
         return None
 
 
+def _main_face_sheet(frames):
+    """Like _contact_sheet, but ISOLATES the main recurring face across every clip first.
+
+    The problem this fixes: a contact sheet with Dadaji in clip 0 and his daughter in clip 1
+    will correctly report 'different people' — but that answers the WRONG question. The right
+    question is whether the MAIN character (the one in the most clips, or the closest to camera)
+    is the same person throughout. So this function:
+      1. Runs macOS Vision faces on every frame
+      2. Picks the face with the largest bounding box area per frame (closest to camera = main
+         character in that shot)
+      3. When the largest face appears in >50% of clips, isolates THAT face across all clips
+      4. Builds the sheet from crops centered on that face, not full-frame panels
+    Falls back to the full-frame contact sheet when Vision is unavailable."""
+    try:
+        import caption
+        import io
+        from PIL import Image
+    except Exception:
+        return _contact_sheet(frames)
+    try:
+        boxes = caption.faces(frames)
+    except Exception:
+        return _contact_sheet(frames)
+    # Pick the recurring face: for each clip, the largest box is the shot's main subject
+    main_idx = {}       # (x, y) rounded to 40px grid -> appearance count
+    per_frame_face = [] # (cx, cy, w, h) of the chosen face per frame, or None
+    for b in boxes:
+        if not b:
+            per_frame_face.append(None)
+            continue
+        # largest by area = closest/most prominent face in this shot
+        best = max(b, key=lambda bb: bb[2] * bb[3])
+        per_frame_face.append(best)
+        # discretise the centre to group same-person across frames
+        cx = round(best[0] + best[2] / 2, -1)
+        cy = round(best[1] + best[3] / 2, -1)
+        main_idx[(cx, cy)] = main_idx.get((cx, cy), 0) + 1
+    if not main_idx:
+        return _contact_sheet(frames)      # no faces at all -> fall back
+    # The face centre that appears in the MOST clips is our main character
+    best_centre = max(main_idx, key=main_idx.get)
+    appear = main_idx[best_centre]
+    if appear <= len(frames) // 2:
+        return _contact_sheet(frames)      # less than half the clips -> not reliable
+    # Crop each frame to a window around that face
+    cols = 3 if len(frames) > 2 else len(frames)
+    rows = (len(frames) + cols - 1) // cols
+    cw, ch = 300, 533
+    sheet = Image.new("RGB", (cols * cw, rows * ch), (0, 0, 0))
+    for i, png in enumerate(frames[:cols * rows]):
+        fb = per_frame_face[i] if i < len(per_frame_face) else None
+        img = Image.open(io.BytesIO(png)).convert("RGB")
+        if fb:
+            # crop around the face: 3x the face box width, centred, with padding
+            fx, fy, fw, fh = fb
+            cx, cy = fx + fw / 2, fy + fh / 2
+            side = max(fw, fh) * 3.5
+            x0 = max(0, int(cx - side / 2))
+            y0 = max(0, int(cy - side / 2))
+            x1 = min(img.width, int(cx + side / 2))
+            y1 = min(img.height, int(cy + side / 2))
+            panel = img.crop((x0, y0, x1, y1)).resize((cw, ch))
+        else:
+            panel = img.resize((cw, ch))
+        sheet.paste(panel, ((i % cols) * cw, (i // cols) * ch))
+    buf = io.BytesIO()
+    sheet.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def check_character_consistency(reel):
     """The owner asked for 'complete character consistency' across scenes. The clip PROMPTS carry
     a character lock, but a lock in a prompt is not evidence about the RENDER — a face can drift
@@ -438,7 +513,7 @@ def check_character_consistency(reel):
     if len(frames) < 2:
         return []                                   # one panel cannot disagree with itself
     import vision
-    sheet = _contact_sheet(frames)
+    sheet = _main_face_sheet(frames)
     res = vision.compare_character(sheet) if sheet is not None else None
     scan = vision.style_scan_cached(frames)
     pairs_drift = [i for i, same in (scan or {}).get("people", {}).items() if not same]
@@ -538,14 +613,18 @@ FLOOR_BAD = -46.0            # dB; below this the reel's audio has a hole no nar
 
 
 def check_score_present(reel):
-    """The background score must be AUDIBLE IN the rendered audio, not merely on the shelf.
-    craft-layers only checks that projects/<reel>/music_raw.mp3 exists — which passes a reel whose
-    bed was mixed in but silent through its hook (the track opened on a slow alap) or one whose
-    build skipped the mix entirely. Neither a file's existence nor a silencedetect scan catches
-    that; the audio floor does (see _audio_floor for the fleet measurement behind the threshold).
-    A quiet beat between lines is a performance choice — only a floor this low is a defect."""
-    if not reel.final or not glob.glob(os.path.join(reel.dir, "music_raw.mp3")):
-        return []                                   # craft-layers owns 'no score at all'
+    """The reel's audio must CARRY it — measured on the cut, never assumed from a file's presence.
+    This used to run only when projects/<reel>/music_raw.mp3 existed, so the reel it was written
+    for (darzi-ka-tukda: the bed was mixed in but the track's 16.5s slow intro played through the
+    hook) was measured, while any reel whose build skipped the mix entirely was not measured at
+    all. Since 2026-10-18 the floor is measured for EVERY cut — including one that deliberately
+    carries no separate bed, because the score can ride inside the generated clips (Google Vids
+    bakes its own; owner's ruling on dadi-ki-bucket-list). Neither a file's existence nor a
+    silencedetect scan answers this; the floor does (see _audio_floor for the fleet measurement
+    behind the threshold). A quiet beat between lines is a performance choice — only a floor this
+    low is a defect."""
+    if not reel.final:
+        return []                                   # playable() already owns 'no video'
     d = _duration(reel.final)
     if d < 6:
         return []
@@ -726,7 +805,10 @@ LESSONS = [
              "Devanagari baked into the frame, and the real card then reads as a fake pasted over "
              "nonsense — the owner caught it in the closing shot. The generator cannot be trusted "
              "with text, so agents.clip_prompts attaches the no-text rule to EVERY prompt by "
-             "code, and this is the by-eye backstop"),
+             "code, and this is the by-eye backstop. ONE exception, the owner's own ruling "
+             "(2026-10-16): a phone or tablet screen may show the message the story is about — if "
+             "the reel's plot IS a message being read, that bubble is the shot, not an artifact. "
+             "Judge a phone screen by whether it reads cleanly, and everything else by the ban"),
     dict(slug="camera-never-into-frame", tier="judgment", severity="warn",
          title="Camera moves never travel INTO a frame, photo, screen or object",
          why="the owner cut exactly such a move out of a reel (the camera pushing INTO a wall "
@@ -750,10 +832,13 @@ LESSONS = [
              "another, meaningless baked Hindi text) — the brain reviews every reel by eye (vision) "
              "before hand-off, using its past-artifact knowledge"),
     dict(slug="craft-layers", check_id="craft-layers", severity="block",
-         title="The reel SHIPS captions, in-scene narration, a moral card and a background score",
+         title="The reel SHIPS captions, in-scene narration and a moral card",
          why="the owner was taught these layers repeatedly and reels still went out without "
              "them; nothing machine-checked it, so it is now a blocking gate. Narration is "
-             "spoken INSIDE the generated clips (WAVELENGTH.md §3), never a track added after"),
+             "spoken INSIDE the generated clips (WAVELENGTH.md §3), never a track added after. "
+             "A separate score is not one of the required layers: it may ride inside the clips "
+             "too (owner ruling 2026-10-18 on dadi-ki-bucket-list), and whether one carries the "
+             "reel is measured by score-present, not assumed from a file"),
     dict(slug="score-present", check_id="score-present", severity="block",
          title="The background score actually carries the reel (audible in the FINAL, not just on disk)",
          why="a music_raw.mp3 on the shelf is not an audible score: a bed that opens on the "
@@ -1102,7 +1187,8 @@ if __name__ == "__main__":
             assert any("source clips carry no audio" in b for b in v["block"]), \
                 f"clips with no narration audio must be HELD: {v['block']}"
             assert any("no moral card" in b for b in v["block"]), v["block"]
-            assert any("no background score" in b for b in v["block"]), v["block"]
+            # (no "no background score" assert here any more: a bed file is optional since
+            # 2026-10-18 — this stripped fixture is held by 'no audio stream' and the rest)
             assert any("visual review could NOT run" in g for g in v["gate"]), \
                 "a down vision gateway must say so, not silently pass"
             # pacing: this stub is a 2s reel holding a 1s source clip. Both are broken whatever
@@ -1327,7 +1413,11 @@ if __name__ == "__main__":
             # track's 16.5s slow intro played through the hook, so the reel's first third was
             # silent while every offline check stayed green. Build one 12s reel with a loud bed
             # and one whose bed is a -70 dB whisper, and prove the floor tells them apart.
-            for _name, _vol in (("bed_ok", 0.25), ("bed_gone", 0.0003)):
+            # No bed file is a legitimate reel (the clips can carry their own score), so the
+            # floor — not the file — has to be what decides: a loud cut passes with or without
+            # music_raw.mp3, a quiet one is flagged either way.
+            for _name, _vol in (("bed_ok", 0.25), ("bed_gone", 0.0003),
+                                ("no_bed", 0.25), ("no_bed_gone", 0.0003)):
                 _d = tempfile.mkdtemp()
                 _cd = os.path.join(_CLIPS_ROOT, os.path.basename(_d))
                 os.makedirs(_cd)
@@ -1338,7 +1428,8 @@ if __name__ == "__main__":
                                    check=True, capture_output=True)
                 for _f in ("caption_hook.png", "caption_moral.png", "caption_cta.png"):
                     open(os.path.join(_d, _f), "wb").write(_PNG)
-                open(os.path.join(_d, "music_raw.mp3"), "wb").write(b"x")
+                if not _name.startswith("no_bed"):
+                    open(os.path.join(_d, "music_raw.mp3"), "wb").write(b"x")
                 json.dump({"opener": _name, "font": "Kalam", "quote": "Kabir",
                            "structure": f"arc {_name}"},
                           open(os.path.join(_d, "identity.json"), "w"))
@@ -1350,9 +1441,10 @@ if __name__ == "__main__":
                                check=True, capture_output=True)
                 _v = run(_d, st)
                 _hit = [b for b in _v["block"] if "background score does not carry" in b]
-                assert bool(_hit) == (_name == "bed_gone"), \
-                    f"{_name} (bed at volume {_vol}): the score check must " \
-                    f"{'flag' if _name == 'bed_gone' else 'pass'} it, blocks={_v['block']}"
+                _want = _vol < 0.01                    # the floor decides, bed file or not
+                assert bool(_hit) == _want, \
+                    f"{_name} (audio at volume {_vol}): the score check must " \
+                    f"{'flag' if _want else 'pass'} it, blocks={_v['block']}"
 
             vision.compare_character = _orig_cmp
 

@@ -255,7 +255,7 @@ def write_script(idea: str, seconds: int = 15) -> str:
 _SCHEMA = """{
   "title": "short title",
   "slug": "a short lowercase ASCII folder name for this reel — letters, digits and dashes only, e.g. 'the-tailors-thread'. A Hindi title MUST be transliterated here; this names the reel's folder on disk, so it must not be empty or a placeholder.",
-  "world": "the LOCKED universal anchor: setting/place, time of day, weather, season, overall lighting & color atmosphere, and the recurring subject's fixed description (who/what, exact clothes/colors/features). This never changes across clips. It MUST also state that the room and every surface in it are clean of writing — no text, signage, papers with words, screen text or lettering.",
+  "world": "the LOCKED universal anchor: setting/place, time of day, weather, season, overall lighting & color atmosphere, and the fixed description of EVERY recurring person — the lead AND every other person who appears in more than one clip (who/what, exact clothes/colors/features, and what each one does NOT have). This never changes across clips. It MUST also state that the room and every surface in it are clean of writing — no text, signage, papers with words or lettering.",
   "style": "the 3-D animation anchor from WAVELENGTH.md §1 — the phrase every clip prompt opens AND closes with (rounded shapes, soft global illumination, cinematic lighting, shallow depth of field)",
   "music_mood": "search words for the background score this reel needs, in plain English — e.g. 'mournful solo bansuri evening raga' or 'playful indian folk dholak festive'. Used to search for a track when nothing in the library fits.",
   "music_want": "one of exactly: bright | playful | warm | neutral | tender | mournful | sombre — where this reel's score sits on the brightness scale. A comic reel is bright; a reel about loss is mournful.",
@@ -290,12 +290,24 @@ def build_shotlist(script: str, aspect: str = "9:16", clip_seconds: int = 5) -> 
         "- 3 to 6 clips. Each 'prompt' is a COMPLETE, self-contained ~"
         f"{clip_seconds}s shot description (action + camera move) that reads well on "
         "its own. Do NOT restate 'world' inside it — it is added automatically.\n"
+        "- COVER EVERY BEAT. The script's beats are the film: fold two beats into one shot when "
+        "they happen in one place with the same people, but never drop one. The script's LAST "
+        "beat is the landing the whole reel was written for — it is ALWAYS its own clip, and the "
+        "reel ENDS on it. A reel that stops on the problem and never shows the resolution has "
+        "lost the only thing the viewer was waiting for (a grandfather's reel ended on his "
+        "reproach, with the family's answer — the script's own final beat — cut away).\n"
         "- The subject's description must ALSO name what they do NOT have — end it with "
         "the negatives explicitly (e.g. 'no glasses, no hat, no jewellery') unless an "
         "accessory is deliberate and then state it in 'world'. A lock that lists only "
         "what IS there cannot stop what gets ADDED: the generator invented round glasses "
         "on one clip of one reel and on no other, and every prompt still dutifully named "
         "the same man.\n"
+        "- EVERY PERSON WHO APPEARS IN MORE THAN ONE CLIP must be described in 'world' with "
+        "that same detail — not only the lead. The generator has no memory between clips, so "
+        "anyone left out of 'world' is played by a DIFFERENT person in each clip that shows "
+        "them (this is how one reel shipped three different women as the same grandmother). "
+        "A family, a crowd or a passer-by who appears in ONE clip only is named in that clip "
+        "prompt and kept generic; anyone who returns is locked in 'world' first.\n"
         "- Keep the recurring subject identical shot to shot. Use gentle, continuous "
         "camera moves (slow push-in, drift, pan) so consecutive clips cut together smoothly.\n"
         "- CAMERA MOVES: ONE move per clip, and it must be gentle and continuous. NEVER write "
@@ -304,26 +316,43 @@ def build_shotlist(script: str, aspect: str = "9:16", clip_seconds: int = 5) -> 
         "asked for (the owner cut exactly that move out of a reel). A memory shown INSIDE a wall "
         "frame is reached by cutting to it, or by a slow pan or drift ACROSS it — never by the "
         "camera entering it. Slow push-in, slow pull-back, pan, drift: those four, nothing else.\n"
-        "- NO TEXT, NO CAPTIONS, NO SUBTITLES — EVER. Nothing written, printed, drawn, embroidered, "
-        "engraved or shown on any surface in the shot: no words on walls, signboards, papers, "
-        "books, phone or TV screens, labels or clothing; no subtitle bars, no title or caption "
-        "cards, no lettering of any kind, in any script. State this in every clip prompt in your "
-        "own words, positively — 'a clean frame with no writing anywhere' — because the film must "
-        "carry no text of its own: every caption and card is added to the finished cut afterwards. "
-        "A prompt that asks the generator for a caption, a title, a heading, or a screen with text "
-        "on it gets gibberish Devanagari baked into the frame, and the real card then has to sit "
-        "over it and read as fake (the owner caught exactly this in a closing shot).\n"
+        "- NO TEXT, NO CAPTIONS, NO SUBTITLES — with ONE exception: a phone or tablet screen may "
+        "show the message the story is about (the chat bubble being read or typed), because a reel "
+        "whose plot IS a message has to be able to show it. Nothing else written, printed, drawn, "
+        "embroidered, engraved or shown on any other surface in the shot: no words on walls, "
+        "signboards, papers, books, TV screens, labels or clothing; no subtitle bars, no title or "
+        "caption cards, no lettering of any kind, in any script. State this in every clip prompt in "
+        "your own words, positively — 'a clean frame with no writing anywhere except the phone "
+        "screen' — because the film must carry no text of its own: every caption and card is added "
+        "to the finished cut afterwards. A prompt that asks the generator for a caption, a title, "
+        "a heading, or text on anything but a phone gets gibberish Devanagari baked into the frame, "
+        "and the real card then has to sit over it and read as fake (the owner caught exactly this "
+        "in a closing shot).\n"
         "- 'music_mood' + 'music_want' describe the SCORE the reel needs, and must agree "
         "with its feeling: a solemn raga under a comic beat is the wrong film. Write the "
         "mood as words someone would actually search for.\n"
         f"- aspect '{aspect}' (vertical/portrait for reels).\n"
         "- Return JSON ONLY."
     )
-    text, used = chat(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=4000, temperature=0.7, role="shotlist",
-    )
-    shot = _extract_json(text)
+    # A parse that fails is retried once, not fatal. The model that wrote a literal newline inside
+    # a string took the whole kickoff down as a traceback — a lost run over a control character,
+    # from the cheapest call in the pipeline (no render is bought here either way).
+    shot = None
+    for attempt in range(2):
+        if attempt:
+            user += ("\n\nYOUR LAST ANSWER WAS NOT VALID JSON and was rejected. Return the SAME "
+                     "plan as a single JSON object, with every string on ONE line.")
+        text, used = chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            max_tokens=4000, temperature=0.7, role="shotlist",
+        )
+        try:
+            shot = _extract_json(text)
+            break
+        except Exception as e:  # noqa: BLE001 — a bad answer is retried, not fatal
+            err = str(e)[:160]
+    if shot is None:
+        raise RuntimeError(f"the shot list came back unreadable twice: {err}")
     # Decide the medium at the START, not after a render: a plan whose style does not read as
     # animation gets the house 3-D anchor here, so the shot list itself is honest and the script,
     # the shot list and the clip prompts all agree (owner rule 2026-10-10). clip_prompts enforces
@@ -343,6 +372,9 @@ PROMPT_CHARS = 4000          # keep a typed prompt inside every site's input com
 # phone; past 44 it is a paragraph the card cannot hold.
 CARD_CHARS = 34
 CARD_HARD = 44
+# How many times agent 3 may rewrite its own cards after the contract rejects them. A rejection
+# with the reason fed back is cheap; a reel queued with no art direction is not.
+PRESENTATION_TRIES = 3
 CARD_KINDS = ("hook", "moral", "cta")
 _DEVA = re.compile(r"[ऀ-ॿ]")
 
@@ -433,11 +465,18 @@ def _char_lock(shot: dict) -> str:
 
 # Attached to EVERY clip prompt by code, not by a model's good behaviour. The generator bakes
 # gibberish lettering into a frame the moment a prompt even hints at text (a "caption card", a
-# phone screen, a sign), and the real card then reads as a fake pasted over nonsense — the owner
-# caught it in a closing shot. Asking the LLM to remember is not a guarantee; this is.
-NO_TEXT = ("No text of any kind anywhere in the frame: no words, letters, captions, subtitles, "
-           "title cards, signage, labels, or writing on walls, papers, screens or clothing — in "
-           "any script. A clean frame with nothing written on it; all captions are added later.")
+# sign), and the real card then reads as a fake pasted over nonsense — the owner caught it in a
+# closing shot. Asking the LLM to remember is not a guarantee; this is.
+#
+# ONE exception, and it is the owner's (2026-10-16): on-screen text is allowed ON A PHONE SCREEN,
+# and nowhere else. A reel whose whole plot is a message nobody answers has to be able to show the
+# message — this rule as written forbade the one image the story is made of, in the same prompt
+# that asked for it, and the generator was left to pick a side. The ban stays absolute everywhere
+# else because that is the case the rule was written for.
+NO_TEXT = ("No text of any kind anywhere in the frame EXCEPT on a phone or tablet screen, which "
+           "may show the message the story is about: no other words, letters, captions, "
+           "subtitles, title cards, signage, labels or writing on walls, papers, clothing or any "
+           "other surface — in any script. All caption cards are added later.")
 
 # The shot-lister is TOLD no text, but it writes the sentence it was told not to: asked to
 # visualize a notebook of memories, it authored "a glowing \"एक\" appears on the page" — text
@@ -461,9 +500,15 @@ _DEVICE = re.compile(
     r'\b(?:spell(?:s|ing|ed)?|spelt|lettering|signage|subtitles?|title\s+cards?|caption\s+cards?|'
     r'the\s+words?)\b', re.I)
 _NEG = re.compile(r'\b(?:no|not|nothing|without|never|free|clean|blank)\b', re.I)
+# The owner's one exception (2026-10-16): a phone screen may carry the message the story is about,
+# so a clause that asks for THAT is a legitimate shot and must survive. Checked before the other
+# two guards, because those would otherwise strip the single image the reel exists to show.
+_PHONE = re.compile(r'\b(?:phone|smartphone|mobile|tablet)\b', re.I)
 
 
 def _asks_text(s: str) -> bool:
+    if _PHONE.search(s):
+        return False
     return bool(_QUOTED.search(s) or (_DEVICE.search(s) and not _NEG.search(s)))
 # Clauses, not sentences: the text request often shares a sentence with the action it decorates
 # ("she opens the notebook; a glowing \"एक\" appears"), so splitting at sentence ends alone would
@@ -572,12 +617,31 @@ def clip_prompts(shot: dict, site: str = "") -> list:
     lock = _char_lock(shot)                    # ONE string for the reel — appended to every clip
     veo = site in VEO_SITES
     sep = "\n" if veo else ", "
+    # Detects extreme close-ups of objects (phone, hands, watch, etc.) — Vids defaults to
+    # photorealism for these even with 3-D instructions. When a clip describes a tight shot of
+    # an inanimate object, swap the lead to PIXAR-style cartoon language (proven fix for the
+    # good-morning-dadaji phone close-up that 2 system re-shoots could not override).
+    _PIXAR_LEAD = ("REQUIRED OUTPUT: PIXAR-STYLE CARTOON 3-D OBJECT — chunky rounded "
+                   "cartoon proportions, a frame from an animated movie, NOT photoreal, "
+                   "NOT real-life object. STYLE for every frame: ")
+    _CLOSEUP_OF = re.compile(
+        r"\b(?:close[- ]up|extreme close[- ]up|tight shot|macro)\b", re.I)
+    _OBJECT_WORDS = re.compile(
+        r"\b(?:phone|mobile|smartphone|hand|watch|clock|screen|keyboard|book|cup|"
+        r"tablet|laptop|wallet|remote)\b", re.I)
+
     # The medium is the FIRST thing a site reads, so the requirement to render 3-D animation is
     # stated before anything else — catching the medium at generation time, not after.
     lead = (MEDIUM_REQUIREMENT + " STYLE for every frame of this clip, no exceptions: "
             + style.split(".")[0].strip() + ".")
     out = []
     for c in sorted(shot.get("clips", []), key=lambda x: x.get("idx", 0)):
+        # per-clip lead swap: an extreme close-up of an object gets PIXAR language
+        _p = (c.get("prompt") or "")
+        if _CLOSEUP_OF.search(_p) and _OBJECT_WORDS.search(_p):
+            _per_clip_lead = _PIXAR_LEAD + style.split(".")[0].strip() + "."
+        else:
+            _per_clip_lead = lead
         says = (c.get("dialogue") or "").strip()
         if says:
             # Narration must come OUT of the clip (WAVELENGTH.md §3), so the line is written into
@@ -592,7 +656,7 @@ def clip_prompts(shot: dict, site: str = "") -> list:
             says = ('the character speaks these words aloud in Hindi, on camera, with natural '
                     'lip-sync — no narrator, no voiceover. They are SOUND the voice carries and '
                     'must never be written anywhere: ' + says)
-        action = _no_text(c["prompt"])
+        action = _no_text(_p)
         if veo:
             body = [f"SCENE AND CAST (identical in every clip): {world}" if world else "",
                     f"ACTION AND CAMERA: {action}" if action else "",
@@ -601,7 +665,7 @@ def clip_prompts(shot: dict, site: str = "") -> list:
         else:
             body = [world, action, says]
             tail = [style, NO_TEXT, anti, lock]
-        out.append(_fit(lead, sep.join(x for x in body if x),
+        out.append(_fit(_per_clip_lead, sep.join(x for x in body if x),
                         sep.join(x for x in tail if x), PROMPT_CHARS, sep,
                         floor=MEDIUM_REQUIREMENT))
     return out
@@ -644,7 +708,7 @@ def validate_plan(shot: dict, prompts: list = None) -> dict:
     else:
         lock = _char_lock(shot)
         for i, pr in enumerate(prompts):
-            if not pr.startswith(MEDIUM_REQUIREMENT[:40]):
+            if not pr.startswith(MEDIUM_REQUIREMENT[:40]) and not pr.startswith("REQUIRED OUTPUT: PIXAR"):
                 bad.append(f"clip {i}: the 3-D medium requirement is gone from the prompt")
             if NO_TEXT not in pr:
                 bad.append(f"clip {i}: the no-text rule is gone from the prompt")
@@ -681,7 +745,7 @@ _PRESENTATION_SCHEMA = """{
 }"""
 
 
-def presentation(script: str, shot: dict, prior: list = None) -> dict:
+def presentation(script: str, shot: dict, prior: list = None, brief: str = "") -> dict:
     """Agent 3: the reel's IDENTITY and its on-screen caption cards.
 
     These are the two things the owner had to hand-write per reel (projects/*/identity.json and
@@ -689,7 +753,12 @@ def presentation(script: str, shot: dict, prior: list = None) -> dict:
     of one reading of the script, so they are one call.
 
     `prior` is the list of identities already shipped: WAVELENGTH.md §5 forbids repeating an
-    editing pattern, so the new reel has to be TOLD what the old ones did in order to differ."""
+    editing pattern, so the new reel has to be TOLD what the old ones did in order to differ.
+
+    `brief` is the owner's OWN text for this reel. Without it the cards are written from the
+    script alone, and a brief that states its hook and moral verbatim gets a paraphrase invented
+    over the top of it — the one creative decision a human had already made is the one the art
+    director silently overrode."""
     seen = ""
     if prior:
         rows = []
@@ -701,13 +770,26 @@ def presentation(script: str, shot: dict, prior: list = None) -> dict:
         if rows:
             seen = ("\n\nALREADY USED by earlier reels in this house — this reel must NOT repeat "
                     "any of these devices; pick a different one:\n- " + "\n- ".join(rows))
+    # The owner's own words, when there are any. A brief that opens with "Hook text: …" and
+    # "Moral: …" has already made the two calls agent 3 is about to make, and inventing over
+    # them throws away the only human creative input in the whole pipeline.
+    brief_block = ""
+    if (brief or "").strip():
+        brief_block = (
+            "\n\nTHE OWNER'S BRIEF — their own words for this reel, which the script above was "
+            f"written from:\n{brief.strip()[:4000]}\n"
+            "If the brief states a hook line, a moral, an opening title or a closing line in its "
+            "own words, THOSE ARE THE WORDS: carry them into the cards, split across the card's "
+            "one or two lines and shortened ONLY as far as the character limit forces. Never "
+            "replace the owner's line with a paraphrase, a question or a slogan you invent."
+        )
     system = _system(
         "You are a reel art-director. You decide how a finished reel LOOKS on screen: its "
         "opening device, its transition language, its typography, and the three caption cards. "
         "Output ONLY valid JSON, no prose."
     )
     user = (
-        f"SCRIPT:\n{script}\n\nSHOT PLAN:\n{json.dumps({k: v for k, v in shot.items() if k != 'clips'}, ensure_ascii=False)}\n"
+        f"SCRIPT:\n{script}\n{brief_block}\nSHOT PLAN:\n{json.dumps({k: v for k, v in shot.items() if k != 'clips'}, ensure_ascii=False)}\n"
         f"{seen}\n\nProduce JSON with EXACTLY this shape:\n{_PRESENTATION_SCHEMA}\n\nRULES:\n"
         "- The caption cards are read on a phone, muted, in about three seconds each. Every "
         f"line must be under {CARD_CHARS} characters. One or two lines per card, never three.\n"
@@ -717,22 +799,48 @@ def presentation(script: str, shot: dict, prior: list = None) -> dict:
         "like that. There is no other address — do not invent, shorten or guess one.\n"
         "- 'hook' is the opening card (a question, a provocation, or the first line of the "
         "story). 'moral' is the turn — it lands the point. 'cta' is the last card.\n"
+        "- If the owner's brief above writes the hook or the moral in its own words, use THOSE "
+        "words on the card, not your own version of them.\n"
         "- 'identity.visual_style' must state that this is 3-D animation. This is not optional.\n"
         "- The identity must be DISTINCT from the prior reels listed above.\n"
         "- Return JSON ONLY."
     )
-    text, _used = chat(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=2000, temperature=0.9, role="presentation",
-    )
-    obj = _extract_json(text)
-    caps = obj.get("captions")
-    if isinstance(caps, dict):
-        caps["font"] = _font_class(caps.get("font"))
-        for card in caps.values():              # the brand's domain is corrected before the judge
-            if isinstance(card, dict):          # and the gate ever see the cards
-                card["lines"] = [_fix_url(ln) for ln in card.get("lines") or []]
-    _presentation_selfcheck(obj)
+    # ONE REJECTION IS NOT A DEAD END. The contract is strict on purpose — a card that overflows
+    # reaches the owner's screen — but no model counts Devanagari characters reliably: handed the
+    # owner's own hook line it answered 48 chars, then 45, then 41. A single rejection used to
+    # throw the WHOLE art direction away, identity AND every card, over one long line; the reel
+    # was then queued with no cards at all and the failure read as one soft line in the kickoff.
+    # So the violation is fed back for another go. What is scarce here is the render, not the call.
+    last, obj = None, None
+    for attempt in range(PRESENTATION_TRIES):
+        extra = "" if attempt == 0 else (
+            f"\n\nYOUR LAST ANSWER WAS REJECTED — {last}\nWrite the cards so this cannot happen: "
+            "split a long line across the card's TWO lines, and drop words only as a last resort. "
+            "Keep the owner's wording, and every other field exactly as it was.")
+        text, _used = chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": user + extra}],
+            # 4000, like the shot list: on a reasoning model the budget is spent on thinking
+            # before any JSON is written, which truncated the object mid-field at 2000.
+            max_tokens=4000, temperature=0.9, role="presentation",
+        )
+        try:
+            obj = _extract_json(text)
+        except Exception as e:  # noqa: BLE001 — a bad answer is retried, not fatal
+            last, obj = str(e)[:200], None
+            continue
+        caps = obj.get("captions")
+        if isinstance(caps, dict):
+            caps["font"] = _font_class(caps.get("font"))
+            for card in caps.values():          # the brand's domain is corrected before the judge
+                if isinstance(card, dict):      # and the gate ever see the cards
+                    card["lines"] = [_fix_url(ln) for ln in card.get("lines") or []]
+        try:
+            _presentation_selfcheck(obj)
+            break
+        except Exception as e:  # noqa: BLE001 — feed the violation back and try again
+            last, obj = str(e)[:200], None
+    if obj is None:
+        raise RuntimeError(f"art direction failed {PRESENTATION_TRIES} times: {last}")
 
     # LAYER 1 of the caption gate: the art director reads its OWN cards back before they are
     # written, with the script in hand. The Hindi is the one layer no metric measures, and the
@@ -986,7 +1094,12 @@ def _presentation_selfcheck(obj: dict) -> bool:
 
 
 def _extract_json(text: str) -> dict:
-    """LLMs wrap JSON in fences or reasoning; grab the first balanced object."""
+    """LLMs wrap JSON in fences or reasoning; grab the first balanced object.
+
+    strict=False because models put a LITERAL newline or tab inside a string — a raw control
+    character is invalid JSON, and it took the whole kickoff down as a traceback (agent 2 had
+    written a multi-line prompt). The character is what the model meant; refusing the answer
+    over it costs a run and teaches nothing."""
     text = re.sub(r"```(?:json)?", "", text)
     start = text.find("{")
     if start == -1:
@@ -998,7 +1111,7 @@ def _extract_json(text: str) -> dict:
         elif text[i] == "}":
             depth -= 1
             if depth == 0:
-                return json.loads(text[start:i + 1])
+                return json.loads(text[start:i + 1], strict=False)
     raise ValueError("unterminated JSON in LLM output")
 
 
@@ -1134,6 +1247,30 @@ if __name__ == "__main__":
             assert _sl["style"] == HOUSE_STYLE, "the repair uses the house anchor verbatim"
         finally:
             globals()["chat"] = _orig_chat
+        # An unreadable shot list is RETRIED, not fatal. A literal newline inside a string is
+        # invalid JSON and it took the whole kickoff down as a traceback — a lost run over a
+        # control character, from the one call in the pipeline that buys nothing.
+        _good = json.dumps({"title": "t", "slug": "s", "world": "A room. BABAJI sits.",
+                            "style": "soft stylized 3-D animation", "music_mood": "warm",
+                            "music_want": "warm", "aspect": "9:16",
+                            "clips": [{"idx": 0, "prompt": "He smiles.", "dialogue": ""}]})
+        _shots, _calls = {"n": 0}, []
+        def _stub_broken(msgs, **kw):
+            _calls.append(msgs[-1]["content"])
+            _shots["n"] += 1
+            return ("{not json at all", _good)[_shots["n"] > 1], "stub"
+        globals()["chat"] = _stub_broken
+        try:
+            assert build_shotlist("script")["world"] == "A room. BABAJI sits.", \
+                "a shot list that came back unreadable must be asked for again"
+            assert _shots["n"] == 2, f"exactly one retry, got {_shots['n']}"
+            assert "NOT VALID JSON" in _calls[-1], "the retry must say what was wrong"
+        finally:
+            globals()["chat"] = _orig_chat
+        # …and a literal control character inside a string is READ, not rejected: the model means
+        # a newline, and the answer is otherwise well-formed.
+        assert _extract_json('{"a": "one\ntwo"}')["a"] == "one\ntwo", \
+            "a raw control character in a string must not throw the answer away"
         # a very long plan must be trimmed to fit, never silently overflow
         _big = dict(_shot, world=_shot["world"] + " " + ("extra detail " * 400))
         assert all(len(pr) <= PROMPT_CHARS for pr in clip_prompts(_big)), \
@@ -1432,6 +1569,62 @@ if __name__ == "__main__":
         finally:
             globals()["chat"] = _orig_chat2
         print("OK: presentation adopts a caption repair, and fails open when the judge is down")
+
+        # The OWNER'S BRIEF reaches agent 3. Without it the art director writes a hook over the
+        # top of one the owner already wrote — a brief that opens "Hook text: …" and "Moral: …"
+        # had both cards replaced by invented questions, which is the one creative call in the
+        # pipeline a human had already made.
+        _seen = {}
+        def _stub_brief(msgs, **kw):
+            if "CAPTION CARDS" not in msgs[-1]["content"]:
+                _seen["user"] = msgs[-1]["content"]
+            return json.dumps(_ident()), "stub"
+        globals()["chat"] = _stub_brief
+        try:
+            presentation("script", _shot, brief="Hook text: दादाजी रोज़ सुबह 5 बजे भेजते हैं")
+            assert "दादाजी रोज़ सुबह 5 बजे भेजते हैं" in _seen.get("user", ""), \
+                "the owner's own words must reach the art director, not just the script"
+            _seen.clear()
+            presentation("script", _shot)
+            assert "OWNER'S BRIEF" not in _seen.get("user", ""), \
+                "a caller that passes no brief must not be told about one"
+        finally:
+            globals()["chat"] = _orig_chat2
+        print("OK: the owner's brief reaches the art director, and its words are the cards' words")
+
+        # A card the contract REJECTS is rewritten, not thrown away. One over-long line used to
+        # take the whole art direction with it — identity AND every card — and the reel was then
+        # queued with no art direction at all.
+        _long = json.loads(json.dumps(_ident()))
+        _long["captions"]["hook"]["lines"] = ["दादाजी रोज़ सुबह 5 बजे Good Morning भेजते हैं..."]
+        _n, _sent = {"n": 0}, []
+        def _stub_retry(msgs, **kw):
+            if "CAPTION CARDS" in msgs[-1]["content"]:
+                return json.dumps(_ident()), "stub"
+            _sent.append(msgs[-1]["content"])
+            _n["n"] += 1
+            return json.dumps(_long if _n["n"] == 1 else _ident()), "stub"
+        globals()["chat"] = _stub_retry
+        try:
+            got = presentation("script", _shot)
+            assert _n["n"] == 2, f"a rejected card must be rewritten, not fatal: {_n['n']} calls"
+            assert got["captions"]["hook"]["lines"] == _ident()["captions"]["hook"]["lines"], \
+                "the SECOND answer must be the one adopted"
+            assert "REJECTED" in _sent[-1], "the rewrite must be told what was wrong"
+            def _always_long(msgs, **kw):
+                if "CAPTION CARDS" in msgs[-1]["content"]:
+                    return json.dumps(_ident()), "stub"
+                return json.dumps(_long), "stub"
+            globals()["chat"] = _always_long
+            try:
+                presentation("script", _shot)
+                raise AssertionError("a card that never fits must stop, not be written anyway")
+            except RuntimeError as e:
+                assert "art direction failed" in str(e), f"say what happened, got: {e}"
+        finally:
+            globals()["chat"] = _orig_chat2
+        print("OK: a card the contract rejects is rewritten with the reason fed back, "
+              "and the attempts are bounded")
 
         # A model handed WAVELENGTH §4's face list answers with the FACE, which is the same answer
         # to the question the schema asked. presentation() maps it to the class the renderer knows;

@@ -266,12 +266,13 @@ class LocalBrain:
         "moral": ("reel-needs-moral",
                   "Every reel lands a moral card — the takeaway is what earns shares and comments",
                   "a story without a stated moral gets scrolled past; the moral IS the viral beat"),
-        "score": ("reel-needs-score",
-                  "Every reel carries a background score that fits its essence, ducked under the "
-                  "clips' own audio",
-                  "silent footage feels amateur on a phone; the bed carries the emotion — "
-                  "automation/music.py measures the fit rather than guessing from a filename"),
-    }
+        }
+    # NB: there is deliberately NO "score" rule here. A reel's score may ride INSIDE the
+    # generated clips — Google Vids bakes its own bed — and the owner rejected both tracks laid
+    # over dadi-ki-bucket-list (2026-10-18), so "no music_raw.mp3" is a choice, not a gap. What
+    # is a defect — a reel that plays flat — qc.check_score_present measures off the shipped cut.
+    # The old rule filed a candidate on every legitimately bed-less reel; it is dismissed in the
+    # brain (2026-10-19) and must not come back.
 
     def absorb(self, project: str) -> dict:
         """Called after EVERY generation (a stitched final, a craft-path build). Audits the

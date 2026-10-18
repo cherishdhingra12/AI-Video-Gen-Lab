@@ -45,7 +45,7 @@ FOLDER = (
     ("shotlist.json", "the world, the cast and every shot", "agents.build_shotlist"),
     ("identity.json", "this reel's look, kept distinct from every prior reel", "agents.presentation"),
     ("captions.json", "the on-screen cards, as written", "agents.presentation"),
-    ("music_raw.mp3", "the background score", "music.choose"),
+    ("music_raw.mp3", "the background score, when the reel carries its own", "music.choose"),
     ("music_meta.json", "where the score came from + how it is placed", "music.install"),
     ("final_veo.mp4", "the cut", "assemble.build"),
     ("caption_place.json", "where each card landed in the cut (QC re-checks faces here)", "assemble.build"),
@@ -56,7 +56,15 @@ FOLDER = (
 REQUIRED = tuple(f for f, _, _ in FOLDER)
 # The cut's own name is written by whichever path built it (runner -> final.mp4), so a folder
 # passing with either is correct; check_reel_folder looks for final_veo.mp4 OR final.mp4.
-OPTIONAL = ("final.mp4",)
+OPTIONAL = (
+    "final.mp4",
+    # A reel may carry NO separate bed at all: the score can ride inside the generated clips
+    # (Google Vids bakes its own; owner rejected every track laid over it for dadi-ki-bucket-list,
+    # 2026-10-18). When a bed does exist it is these three, and all three belong here — nothing is
+    # missing from a reel that chose the other route, and qc measures the cut's audio floor either
+    # way, so a reel that really does play flat is still caught.
+    "music_raw.mp3", "music_meta.json", "music_bed.json",
+)
 
 COVER_STYLE = dict(size=56, color="#FFF3D6", bg="rgba(18,16,14,0.72)", width=640)
 # The Instagram profile grid shows a 1:1 CENTRE CROP of a 9:16 reel. Text outside this band is
@@ -230,18 +238,30 @@ def _sheet_text(project_dir, copy, facts):
     me = _load(project_dir, "music_meta.json", {}) or {}
     bed = _load(project_dir, "music_bed.json", {}) or {}
     present = [f for f, _, _ in FOLDER if os.path.exists(os.path.join(project_dir, f))]
-    track = " / ".join(p for p in (me.get("title"), me.get("artist")) if p) or "the score"
-    score = [f"`music_raw.mp3` = **{track}**"
-             + (f" — {me['source']}" if me.get("source") else "")
-             + (f" ({me['licence']})" if me.get("licence") else "")]
-    if me.get("source_url"):
-        score.append(f"source: {me['source_url']}")
-    if bed.get("floor") is not None:
-        score.append(f"bed at level {me.get('level_start', 0)}s in, measured floor "
-                     f"{bed['floor']} dB (the −46 floor gate is the failure line)")
-    if not me.get("licence"):
-        score.append("⚠ provenance is not recorded for this bed — it plays, and provenance is "
-                     "recorded rather than gating (owner ruling 2026-10-10), but the row is missing")
+    if me:
+        track = " / ".join(p for p in (me.get("title"), me.get("artist")) if p) or "the score"
+        score = [f"`music_raw.mp3` = **{track}**"
+                 + (f" — {me['source']}" if me.get("source") else "")
+                 + (f" ({me['licence']})" if me.get("licence") else "")]
+        if me.get("source_url"):
+            score.append(f"source: {me['source_url']}")
+        if bed.get("floor") is not None:
+            score.append(f"bed at level {me.get('level_start', 0)}s in, measured floor "
+                         f"{bed['floor']} dB (the −46 floor gate is the failure line)")
+        if not me.get("licence"):
+            score.append("⚠ provenance is not recorded for this bed — it plays, and provenance is "
+                         "recorded rather than gating (owner ruling 2026-10-10), but the row is "
+                         "missing")
+    else:
+        # No bed file: the score rides INSIDE the generated clips (owner's ruling on
+        # dadi-ki-bucket-list, 2026-10-18 — Vids bakes its own bed and every track laid over it
+        # was rejected). Say that, and say what the cut actually measures, so the sheet never
+        # implies a score that is not there.
+        score = ["No separate score: the reel plays on the audio baked into the generated clips "
+                 "(no `music_raw.mp3` is mixed in at assembly)."]
+        if bed.get("floor") is not None:
+            score.append(f"the cut's own audio floor measures {bed['floor']} dB "
+                         f"(the −46 floor gate is the failure line)")
     hook = " ".join((cards.get("hook") or {}).get("lines") or [])
     return f"""# {facts['title']} — publishing sheet
 

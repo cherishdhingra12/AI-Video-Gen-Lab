@@ -234,15 +234,24 @@ for (const p of document.querySelectorAll('p')) {{
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(html)
     try:
-        subprocess.run([CHROME, "--headless=new", "--disable-gpu", "--hide-scrollbars",
-                        "--force-device-scale-factor=1", "--default-background-color=00000000",
-                        f"--window-size={W},{H}", f"--screenshot={out}", f"file://{tmp}"],
-                       check=True, capture_output=True, timeout=60)
+        p = subprocess.run([CHROME, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+                            "--force-device-scale-factor=1", "--default-background-color=00000000",
+                            f"--window-size={W},{H}", f"--screenshot={out}", f"file://{tmp}"],
+                           check=False, capture_output=True, timeout=60)
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
-    sz = os.path.getsize(out)
-    assert sz > 2000, f"{os.path.basename(out)} too small ({sz} B) — render failed"
+    # Chrome's exit code is NOT the success signal. On this Mac its teardown watchdog expires
+    # about 11 s after the shot is already on disk — "[...] bytes written to file" then
+    # "Teardown watchdog expired; recording dump and terminating", exit 2. Measured 2026-10-17:
+    # 6/6 runs wrote a correct PNG, 8/10 of them exited 2, and `check=True` turned a good card
+    # into an exception that killed the whole assembly. The file is the signal; a missing or
+    # stub file is still a real failure and still raises, with Chrome's own words attached.
+    sz = os.path.getsize(out) if os.path.exists(out) else 0
+    if sz <= 2000:
+        raise RuntimeError(
+            f"{os.path.basename(out)} was not rendered ({sz} B, Chrome exit {p.returncode}) — "
+            + (p.stderr or b"").decode(errors="replace").strip()[-300:])
     return out
 
 

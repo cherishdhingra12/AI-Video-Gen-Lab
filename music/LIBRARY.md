@@ -27,6 +27,7 @@ manual fallback and the explanation of what the automation is doing.
 | krishna-bansuri__mayar-krishna__youtube.mp3 | Krishna Bansuri \| Festive Flute Dance \| Divine Krishna Instrumental / Mayar Krishna | [youtube](https://www.youtube.com/watch?v=6iIQqJCe3b0) | UNVERIFIED — owner waived licence check (2026-10-06) | playful indian folk dholak festive instrumental; measured fit 0.92 | not used yet |
 | bamboo-flute-music__bamboooye-archive-org__archive-org.mp3 | Bamboo Flute Music / BambooOye (archive.org) | [archive.org](https://archive.org/details/bamboo-flute-music-bamboo-oye) | CC0 1.0 Public Domain — no attribution required | soft bamboo flute; warm/neutral bed | not used yet |
 | tabla-solo-folk-matsya-tabla-by-joydeep__joydeep-archive-org__archive-org.mp3 | Tabla Solo (folk/matsya tabla, by joydeep) / joydeep (archive.org) | [archive.org](https://archive.org/details/10-oct-9.05-pm-pitch-2.30-tempo-121) | CC0 1.0 Public Domain — no attribution required | energetic tabla solo, bright/playful percussion; festival energy | not used yet |
+| folk-music-india-dholak__indian-sounds-classical-music__youtube.mp3 | Folk Music India Dholak / Indian Sounds & Classical Music | [youtube](https://www.youtube.com/watch?v=298UX9HxB4s) | UNVERIFIED — owner waived licence check (2026-10-06) | playful Indian folk dholak upbeat happy; measured fit 0.98 | not used yet |
 
 ⚠️ **`wistful-warm-bed`**: this track was grabbed in an earlier session with no source/license
 recorded, and no metadata survives in the file. intezaar + ek_ghanta both use it. Its source

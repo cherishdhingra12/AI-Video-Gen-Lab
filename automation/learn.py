@@ -32,7 +32,15 @@ def _order(site: str) -> int:
 _WALL_BASE = {
     "captcha": 600.0,       # 10 min, doubling
     "rate_limit": 900.0,    # 15 min
-    "block": 3600.0,        # 1 h — serious, wait long
+    "block": 600.0,         # 10 min, doubling — owner ruling 2026-10-16, was 1 h. `block` is
+                            # raised for two unlike things: a structural fact about the account
+                            # (geo-blocked, paywalled, out of scope) and a transient failure (a
+                            # download HTTP 500, a render that timed out). An hour suited the first
+                            # and was far too long for the second — one slow Vids render cost this
+                            # reel an hour for nothing. Ten minutes retries the transient case
+                            # promptly, and because the floor doubles per prior hit a genuinely
+                            # permanent wall pushes itself back out (10 -> 20 -> 40 min) without
+                            # anyone having to classify the 22 call sites by hand.
     "selector": 120.0,      # UI probably changed; short wait, adapter may self-heal
     "credits": 0.0,         # OUT, not cooling. Being empty is not a mistake to step back from,
                             # and a cooldown here would just send the scheduler back in 15
@@ -104,8 +112,8 @@ class Brain:
 
         True only when the site is not usable RIGHT NOW but is still worth waiting for. A site
         that is ready returns False (go straight to it); so do the two real dead ends — dry, and
-        hard-`block`ed (_WALL_BASE: 1h and escalating, which means "go elsewhere", not "come back
-        shortly"). No bid at all returns False: the waterfall picks freely."""
+        hard-`block`ed (_WALL_BASE: 10 min and escalating, which means "go elsewhere", not "come
+        back shortly"). No bid at all returns False: the waterfall picks freely."""
         if not site:
             return False
         if self.pick(want_site=site, strict=True):

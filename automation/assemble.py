@@ -479,24 +479,49 @@ def _spec(project_dir):
     return d, d.get("font", "rounded")
 
 
-def _speed(project_dir):
+def _speed(project_dir, pre_trim_len=None):
     """The reel's own pace, if it declared one. An env override wins (hand-tuning a single
-    reel); otherwise `speed` from identity.json; otherwise 1.0, i.e. leave the pace alone."""
+    reel); otherwise `speed` from identity.json; otherwise 1.0, i.e. leave the pace alone.
+
+    When `target_duration` is set in identity.json AND speed is 1.0 (the default, meaning
+    unset), auto-calculate speed = pre_trim_len / target_duration so the reel lands near the
+    intended length without hardcoding a specific value."""
     if os.environ.get("SPEED"):
         return SPEED
     try:
-        s = float(json.load(open(os.path.join(project_dir, "identity.json"),
-                                 encoding="utf-8")).get("speed") or 1.0)
+        ident = json.load(open(os.path.join(project_dir, "identity.json"),
+                               encoding="utf-8"))
+        s = float(ident.get("speed") or 1.0)
+        td = ident.get("target_duration")
     except Exception:  # noqa: BLE001 — no identity, or not a number: keep the native pace
         return 1.0
-    return s if 0.5 <= s <= 2.0 else 1.0      # outside this, atempo would need chaining
+    # speed explicitly set by the plan -> use it
+    if abs(s - 1.0) > 1e-6:
+        return s if 0.5 <= s <= 2.0 else 1.0
+    # speed=1.0 (default) + target_duration present -> auto-calc from the cut's pre-speed
+    # length. Clamped so the reel never flies past or drags.
+    if td and pre_trim_len and pre_trim_len > 0:
+        calc = pre_trim_len / float(td)
+        return min(2.0, max(1.0, calc))
+    return 1.0
+
+
+def _clips(clips_dir):
+    """The reel's clips, in order — and NOT the intermediates we park beside them.
+    `compress_gaps` writes `clip_00N.mp4.gap.mp4` next to its source (line ~176) and removes it
+    only if the build reaches cleanup. A build that dies earlier (a card render, a Chrome exit)
+    leaves the temp behind, and the bare `clip_*.mp4` glob then read it as one more clip: the
+    reel came out 6 clips / 51.47s with the moral card sitting "over clip 5". The suffix is
+    never a clip, whatever is on disk."""
+    return sorted(c for c in glob.glob(os.path.join(clips_dir, "clip_*.mp4"))
+                  if not c.endswith(".gap.mp4"))
 
 
 def build(project_dir, clips_dir=None, absorb=True):
     project_dir = os.path.abspath(project_dir)
     name = os.path.basename(project_dir)
     clips_dir = clips_dir or os.path.join(ROOT, "clips", name)
-    clips = sorted(glob.glob(os.path.join(clips_dir, "clip_*.mp4")))
+    clips = _clips(clips_dir)
     if not clips:
         raise RuntimeError(f"no clips in {clips_dir}")
     out = os.path.join(project_dir, "final_veo.mp4")
@@ -617,7 +642,7 @@ def build(project_dir, clips_dir=None, absorb=True):
         # The window is in PRE-speed reel time; QC samples these times against the SHIPPED cut,
         # so divide by the pace (below) before writing or the check reads the wrong frames.
         try:
-            _sp = _speed(project_dir)
+            _sp = _speed(project_dir, pre_trim_len=total)
             conv = {k: {**w, "start": round(w["start"] / _sp, 3), "end": round(w["end"] / _sp, 3)}
                     for k, w in placed.items()}
             with open(os.path.join(project_dir, "caption_place.json"), "w") as f:
@@ -686,7 +711,7 @@ def build(project_dir, clips_dir=None, absorb=True):
     # ---- pace, last: every window above is in REEL time, and speeding the finished composite
     #      keeps them all valid (a card simply stays up for (ce-cs)/speed seconds). Video and
     #      audio move together, so lip-sync is untouched; atempo holds the pitch. ----
-    speed = _speed(project_dir)
+    speed = _speed(project_dir, pre_trim_len=total)
     out_len = total
     if abs(speed - 1.0) > 1e-6:
         fc.append(f"[{vmap}]setpts=(PTS-STARTPTS)/{speed:g}[vsp]")
@@ -722,15 +747,15 @@ def build(project_dir, clips_dir=None, absorb=True):
         layers.append(f"dead-air trimmed {cut:.2f}s")
     if abs(speed - 1.0) > 1e-6:
         layers.append(f"{speed:g}x pace")
-    if scored:
-        # Record the audio's floor in the FINAL as a checkable artifact: the existence of
-        # music_raw.mp3 says nothing about whether the score is audible in the reel (the hole
-        # that let darzi's silent-intro bed ship). QC reads this instead of guessing.
-        try:
-            with open(os.path.join(project_dir, "music_bed.json"), "w") as f:
-                json.dump({"mean_db": _mean_db(out), "floor": _audio_floor(out)}, f)
-        except OSError:
-            pass
+    # Always, bed or no bed: the floor is a property of the FINAL, and QC now measures it on
+    # every cut. The existence of music_raw.mp3 said nothing about whether a score is audible
+    # (the hole that let darzi's silent-intro bed ship), and since 2026-10-18 a reel may carry no
+    # bed at all — the score rides in the generated clips. QC reads this instead of guessing.
+    try:
+        with open(os.path.join(project_dir, "music_bed.json"), "w") as f:
+            json.dump({"mean_db": _mean_db(out), "floor": _audio_floor(out)}, f)
+    except OSError:
+        pass
     print(f"OK -> {out}  ({_dur(out):.2f}s, {n} clips, {', '.join(layers)})  VERIFIED")
     # ---- the folder is the deliverable: the cover and the publishing sheet are part of the
     #      build, so the next reel has them because the pipeline wrote them (see publishing.py).
@@ -850,7 +875,7 @@ if __name__ == "__main__":
         assert os.path.exists(out), "no reel built"
         assert not verify_playable(out, _dur(out)), "the built reel must actually play"
         # the trimmed reel must be shorter than the naive join of the untrimmed clips
-        naive = sum(_dur(c) for c in glob.glob(os.path.join(cdir, "clip_*.mp4"))) - 2 * 0.40
+        naive = sum(_dur(c) for c in _clips(cdir)) - 2 * 0.40
         assert _dur(out) < naive - 1.2, \
             f"dead air was not cut: reel {_dur(out):.2f}s vs untrimmed {naive:.2f}s"
         got = sorted(f for f in os.listdir(pdir)

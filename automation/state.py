@@ -335,6 +335,20 @@ class State:
                 out.append(r)
         return out
 
+    def credit_line(self, site: str, account: str) -> str:
+        """One line saying what the ledger believes about a pair — the only thing the scheduler
+        ever sees. `resets_at=0` is printed as "no refill time", because that is the state that
+        silently kills a site: a 0 with no refill reads to `available()` as a permanent dead end."""
+        r = self.db.execute("SELECT * FROM credits WHERE site=? AND account=?",
+                            (site, account)).fetchone()
+        if not r:
+            return f"{site}/{account}: no row — the site is invisible to the scheduler"
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["resets_at"])) \
+            if r["resets_at"] else "no refill time"
+        age = (time.time() - (r["updated"] or 0)) / 3600.0
+        return (f"{site}/{account}: remaining={r['remaining']} resets={when} "
+                f"source={r['source']} read {age:.1f}h ago")
+
     def site_has_credit(self, site: str, now: float = None) -> bool:
         """Does ANY account on this site still have credit left? Deliberately ignores cooldown.
 
