@@ -35,6 +35,12 @@ python3 brain.py --selfcheck      # offline proof the report + sensing + mining 
 Every rule the organs enforce traces back to a file on disk, never to a model's memory:
 **`WAVELENGTH.md`** is the house taste (audience, language, medium, narration, captions,
 identity) and every LLM call reads it at call time. Change it there and the next run obeys it.
+**`STORY.md`** is the same bargain for the WRITING — the hook, the shape of the beats, the spoken
+register, the word budget, the earned moral. `agents._story()` reads it at call time and puts it in
+front of the agents that write words; `agents.critique_script` judges every script against it
+before a credit is spent. It is separate from the wavelength because the shot list and the caption
+cards need the taste file but not the 60-line writing standard, and because a rule about hooks is
+an edit the owner wants to make in one place.
 
 ### Which model answers (`.env` — the one thing a model swap must not lose)
 

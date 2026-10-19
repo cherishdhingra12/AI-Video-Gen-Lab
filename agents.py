@@ -99,6 +99,25 @@ def _wavelength() -> str:
         return ""
 
 
+_STORY_MD = os.path.join(_DIR, "STORY.md")
+
+
+def _story() -> str:
+    """The house rules for WRITING (STORY.md), read at CALL time like the wavelength.
+
+    Separate from WAVELENGTH.md on purpose: that file is the production contract (medium, captions,
+    score, the hard nevers) and is pasted into every agent including the caption judge. These rules
+    are only about the writing — the hook, the shape of the beats, the dialogue, the moral — so they
+    go only to the agents that write words. Same bargain as the wavelength: a rule lives in a file
+    rather than inside these prompt strings so a model swap cannot lose it, and an edit lands on the
+    very next run. "" when absent, so the pipeline still runs without it."""
+    try:
+        with open(_STORY_MD) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 _brief_cache = None
 
 
@@ -134,12 +153,20 @@ def _brief() -> str:
     return _brief_cache
 
 
-def _system(role: str) -> str:
+def _system(role: str, writing: bool = False) -> str:
     """A role prompt with the house wavelength AND the brain's learned craft rules in front of
     it, so no agent writes without them — and so a lesson the brain has just learned lands on
-    the very next run."""
-    parts = [p for p in (_wavelength(), _brief(), role) if p]
-    return "\n\n---\n\n".join(parts)
+    the very next run.
+
+    `writing=True` also puts STORY.md in front of it, for every agent that puts words on the reel
+    (the script, the shot list, the caption cards) and for the script critic, whose rubric STORY.md
+    IS. The caption judge leaves it off: its prompt is already long and its job is one line at a
+    time, and a judge primed with the whole craft document drifts into rewriting what it audits."""
+    parts = [_wavelength()]
+    if writing:
+        parts.append(_story())
+    parts += [_brief(), role]
+    return "\n\n---\n\n".join(p for p in parts if p)
 
 
 # A free router answers a 429 "Too Many Requests" most days. Falling through to the next gateway
@@ -226,29 +253,315 @@ def chat(messages, max_tokens=4000, temperature=0.8, prefer=None, role=None):
                        + (f" | cooling: {routerhealth.walled()}" if routerhealth.walled() else ""))
 
 
-def write_script(idea: str, seconds: int = 15) -> str:
-    """Agent 1: idea -> vivid, shootable short-video script."""
-    system = _system(
-        "You are an award-winning short-film director and screenwriter. "
-        "You turn a one-line idea into a vivid, concrete, shootable micro-script "
-        "for an AI-generated video. You write what the audience SEES and HEARS, "
-        "never vague abstractions."
+# The script call used to ask for 2000 tokens, and that budget CUT the newest script mid-table:
+# projects/dadi-ki-bucket-list/script.md ends on a bare "| 8 | **" with its NGO-card row missing.
+# Nothing noticed — agent 2 read the truncated document, the folder kept it, the reel was built
+# from it. Devanagari is token-hungry (about a token per character on these routers), so a Hindi
+# script with a beats table needs far more room than an English one of the same length.
+#
+# 8000 rather than 4000: the CRITIC has to re-emit the whole corrected script inside its JSON, so
+# its answer is the script plus the findings, escaped. Measured on dadi-ki-bucket-list (a 3.5KB
+# script): 4000 came back as an unterminated JSON object, 8000 came back whole and parsed.
+SCRIPT_TOKENS = int(ENV.get("SCRIPT_TOKENS", "8000"))
+
+# How many times the critic may send the script back: one rewrite, then one check of that rewrite.
+# Never unbounded — a free tier that always finds something to say must not turn one kickoff into
+# twenty calls. 0 switches the critique off and restores the old single-draft behaviour.
+SCRIPT_ROUNDS = max(0, int(ENV.get("SCRIPT_ROUNDS", "2")))
+
+# The critique of the script that was actually written, for the caller to record beside it. A module
+# global rather than a second return value on purpose: write_script's contract (idea -> script text)
+# is stubbed by measure.py and qc.py's selfchecks, and widening it would break all of them.
+LAST_CRITIQUE = {}
+
+_SCRIPT_SECTIONS = ("LOGLINE", "VISUAL STYLE", "BEATS", "MORAL")
+
+
+def _script_complete(text: str) -> list:
+    """What is missing from a script — [] when it is whole.
+
+    Its whole job is truncation. A model that runs out of token budget mid-table returns a document
+    that looks like a script to everything downstream: agent 2 builds a shot list from it, the folder
+    keeps it as the reel's record, and the rows that never arrived are simply never missed. A last
+    line that stops inside a table row, or carries an odd number of bold markers, is what a cut-off
+    answer looks like."""
+    t = (text or "").strip()
+    if not t:
+        return ["the answer was empty"]
+    up = t.upper()
+    bad = [f"no {s.title()} section" for s in _SCRIPT_SECTIONS if s not in up]
+    last = [ln.strip() for ln in t.splitlines() if ln.strip()][-1]
+    if last.startswith("|") and not last.endswith("|"):
+        bad.append(f"it stops inside a table row: {last[:48]!r}")
+    elif last.count("**") % 2:
+        bad.append(f"it stops inside bold text: {last[:48]!r}")
+    return bad
+
+
+_SCRIPT_WRITER = (
+    "You are an award-winning short-film director and screenwriter, writing for an Indian family "
+    "scrolling on a phone. You turn a one-line idea into a script nobody can scroll past. You write "
+    "what the audience SEES and HEARS, never vague abstractions. STORY.md is your craft standard and "
+    "you obey every rule in it — the hook, the shape of the beats, the spoken register, the word "
+    "budget, the earned moral. You have never met a reel you could not make specific."
+)
+
+# The critic's rubric IS STORY.md, so this prompt only says how to judge and what to return. It is
+# built on the shape that already works here — agents.judge_captions: an independent reader that did
+# not write the thing, must quote what it objects to, and must return the fix rather than advice.
+_SCRIPT_CRITIC = (
+    "You are a story editor for a short vertical film. You did NOT write this script, and you are "
+    "not here to be encouraging — you are the last reader before a single frame is generated, so "
+    "anything you let pass gets filmed.\n"
+    "Judge it against STORY.md, rule by rule, and TAG every problem with the rule it breaks, so a "
+    "weakness that recurs across reels can be counted: [hook] [shape] [concrete] [dialogue] "
+    "[budget] [moral] [sameness] [length].\n"
+    "For each problem:\n"
+    "- QUOTE the exact line you object to. A finding that does not quote the script is not a "
+    "finding.\n"
+    "- Say what the rule wanted instead, in one sentence.\n"
+    "- Look for the whole CLASS, not the instance: if one beat is a listicle item, check every other "
+    "beat for the same fault; if one line is written Hindi, read all of them.\n"
+    "The three findings that matter most, in this order: a hook that is a preface or a contents "
+    "page; beats that could be swapped with no loss because nothing escalates and there is no turn; "
+    "a moral that is a platitude, a question, or unsupported by the story.\n"
+    "COUNT the words of every spoken line against its seconds — a line of the wrong length cannot be "
+    "performed, and no edit fixes it after the fact.\n"
+    "Then REWRITE the script yourself and return the WHOLE corrected document in the same shape "
+    "(MEDIUM, LOGLINE, VISUAL STYLE, BEATS table, MORAL, CTA), at the length the idea asked for. "
+    "Every problem you name must be VISIBLY fixed in what you return, and every line you changed "
+    "must appear in problems. Rewrite in the script's own language and register — the dialogue stays "
+    "Hindi as a character would speak it, never literary.\n"
+    "If the script already meets every rule, return it unchanged and an empty problems list."
+)
+
+
+def _shipped_shapes(limit: int = 8) -> list:
+    """The structure/motif/moral of the reels already shipped — the 'never the same reel twice' rule
+    needs the writer and the critic to SEE what has been done. `other_identities("")` matches no reel
+    by name, so it returns every one of them. Fail-open: no brain, no shapes, and the rule is simply
+    unenforced for that run."""
+    try:
+        from state import State
+        st = State()
+        try:
+            rows = st.other_identities("")
+        finally:
+            st.close()
+        out = []
+        for r in rows:
+            try:
+                fp = json.loads(r["fp"])
+            except (TypeError, ValueError):
+                continue
+            keep = {k: fp.get(k) for k in ("structure", "motif", "moral", "opener") if fp.get(k)}
+            if keep:
+                out.append({"reel": r["reel"], **keep})
+        return out[-limit:]
+    except Exception:  # noqa: BLE001 — a missing brain must never cost a script
+        return []
+
+
+# a problem's leading tag, e.g. "[shape] the four beats can be swapped"
+_TAG = re.compile(r"\[([a-z][a-z-]{2,19})\]")
+
+# A finding as it appears inside the critic's JSON — "[hook] the exact line — what the rule
+# wanted". Used only to salvage findings out of an answer that was cut off before its closing brace.
+_SALVAGE = re.compile(r'"(\[[a-z][a-z-]{2,19}\][^"]{12,})"')
+
+
+def _salvage_problems(text: str) -> list:
+    """The findings out of an unparseable critic answer. A truncated JSON object still contains
+    every problem it got to, as complete quoted strings; they are read here so a cut-off answer
+    still teaches the brain something instead of being thrown away as an outage."""
+    return [m.group(1).strip() for m in _SALVAGE.finditer(text or "")]
+
+
+def _file_script_lessons(problems: list):
+    """A finding the critic keeps making becomes a candidate rule the brain proposes — and the owner
+    still vets it: nothing filed here is enforced, it waits in `candidate_lessons` for `brain.py
+    promote`.
+
+    It goes through the existing propose path for one reason: propose_lesson upserts by slug and
+    increments `hits`, so a fault seen on four reels reaches the owner with hits=4 while a one-off
+    reaches them with hits=1 — recurrence is counted for free instead of by a counter kept here. The
+    title is per TAG and therefore stable; the newest evidence rides in `why`."""
+    try:
+        from state import State
+        st = State()
+    except Exception:  # noqa: BLE001 — no brain, no lesson, no cost
+        return
+    try:
+        for p in problems:
+            m = _TAG.search(p or "")
+            if not m:
+                continue
+            tag = m.group(1)
+            st.propose_lesson(
+                f"script-{tag}",
+                f"The script's {tag} keeps failing the critic — write to STORY.md",
+                why=(p or "").strip()[:400],
+                evidence=(p or "").strip()[:400])
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        st.close()
+
+
+def critique_script(script: str, idea: str = "", priors=None) -> dict:
+    """The script judge — the one review this pipeline never had.
+
+    Every other part of a reel is measured before it ships: the pace, the captions, the faces, the
+    audio floor. The script — the thing that decides whether anyone watches — was written once and
+    read by nothing at all. This is that reader: it gets STORY.md as its rubric, the idea the script
+    must serve and the shapes already shipped, and it returns problems plus the rewritten script.
+
+    It asks the OTHER gateway (`prefer`, the same trick the caption judge uses): the writer takes
+    whichever route answers first, so the critic asks the one that probably did not write it — a
+    model marking its own homework is not a review. `role="judge"` reuses the route already MEASURED
+    for judging rather than inventing an unmeasured role. Raises if no gateway answers; the caller
+    decides what an outage means, so a check that could not run is neither a pass nor a failure."""
+    shown = []
+    for p in priors or []:
+        p = p or {}
+        bits = [f"{k}: {str(p[k])[:100]}" for k in ("structure", "motif", "moral") if p.get(k)]
+        if bits:
+            shown.append(f"- {p.get('reel', 'a reel')} — " + " | ".join(bits))
+    seen = ("\nALREADY SHIPPED — their shapes, motifs and morals. Do not write one of these again:\n"
+            + "\n".join(shown)) if shown else ""
+    user = (
+        f"THE IDEA THIS REEL MUST SERVE:\n{idea}\n\n"
+        f"THE SCRIPT AS WRITTEN:\n{script}{seen}\n\n"
+        # The contract goes LAST and forbids reasoning, for the reason the caption judge learned the
+        # hard way: these routes are reasoning models, and one spent its whole budget thinking and
+        # never emitted the JSON, so the answer read as a gateway outage.
+        "Answer with JSON ONLY — no reasoning, no commentary, no markdown fences:\n"
+        '{"problems": ["[tag] the exact line — what the rule wanted instead", "...", '
+        '"[tag] ..."], '
+        '"script": "the WHOLE corrected script, in the same document shape"}')
+    text, used = chat(
+        [{"role": "system", "content": _system(_SCRIPT_CRITIC, writing=True)},
+         {"role": "user", "content": user}],
+        max_tokens=SCRIPT_TOKENS, temperature=0.4,
+        prefer=_ORDER[-1] if len(_ORDER) > 1 else None,
+        role="judge",
     )
+    try:
+        out = _extract_json(text)
+    except ValueError:
+        # A cut-off answer is the normal failure of this call, not an exotic one: the critic has to
+        # re-emit the whole script inside the JSON. Its findings, though, are complete strings long
+        # before the end — so salvage them, keep the draft, and let the caller record what was
+        # found. An unparseable answer is not an outage, and the findings are worth more than the
+        # rewrite we could not read.
+        out = {"problems": _salvage_problems(text), "script": ""}
+    problems = [str(p).strip() for p in (out.get("problems") or []) if str(p).strip()]
+    fixed = out.get("script") or out.get("rewritten_script") or ""
+    return {"problems": problems, "script": fixed if isinstance(fixed, str) else "", "by": used}
+
+
+def _finish_script(text: str, missing: list, idea: str) -> str:
+    """One continuation call for an answer that ran out of room, and only that.
+
+    The continuation is accepted only if it actually reduces what is missing, so a model that answers
+    with a fresh preamble instead of a continuation leaves the original untouched."""
+    try:
+        more, _used = chat(
+            [{"role": "system", "content": _system(_SCRIPT_WRITER, writing=True)},
+             {"role": "user", "content":
+              f"IDEA: {idea}\n\nYou were writing this script and your answer was cut off. What is "
+              f"missing: {'; '.join(missing)}.\n\nThe end of what you wrote:\n…{text[-1200:]}\n\n"
+              "Continue from exactly there and finish the document — the rest of the BEATS table, "
+              "the MORAL line and the CTA. Return ONLY the continuation: no preamble, no repeated "
+              "sections, no closing remarks."}],
+            max_tokens=SCRIPT_TOKENS, temperature=0.6, role="script")
+    except Exception:  # noqa: BLE001 — a draft is better than nothing
+        return text
+    joined = text.rstrip() + "\n" + more.strip()
+    return joined if len(_script_complete(joined)) < len(missing) else text
+
+
+def _draft_script(idea: str, seconds: int = None) -> tuple:
+    """The writer's ONE call, plus the continuation call when its answer ran out of room. Split out
+    of write_script so the draft can be scored on its own (measure.py ranks candidates on the draft,
+    not on the rewrite, because the rewrite is partly the critic's work).
+
+    `seconds` is the length the caller wants, and None means "whatever the IDEA asks for" — the old
+    default of 15 was silently pasted into the prompt for a 35-second brief, so the writer was told
+    to make a 15-second film while the idea asked for half a minute and the two fought each other.
+    Returns (text, "route:model")."""
+    system = _system(_SCRIPT_WRITER, writing=True)
+    length = (f"~{seconds}-second" if seconds else
+              "cinematic video of the length the IDEA asks for — about 30 seconds if it names none")
     user = (
         f"IDEA: {idea}\n\n"
-        f"Write a script for a ~{seconds}-second cinematic video. Include:\n"
+        f"Write a script for a {length} video. Include:\n"
         "- MEDIUM: this is a 3-D ANIMATED film — a stylized animated-feature look, never photoreal, "
         "never live action. Write every beat as it would look animated.\n"
-        "- LOGLINE: one sentence.\n"
+        "- LOGLINE: one sentence — who wants what, and what it costs them.\n"
         "- VISUAL STYLE: palette, 3-D animation look, mood (one paragraph).\n"
-        "- BEATS: a numbered beat-by-beat of the visual action and, for each beat, the exact "
-        "Hindi line a character speaks on camera — or a note that the beat is silent.\n"
+        "- BEATS: a numbered table — the visual action, the exact Hindi line a character speaks on "
+        "camera (or *silent*), and the seconds that beat runs. Count each line's words against the "
+        "STORY.md budget before you write it down.\n"
+        "- MORAL: the closing card line, written out.\n"
+        "- CTA: the closing line and the brand on the last frame, kept separate from the moral.\n"
+        "Write the WHOLE document — an answer that stops mid-table is treated as broken. "
         "Keep it tight, concrete, and directable."
     )
     text, used = chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        max_tokens=2000, temperature=0.9, role="script",
+        max_tokens=SCRIPT_TOKENS, temperature=0.9, role="script",
     )
+    cut = _script_complete(text)
+    if cut:
+        print(f"  ! the script came back incomplete ({'; '.join(cut)}) — asking for the rest")
+        text = _finish_script(text, cut, idea)
+    return text, used
+
+
+def write_script(idea: str, seconds: int = None) -> str:
+    """Agent 1: idea -> a script that has been judged and rewritten before anything is filmed.
+
+    The critique is the point of this function. The script used to be written once and read by
+    nothing; now it is written, sent to a model that did not write it, and rewritten to its findings
+    — twice at most — before a single video credit is spent. The whole exchange costs a few seconds
+    on a free tier against the ten to thirty minutes and the credits a render costs.
+
+    The draft is always returned, whatever happens: an unjudged script beats no reel at all when the
+    critic's gateway is down. What happened is left in LAST_CRITIQUE, and the pipeline writes it
+    beside the script so the record survives the run."""
+    global LAST_CRITIQUE
+    text, used = _draft_script(idea, seconds)
+    cut = _script_complete(text)      # what was still missing after the one continuation call
+
+    problems, rounds, by, outage = [], 0, "", ""
+    for _ in range(SCRIPT_ROUNDS):
+        try:
+            out = critique_script(text, idea, _shipped_shapes())
+        except Exception as e:  # noqa: BLE001 — an unjudged script is still a script
+            outage = str(e)[:200]
+            break
+        rounds += 1
+        by = out.get("by") or by
+        problems += out["problems"]
+        if not out["problems"]:
+            break
+        fixed = out["script"]
+        # only adopt a rewrite that is whole: a critic that ran out of room mid-sentence and handed
+        # back half a document must not leave us with less than we started with
+        if fixed.strip() and not _script_complete(fixed):
+            text = fixed
+        else:
+            break
+    LAST_CRITIQUE = {"problems": problems, "rounds": rounds, "by": by, "writer": used,
+                     "could_not_run": outage, "incomplete_on_arrival": cut}
+    if problems:
+        print(f"  script critic: {len(problems)} finding(s) over {rounds} pass(es) — rewritten")
+    elif rounds:
+        print(f"  script critic: clean on the first read ({by})")
+    if outage:
+        print(f"  ! the script critic could NOT run ({outage[:80]}) — the script ships as written")
+    _file_script_lessons(problems)
     return text
 
 
@@ -1682,6 +1995,123 @@ if __name__ == "__main__":
         print("OK: a publishing sheet must open on the reel's own hook and the real address")
         print("OK: presentation() rejects overflow, an empty card, an English-only hook, "
               "a photoreal identity, and an unknown font")
+
+        # ---- THE SCRIPT'S OWN CONTRACT: written, judged, rewritten — before it costs anything ----
+        # Prose rules drift silently, so the writer's rubric is asserted the way WAVELENGTH's is.
+        assert _story().strip(), "STORY.md must exist: it is the writer's rubric and the critic's bar"
+        assert "Banned openings" in _story(), "STORY.md no longer bans a preface as a hook"
+        assert "Never the same reel twice" in _story(), "STORY.md lost the anti-repeat rule"
+        assert "the word budget is arithmetic" in _story().lower(), \
+            "STORY.md no longer states the word budget as a rule"
+        # Read at CALL time (the _wavelength() contract): a rule the owner adds to the file lands on
+        # the very next run, with no code change and no model swap able to lose it.
+        import tempfile
+        _probe = os.path.join(tempfile.mkdtemp(), "STORY.md")
+        with open(_probe, "w") as f:
+            f.write("# a rule added one second ago\n")
+        _orig_md = globals()["_STORY_MD"]
+        try:
+            globals()["_STORY_MD"] = _probe
+            assert "one second ago" in _system("ROLE", writing=True), \
+                "STORY.md must be read at call time, not cached at import"
+            assert "one second ago" not in _system("ROLE"), \
+                "the caption judge must not carry the writing rules — its prompt is long enough"
+        finally:
+            globals()["_STORY_MD"] = _orig_md
+
+        # A whole script is whole; a script cut off mid-table-row is NOT — and that is the defect
+        # that shipped: dadi-ki-bucket-list's script.md ends on a bare "| 8 | **" and agent 2 filmed
+        # the fragment. A missing MORAL is the same failure one step earlier.
+        _WHOLE = ("MEDIUM: a 3-D animated film\nLOGLINE: A son wants his father's voice back.\n"
+                  "VISUAL STYLE: soft stylized 3-D animation, amber lamplight.\n"
+                  "BEATS:\n"
+                  "| 1 | He holds the dead phone | क्या तुम्हें यह आवाज़ याद है? | 8 |\n"
+                  "| 2 | He plays the recording | *silent* | 5 |\n"
+                  "MORAL: पिता की आवाज़ कभी नहीं जाती\n"
+                  "CTA: standardsunrisefoundation.org\n")
+        _FIXED = _WHOLE.replace("क्या तुम्हें यह आवाज़ याद है?", "यह आवाज़ मेरे पास अब भी है")
+        assert _script_complete(_WHOLE) == [], "a whole script must pass"
+        assert _script_complete(_FIXED) == [], "the rewrite must be a whole script too"
+        assert _script_complete(_WHOLE + "| 8 | **"), "a script cut off mid-table must be caught"
+        assert _script_complete("LOGLINE: x\nVISUAL STYLE: y\nBEATS: z"), \
+            "a script with no MORAL is incomplete"
+        assert _script_complete(""), "an empty answer is not a script"
+        # the finding -> lesson tag, pure (nothing is filed by this assertion)
+        assert _TAG.search("[budget] 24 words in a 7-second line").group(1) == "budget", \
+            "a tagged finding must name its rule"
+        assert not _TAG.search("the hook is a preface"), "an untagged finding files no lesson"
+        # A critic answer cut off before its closing brace still carries its findings — they are
+        # complete strings long before the end, and throwing them away as an outage loses the one
+        # thing the call was worth.
+        assert _salvage_problems('{"problems": ["[hook] a preface — open on the object", '
+                                 '"[shape] the beats are swappable"], "script": "MEDIUM: 3-D') == \
+            ["[hook] a preface — open on the object", "[shape] the beats are swappable"], \
+            "a truncated critique must still teach the brain what it found"
+        assert _salvage_problems("no json at all") == [], "nothing is invented from prose"
+
+        _orig_chat3, _orig_file = chat, _file_script_lessons
+        _filed = []
+
+        def _critic_says(problems, script):
+            """A stub `chat` that answers as the critic when the prompt is the critic's."""
+            def _stub(messages, **k):
+                if "story editor" in messages[0]["content"]:
+                    return json.dumps({"problems": problems, "script": script}), "critic"
+                return _WHOLE, "writer"
+            return _stub
+        try:
+            globals()["_file_script_lessons"] = lambda p: _filed.append(list(p))
+
+            # the critic's rewrite is ADOPTED, its findings are recorded, and the rounds are capped —
+            # a stub that always finds something must not loop forever
+            globals()["chat"] = _critic_says(["[hook] opens on a preface"], _FIXED)
+            out = write_script("a test idea")
+            assert out == _FIXED, "the critic's rewrite must be what gets filmed"
+            assert LAST_CRITIQUE["rounds"] == SCRIPT_ROUNDS, \
+                f"the loop must stop at SCRIPT_ROUNDS, ran {LAST_CRITIQUE['rounds']}"
+            assert len(LAST_CRITIQUE["problems"]) == SCRIPT_ROUNDS, \
+                "every pass's findings are recorded, not just the last"
+            assert _filed and _filed[0][0] == "[hook] opens on a preface", \
+                "a tagged finding must reach the brain as a candidate lesson"
+
+            # a critic that is DOWN costs nothing: the draft ships and the outage is recorded
+            def _down(messages, **k):
+                if "story editor" in messages[0]["content"]:
+                    raise RuntimeError("all LLM gateways failed: stub")
+                return _WHOLE, "writer"
+            globals()["chat"] = _down
+            assert write_script("a test idea") == _WHOLE, "a critic outage must not cost the draft"
+            assert LAST_CRITIQUE["could_not_run"], \
+                "an outage is recorded — a check that could not run is not a pass"
+            assert not _filed[-1], "nothing is filed from a critique that never happened"
+
+            # a critic that returns HALF a document is refused: we never end up with less
+            globals()["chat"] = _critic_says(["[shape] a list, not a story"], _WHOLE + "| 8 | **")
+            assert write_script("a test idea") == _WHOLE, \
+                "a truncated rewrite must never replace a whole draft"
+
+            # truncated WRITING is finished by one continuation call, and only if it helps
+            _cut = _WHOLE.split("MORAL:")[0]
+            _writes = []
+
+            def _cut_then_rest(messages, **k):
+                if "story editor" in messages[0]["content"]:
+                    return json.dumps({"problems": [], "script": ""}), "critic"
+                _writes.append(messages[-1]["content"])
+                if len(_writes) == 1:
+                    return _cut, "writer"
+                return "MORAL: पिता की आवाज़ कभी नहीं जाती\nCTA: standardsunrisefoundation.org", "w"
+            globals()["chat"] = _cut_then_rest
+            out = write_script("a test idea")
+            assert "MORAL" in out and not _script_complete(out), \
+                "an answer cut off mid-document must be finished, not shipped"
+            assert len(_writes) == 2 and "cut off" in _writes[1], \
+                "exactly one continuation call, told what was missing — never a barrage"
+        finally:
+            globals()["chat"] = _orig_chat3
+            globals()["_file_script_lessons"] = _orig_file
+        print("OK: the script is written, judged against STORY.md, rewritten, and finished — and a "
+              "critic that is down costs the reel nothing")
         raise SystemExit(0)
 
     # self-check: real end-to-end of the LLM half on a tiny idea.

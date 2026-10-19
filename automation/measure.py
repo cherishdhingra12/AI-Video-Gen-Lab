@@ -5,7 +5,9 @@ The two routers between them expose ~1,200 models, and which one suits which age
 matter of taste: every role in this pipeline already has a CONTRACT saying what a good answer
 looks like, so the answer can be SCORED instead of admired. One real call per candidate per role:
 
-    script        the sections the writer was asked for, in Hindi, long enough to shoot
+    script        the writer's own contract: the sections, in Hindi, WHOLE (not cut off mid-table)
+                  — plus the two halves of the critic, which must pass this draft AND catch a
+                  planted weak script
     shotlist      a plan surviving build_shotlist's own rules — 3-D style, 3-6 clips, no clip
                   prompt asking for text, no camera travelling INTO anything, real dialogue
     presentation  agent 3's output passing agents._presentation_selfcheck (identity + cards)
@@ -26,8 +28,9 @@ a defect, and a route that was down at measuring time must not lose to the one t
 answer. The picks file is runtime state (like .brain_state.json) — a measurement of a free tier
 is machine-local and goes stale, so it is gitignored and re-run by hand.
 
-ponytail: the script role scores SHAPE (the sections exist, in Hindi, long enough) — nothing here
-reads a screenplay. It is the weakest of the five and the report says so.
+ponytail: the script role scores the writer's shape plus the house critic's verdict on it. STORY.md
+is the rubric, and the critic reading it is a free model too — so the score ranks writers against
+each other by the house rules, it does not judge writing in the absolute.
 """
 
 import argparse
@@ -73,7 +76,22 @@ _SCRIPT = (
     "silent, only the hum.\n"
     "3. He plays it for the old man, who smiles without saying anything: सुनो, यह उनकी आवाज़ है।\n"
     "4. The phone lies face up on the table between them, still playing, as the lamp warms the "
-    "room and neither of them speaks."
+    "room and neither of them speaks.\n"
+    "MORAL: पिता की आवाज़ कभी नहीं जाती\n"       # the clean cards' own moral, or the caption judge
+)                                              # would flag them and every candidate lose the mark
+
+# The PLANTED weak script: dadaji-ka-kahani as it actually shipped — a preface for a hook, four
+# interchangeable aphorisms with nothing physical to film, and a moral nobody speaks and the story
+# never earned. A critic that does not name THIS has not read it, and the writer role's score says so.
+_WEAK_SCRIPT = (
+    "LOGLINE: An old man shares what eighty years taught him.\n"
+    "VISUAL STYLE: soft stylized 3-D animation, warm lamplight, shallow focus.\n"
+    "BEATS:\n"
+    "1. दादाजी कुर्सी पर बैठे हैं और कहते हैं: अस्सी की उम्र में मैंने ये बातें सीखीं।\n"
+    "2. वे कहते हैं: समय सबसे बड़ा शिक्षक है।\n"
+    "3. वे कहते हैं: परिवार ही सब कुछ है।\n"
+    "4. वे कहते हैं: मुस्कुराते रहो, जीवन छोटा है।\n"
+    "MORAL: सपनों की कोई उम्र नहीं होती।\n"
 )
 
 _SHOT = {"title": "पुराना फ़ोन", "slug": "purana-phone", "aspect": "9:16",
@@ -124,12 +142,26 @@ def _frac(checks) -> float:
     return sum(1 for c in checks if c) / len(checks) if checks else 0.0
 
 
-def _score_script(text: str) -> float:
-    """SHAPE only — see the module docstring. The sections the prompt asked for, in Hindi, with
-    enough written to shoot."""
+def _score_script(text: str, problems=None, planted=None) -> float:
+    """The WRITER's own contract, plus whether the house critic agrees with it.
+
+    Seven marks. Five are the shape the prompt asked for (sections, Hindi, and now WHOLENESS — a
+    document cut off mid-table used to be scored as a complete one, which is how
+    dadi-ki-bucket-list shipped a truncated script). The last two are the two halves of the critic:
+    it must find NOTHING wrong with this writer's draft, and it must CATCH the planted weak script.
+
+    Those two are opposite-signed on purpose. A critic that says "clean" to everything gets the
+    first and misses the second; a critic that finds fault with everything misses the first and gets
+    the second — both land on 6/7, so a useless critic cannot win the role by being loud OR quiet.
+    The same discipline as _score_judge.
+
+    Honest ceiling: the critic is a free model too, so this ranks writers AGAINST EACH OTHER by the
+    house rubric (STORY.md). It is not an absolute judgement of writing."""
     up = (text or "").upper()
     return _frac([("LOGLINE" in up), ("BEAT" in up), ("STYLE" in up),
-                  bool(re.search(r"[ऀ-ॿ]", text or "")), len(text or "") >= 500])
+                  bool(re.search(r"[ऀ-ॿ]", text or "")),
+                  not agents._script_complete(text or ""),
+                  not (problems or []), bool(planted or [])])
 
 
 def _score_shotlist(shot) -> float:
@@ -187,9 +219,33 @@ def _pin(route, model):
     routerhealth.clear()
 
 
+def _critique_by_judge(script, idea):
+    """Critique a draft with the HOUSE JUDGE — the route and model that `role="judge"` is measured
+    to, or the far end of LLM_ORDER when the role has no measurement yet.
+
+    Not the candidate being measured. critique_script asks whichever route answers first once a
+    candidate is pinned, so without this a writer would be marking its own homework and every
+    candidate would score the same on the two critic marks — the same reason the caption judge is
+    never the writer."""
+    pick = agents._picks().get("judge") or {}
+    keep = agents._PIN
+    if pick.get("route") or len(agents._ORDER) > 1:
+        agents._PIN = (pick.get("route") or agents._ORDER[-1], pick.get("model"))
+    try:
+        return agents.critique_script(script, idea)
+    finally:
+        agents._PIN = keep
+
+
 def _t_script(route, model) -> float:
+    """The DRAFT the candidate writes, read by the house critic. The two extra calls are the point:
+    a writer whose script the house critic rejects has not written a good script, however neatly it
+    laid out the sections. The draft, not the rewrite — the rewrite is partly the critic's work."""
     _pin(route, model)
-    return _score_script(agents.write_script(_IDEA))
+    draft, _used = agents._draft_script(_IDEA)
+    out = _critique_by_judge(draft, _IDEA) or {}
+    planted = _critique_by_judge(_WEAK_SCRIPT, _IDEA) or {}
+    return _score_script(draft, out.get("problems"), planted.get("problems"))
 
 
 def _t_shotlist(route, model) -> float:
@@ -359,9 +415,17 @@ if __name__ == "__main__":
     if a.selfcheck:
         assert abs(_frac([True, False, True, True]) - 0.75) < 1e-9, "a fraction of checks"
         assert _frac([]) == 0.0, "no checks must not divide by zero"
-        # script: the sections the writer was told to produce, in Hindi, long enough to shoot
-        assert _score_script(_SCRIPT) == 1.0, "a good script must score full marks"
+        # script: the writer's shape AND the critic's two halves. A cut-off document, a critic that
+        # flags everything and a critic that flags nothing must all lose the role.
+        assert _score_script(_SCRIPT, [], ["[hook] a preface, not a hook"]) == 1.0, \
+            "a whole script the critic passed, with the planted defect caught, is a full score"
         assert _score_script("LOGLINE: x") < 0.5, "a stub script must not"
+        assert _score_script("LOGLINE: x\nVISUAL STYLE: y\nBEATS: z") < 1.0, \
+            "a script with no MORAL section (or one cut off mid-table) is not a whole script"
+        loud = _score_script(_SCRIPT, ["[shape] nitpick"], ["[shape] planted"])
+        quiet = _score_script(_SCRIPT, [], [])
+        assert loud == quiet == 6 / 7, \
+            "a critic that flags everything and one that flags nothing score the same: 6/7"
         # shotlist: a plan the pipeline would accept, and three ways it has actually failed
         good = {"style": agents.HOUSE_STYLE, "world": "A room at night. " * 8, "aspect": "9:16",
                 "clips": [{"prompt": "He scrolls the phone slowly, then stops.",

@@ -900,6 +900,18 @@ LESSONS = [
          why="owner instruction 2026-10-06, restated 2026-10-08: prioritise output quality, do "
              "not hold a reel back over licensing questions — but the source row stays in "
              "music/LIBRARY.md so provenance is never lost. Publication is the owner's call"),
+    dict(slug="script-craft-story", tier="judgment", severity="warn",
+         title="The script is a STORY with a hook — not a list, and never a preface",
+         why="owner ask 2026-10-19: the writing is the weakest link. Judged on the five shipped "
+             "scripts, the house failure mode is a LIST, not a story: interchangeable beats you "
+             "could shuffle with no loss (dadi-ki-bucket-list: four parallel items, no obstacle), "
+             "opened on a contents page ('80 की उम्र में दादी की लिस्ट में क्या था?') or on a "
+             "preface ('अस्सी की उम्र में मैंने ये बातें सीखीं...'), with a moral nobody speaks "
+             "and no beat earns (dadaji-ka-kahani). The strongest reel of the five "
+             "(good-morning-dadaji) has a real hook, cause and effect, a physical turn — a dead "
+             "battery — and a moral the story proves. The rules live in STORY.md (agents._story() "
+             "reads it at call time and agents.critique_script judges against it, before any "
+             "credit is spent)"),
 ]
 
 
@@ -1103,6 +1115,14 @@ if __name__ == "__main__":
         seed(st)
         assert set(l["check_id"] for l in st.craft_lessons(tier="auto")) <= set(CHECKS) | {None}, \
             "every auto lesson must map to a real check"
+        # A slug is the lesson's identity: learn_lesson UPSERTS by it, so two entries sharing one
+        # silently replace each other and the second rule never exists.
+        _slugs = [l["slug"] for l in LESSONS]
+        assert len(set(_slugs)) == len(_slugs), f"two lessons share a slug: {_slugs}"
+        assert "script-craft-story" in _slugs and \
+            os.path.exists(os.path.join(os.path.dirname(_DIR), "STORY.md")), \
+            "the writing standard is seeded as a lesson AND lives in STORY.md (agents._story reads " \
+            "it at call time) — the lesson is worthless if the file it points at is gone"
 
         # A "clean reel" fixture has to be a REAL reel length, or the pacing check fires on the
         # test itself and every passing fixture reads as HELD. The passing fixtures use _RL; the
@@ -1631,8 +1651,14 @@ if __name__ == "__main__":
             assert _f12, "a pipeline folder missing its cover and sheet must gate go_live"
             for _m in ("cover.png", "publishing.md"):
                 assert _m in _f12[0], f"the missing file must be NAMED: {_f12[0]}"
-            assert "shotlist.json" in _f12[0] and "music_meta.json" in _f12[0], \
+            assert "shotlist.json" in _f12[0] and "caption_place.json" in _f12[0], \
                 f"every missing member must be named, not just the first: {_f12[0]}"
+            # ...and the OPTIONAL members are NOT: a reel whose score rides inside the generated
+            # clips carries no bed, and demanding one would gate it forever (publishing.OPTIONAL).
+            # This assert used to name music_meta.json as missing — stale since the no-bed route
+            # was allowed, and it left the offline suite red.
+            assert "music_meta.json" not in _f12[0] and "music_bed.json" not in _f12[0], \
+                f"a reel with no separate bed must not be asked for one: {_f12[0]}"
             assert "publishing.py" in _f12[0], "the item must carry the command that fixes it"
             assert not any("[reel-folder]" in b for b in run(d12, st)["block"]), \
                 "an incomplete folder is not a broken reel — it gates, it never blocks"

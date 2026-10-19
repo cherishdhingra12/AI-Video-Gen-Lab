@@ -657,12 +657,17 @@ def _selfcheck():
     open(os.path.join(bare, "final.mp4"), "wb").write(b"x")          # a reel with NO craft
     r = b.absorb(bare)
     # narration is the one layer that CANNOT be judged from a reel with no clips on disk — the
-    # measurement lives in the clips, so a clip-less project is not evidence of a narration gap
+    # measurement lives in the clips, so a clip-less project is not evidence of a narration gap.
+    # Nor is the SCORE filed: a reel may legitimately carry no separate bed (the clips' own audio
+    # does it), so "no music_raw.mp3" is a choice, not a gap — check_score_present measures the
+    # shipped cut's floor instead (2026-10-18, and the old rule is dismissed for good).
     assert r["ok"] and set(r["learned"]) == {"reel-needs-captions", "reel-needs-identity",
-                                             "reel-needs-moral", "reel-needs-score"}, r
+                                             "reel-needs-moral"}, r
     pend = {c["slug"] for c in st.candidates(status="pending")}
-    assert {"reel-needs-captions", "reel-needs-identity", "reel-needs-moral",
-            "reel-needs-score"} <= pend, f"each gap must be filed as evidence: {pend}"
+    assert {"reel-needs-captions", "reel-needs-identity",
+            "reel-needs-moral"} <= pend, f"each gap must be filed as evidence: {pend}"
+    assert "reel-needs-score" not in pend, \
+        "a bed-less reel is not a gap — the score is measured off the cut, never off a file"
     gen = [e for e in st.events(limit=2000) if e["kind"] == "generation"]
     assert gen and "reel-bare" in gen[-1]["detail"], "each generation is written to memory"
     # a reel that ships EVERY layer must file nothing — the loop must be quiet when there's no gap

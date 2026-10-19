@@ -69,6 +69,11 @@ Viral pull is the **hook** — a curiosity gap, a number, or an image that makes
 the end. Hooks that have worked: a phone secretly recording a hum; a full visitors' register; a
 grandfather stuck in a bunny filter; a drawer of handwritten lists.
 
+How the writing is actually done — the banned openings, why a list is not a story, how a
+grandmother talks, the word budget per line — lives in **`STORY.md`**, read at call time by the
+agents that write words and judged against by `agents.critique_script`. That file is the standard;
+this section is the taste it serves.
+
 ## 3. Narration — spoken IN the scene, never added later
 
 Dialogue belongs to the generated clip, spoken by a character on camera, in **Hindi**. Write

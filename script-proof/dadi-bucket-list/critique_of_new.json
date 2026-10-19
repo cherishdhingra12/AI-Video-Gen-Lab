@@ -1,0 +1,24 @@
+{
+  "problems": [
+    "[hook] \"80 की उम्र में दादी की लिस्ट में क्या था?\" — this is a contents-page hook, banned by STORY.md §1; the hook should open a curiosity gap with an image or number, not announce a list.",
+    "[shape] Beats 1–4 are four parallel joyful activities (pizza, dance, flight, selfie) with no escalation, no obstacle, no turn — they could be swapped with no loss, making the reel a listicle, not a story (STORY.md §2).",
+    "[concrete] No specific, physical detail survives — no name, date, count, or unique object; the pizza, dance, flight, and actor are generic (STORY.md §3).",
+    "[dialogue] All four list lines are literary, not spoken Hindi — \"बिल्कुल मेरे बचपन की मिठाई जैसा\", \"जीवन का जश्न मनाते हुए\", \"दिल की धड़कन जैसे तड़प रही है\", \"जिंदादिली\" — a grandmother would not say these (STORY.md §4).",
+    "[budget] Beat 1 line is 20 words for a 7 s clip (≈2.9 wps), beats 2–4 are 15 words each (≈2.1 wps) — spoken Hindi runs ~2.2 wps, so lines must be ~13 words for 6 s of speech (STORY.md §4).",
+    "[moral] The moral card contains two sentences, the second a direct question to the viewer (\"पूछिए...\") — a question is a CTA, not a moral; also the platitude \"सपनों की कोई उम्र नहीं होती\" is unsupported because the story never shows her dream being doubted (STORY.md §5).",
+    "[sameness] This reel replicates the already-shipped `dadi-ki-bucket-list` (same hook card, same four list beats, same grandson Q&A, same moral, same CTA) — STORY.md §6 forbids repeating a prior reel's architecture.",
+    "[length] The brief requires each clip ~10 s with 6–9 s of speech, but the script allocates only 7 s per clip, leaving no room for the required speech duration (Idea brief).",
+    "[hook] \"80 की उम्र में दादी की लिस्ट में क्या था?\" — contents-page hook announces a list; STORY.md §1 bans preface/contents-page openings (mandated by brief but still a structural flaw).",
+    "[shape] Beats 1–4 are parallel bucket-list items with no causal escalation and no turn; swapping any two loses nothing — a listicle, not a story. STORY.md §2.",
+    "[concrete] No specific surviving detail — \"पिज़्ज़ा\", \"नाचना\", \"हवाई जहाज\", \"सेल्फी\" are generic categories; nothing a viewer could name after watching. STORY.md §3.",
+    "[dialogue] All four list lines are written Hindi, not spoken — \"आख़िर आ गया मेरा पिज़्ज़ा — भूख मिट गई, दिल भर गया!\", \"ऐसा स्वाद आया कि पाँव खुद थिरकने लगे!\", \"पिज़्ज़ा ने याद दिलाया — मुझे भी तो उड़ना था!\", \"देखो, मेरे हीरो मेरे साथ सेल्फी ले रहे हैं!\" — no grandmother speaks this way. STORY.md §4.",
+    "[budget] Every list line is 10–13 words for 7s of speech (1.4–1.9 wps) — spoken Hindi needs ~2.2 wps; lines will leave 3–4s dead air per clip. STORY.md §4.",
+    "[moral] \"सपनों की कोई उम्र नहीं होती। पूछिए, आपके घर के बुज़ुर्गों की इच्छा क्या है?\" — first sentence is a platitude unsupported by the montage; second is a CTA question, not a moral. STORY.md §5.",
+    "[sameness] Structure (hook-card → four parallel list beats → grandson Q&A → moral-card → CTA-card) and moral duplicate shipped reels \"dadi-ki-bucket-list\" and \"dadi-bucket-list\". STORY.md §6."
+  ],
+  "rounds": 2,
+  "by": "omniroute:nvidia/nemotron-3-ultra-550b-a55b:free",
+  "writer": "freellmapi:gpt-oss:120b",
+  "could_not_run": "",
+  "incomplete_on_arrival": []
+}

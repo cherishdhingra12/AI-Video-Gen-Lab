@@ -96,6 +96,14 @@ def main(st=None):
         f.write(f"# {shot.get('title')}\n\nIDEA: {idea}\n\n{script}")
     with open(os.path.join(pdir, "shotlist.json"), "w") as f:
         json.dump(shot, f, indent=2)
+    # WHAT THE CRITIC SAID, kept beside the script it judged. The rewrite that ships is only half the
+    # record — a finding the critic keeps making across reels becomes a candidate rule in the brain
+    # (agents._file_script_lessons), and this file is where a person can see the finding itself.
+    try:
+        with open(os.path.join(pdir, "script_critique.json"), "w") as f:
+            json.dump(agents.LAST_CRITIQUE, f, indent=2, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001 — the record must never cost the reel
+        print(f"  ! could not write script_critique.json ({str(e)[:80]})")
 
     # THE PLAN LINT — the last gate before a credit is committed (owner fix, 2026-10-14). Until
     # now a plan that could not be filmed was found by watching the finished reel: four to six
@@ -103,6 +111,13 @@ def main(st=None):
     # pasted into a site, so nothing is queued that has lost a guarantee — and the plan is on
     # disk first, so a refusal leaves the evidence in front of whoever re-runs it.
     plan = agents.validate_plan(shot, prompts)
+    # A script that arrived incomplete (the writer ran out of room and the one continuation call did
+    # not close it) is a defect in the WRITING, not in the filmability — so it warns here, where the
+    # plan's own warnings are read, rather than stopping a reel that can still be filmed. It used to
+    # pass in silence: dadi-ki-bucket-list shipped a script cut off mid-table.
+    miss = agents._script_complete(script)
+    if miss:
+        plan["warn"] += [f"the script is INCOMPLETE ({'; '.join(miss)}) — it was queued anyway"]
     for w in plan["warn"]:
         print(f"  ! {w}")
     if plan["bad"]:
@@ -212,7 +227,7 @@ if __name__ == "__main__":
             globals()["_DIR"] = _tmp                     # never litter the real projects/
             _crisis.CRISES = os.path.join(_tmp, "crises")
             sys.argv = ["pipeline.py", "a test reel"]
-            agents.write_script = lambda idea: "script"
+            agents.write_script = lambda idea, **k: "script"
             agents.build_shotlist = lambda script: _bad
             music.choose = lambda *a, **k: None
             try:
