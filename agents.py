@@ -755,6 +755,47 @@ def _char_clauses(world: str) -> list:
     return out
 
 
+# ---- what makes a clip a FLASHBACK -----------------------------------------------------------
+# The plan already says it in words ("Flashback: Young Dadaji dashes through a flood", "Back to
+# present: …"). ONE list, read by the two places that must agree about it: _clip_lock below (so a
+# flashback clip is not ordered to hold an age the story changes) and the QC character check (so a
+# younger face is not read as a drifted one). A jump the plan never names is invisible here; the
+# by-eye pass is what catches that one.
+FLASHBACK_WORDS = ("flashback", "flash-back", "flash back", "time jump", "years earlier",
+                   "years ago", "in the past", "back then", "memory", "memories", "younger",
+                   "young version", "as a child", "childhood")
+
+
+def declares_flashback(text: str) -> bool:
+    """Does this clip's own text say it happens in an earlier time? ("Back to present" does not —
+    it is the RETURN from the jump, and marking it would move the exclusion onto the wrong clip.)"""
+    low = (text or "").lower()
+    return any(w in low for w in FLASHBACK_WORDS)
+
+
+def _clip_lock(shot: dict, clip: dict, base: str = "") -> str:
+    """The identity lock for ONE clip — the reel's single lock, in its flashback form when this
+    clip's own text declares an earlier time.
+
+    A flashback clip cannot carry the standard lock. That lock says "identical face, AGE … from the
+    first clip to the last, and no … garment … removed", in the same prompt whose action line opens
+    "Flashback: Young Dadaji …" and whose cast block calls him an elderly man — so the generator
+    is handed two opposite orders about the one thing the shot is about, and picks one (the same
+    class of bug NO_TEXT exists for; dadaji-ki-yadein, 2026-10-19). The flashback form keeps every
+    guarantee that still holds — same face structure, features, hair, skin tone and build, nothing
+    added or redesigned — and drops only what the story itself changes: age, and the clothes and
+    light of that earlier day."""
+    base = base or _char_lock(shot)
+    if not declares_flashback((clip.get("prompt") or "") + " " + (clip.get("visual") or "")):
+        return base
+    return ("FLASHBACK — THE SAME PERSON AS IN EVERY OTHER CLIP, AT A YOUNGER AGE. This clip is an "
+            "earlier time in the story, so this character is YOUNGER here and wears what he wore "
+            "then: where the cast description above reads as an elderly man, read it as the SAME "
+            "man, young. Keep the same face structure, features, hair and skin tone and the same "
+            "build, so he is recognisable as that person; nothing else added, removed or "
+            "redesigned, and no accessory or jewellery he does not have.")
+
+
 def _char_lock(shot: dict) -> str:
     """ONE sentence per reel, appended VERBATIM — same words, same place — to every clip prompt.
 
@@ -974,10 +1015,10 @@ def clip_prompts(shot: dict, site: str = "") -> list:
             body = [f"SCENE AND CAST (identical in every clip): {world}" if world else "",
                     f"ACTION AND CAMERA: {action}" if action else "",
                     f"SPOKEN ALOUD, sound only — never written on screen: {says}" if says else ""]
-            tail = [f"LOOK, IN EVERY FRAME: {style}", NO_TEXT, anti, lock]
+            tail = [f"LOOK, IN EVERY FRAME: {style}", NO_TEXT, anti, _clip_lock(shot, c, lock)]
         else:
             body = [world, action, says]
-            tail = [style, NO_TEXT, anti, lock]
+            tail = [style, NO_TEXT, anti, _clip_lock(shot, c, lock)]
         out.append(_fit(_per_clip_lead, sep.join(x for x in body if x),
                         sep.join(x for x in tail if x), PROMPT_CHARS, sep,
                         floor=MEDIUM_REQUIREMENT))
@@ -1027,7 +1068,7 @@ def validate_plan(shot: dict, prompts: list = None) -> dict:
                 bad.append(f"clip {i}: the no-text rule is gone from the prompt")
             if not _anti(style if _is_animated(style) else HOUSE_STYLE) in pr:
                 bad.append(f"clip {i}: the anti-photoreal negation is gone from the prompt")
-            if lock and lock not in pr:
+            if _clip_lock(shot, clips[i], lock) not in pr:
                 bad.append(f"clip {i}: the identity lock is gone from the prompt")
             if len(pr) > PROMPT_CHARS:
                 bad.append(f"clip {i}: {len(pr)} chars overflows the site's box ({PROMPT_CHARS})")
@@ -1594,6 +1635,23 @@ if __name__ == "__main__":
         _blk = _char_lock(_big)
         assert _blk and all(_blk in pr for pr in clip_prompts(_big)), \
             "the identity lock must survive the length trim — the shot gives, the lock does not"
+        # A FLASHBACK CLIP CANNOT CARRY THE STANDARD LOCK. The action line says "Flashback: young
+        # Dadaji" while the lock orders the SAME elderly face in the SAME clothes — two opposite
+        # orders in one prompt, and the generator obeys whichever it likes (dadaji-ki-yadein:
+        # the young-clip came back old, or the old clips came back young).
+        _fb = dict(_shot, clips=[dict(_shot["clips"][0], prompt="Flashback: a young man runs."),
+                                 _shot["clips"][1], _shot["clips"][2]])
+        _fp = clip_prompts(_fb)
+        _std, _fl = _clip_lock(_fb, _fb["clips"][1]), _clip_lock(_fb, _fb["clips"][0])
+        assert _fl != _std and _fl in _fp[0] and _std not in _fp[0], \
+            "a clip that declares a flashback must get the younger lock, not the standard one"
+        assert _std in _fp[1] and _std in _fp[2], \
+            "the jump is per-clip: a plain clip keeps the standard lock"
+        assert "YOUNGER" in _fl and "same face structure" in _fl, \
+            "the flashback lock drops age, never identity"
+        assert declares_flashback("Back to present day.") is False, \
+            "'back to present' is the RETURN from the jump — marking it moves the exclusion " \
+            "onto the wrong clip"
         # …and so must the medium requirement. When the guarantees alone nearly fill the box the
         # old trim dropped the lead WHOLE — MEDIUM_REQUIREMENT, the rule that the frame is 3-D at
         # all, went with it and the clip was free to render photoreal. The lead has a floor now.

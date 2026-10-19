@@ -319,13 +319,18 @@ def review_frame(png: bytes) -> list:
     return _clean_defects(out)
 
 
-def compare_character(png: bytes):
+def compare_character(png: bytes, allow_age_change=False):
     """Review a CONTACT SHEET (one panel per scene) of the film's recurring character and say
     whether it is the same person throughout. Returns {'consistent': bool, 'detail': str}, or
     None if the gateway was unavailable — so the gate can say 'not reviewed' instead of passing.
 
     The sheet is ONE image on purpose: the gateway takes a single image per call, and a montage
-    is exactly the question 'same person in every panel?', which no single frame can answer."""
+    is exactly the question 'same person in every panel?', which no single frame can answer.
+
+    `allow_age_change` is for a sheet the caller KNOWS mixes two points in the story's timeline (a
+    declared flashback it could not keep out). There the older/younger pair IS the story. It
+    defaults to False and stays off for a single-period sheet, where a change of age is still
+    evidence of a different person."""
     prompt = (
         "This image is a contact sheet: several panels, each a frame from a DIFFERENT scene of "
         "the same short film. The film has one recurring main character. Decide whether that "
@@ -340,6 +345,13 @@ def compare_character(png: bytes):
         'differs, or an empty string when they are the same"}. `detail` must describe what you '
         "SEE (e.g. \"the beard is gone by the third panel\") — never restate these instructions."
     )
+    if allow_age_change:
+        prompt += (
+            "\nIMPORTANT: this sheet may mix two points in the timeline, because the film has a "
+            "flashback. The same character may therefore appear YOUNGER in some panels, and that "
+            "is the story working — NOT an inconsistency. Judge identity by the face itself "
+            "(shape, features, hair, skin tone) and reply same=true when age is the only thing "
+            "that differs.")
     try:
         d = _json_from(_ask(png, prompt, max_tokens=600))
     except Exception:
@@ -506,9 +518,16 @@ _STYLE_PROMPT = (
     "technique and the same level of realism/detail, or is one clearly more photoreal, or more "
     "cartoonish, than the other? Ask this only when a person is visible in BOTH frames — a "
     "still-life and a face have no common style to compare, and answering anyway turns the room "
-    "into a false 'style drift'. (2) person: is the human in both frames the same individual — "
-    "same face shape, eyes, age, features? Clothing, lighting and pose may legitimately differ, "
-    "and a film may be 3-D animation: never report 'this is animation' as a difference. "
+    "into a false 'style drift'. Anything INSIDE the scene — a family photograph on a wall, a "
+    "poster, a painting, a picture on a screen — is part of the scene, so what it depicts is "
+    "NEVER a difference in technique: never report 'one includes a photograph' as a difference. "
+    "(2) person: the film has ONE recurring main character, and other people (children, "
+    "passers-by) may appear too. Is the MAIN character the same individual in both frames — same "
+    "face shape, eyes, age, features? Clothing, lighting and pose may legitimately differ, and a "
+    "film may be 3-D animation: never report 'this is animation' as a difference. When a frame "
+    "clearly shows a DIFFERENT member of the cast (a child where the other frame shows the "
+    "adult) rather than the main character drawn differently, that is casting, not drift — leave "
+    "same_person null rather than false. "
     'Reply ONLY JSON: {"people_visible": [true|false, true|false], "same_style": true|false, '
     '"style_detail": "short phrase", "same_person": true|false|null, '
     '"person_detail": "short phrase"}. If either frame shows no person, same_person MUST be null '

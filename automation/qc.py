@@ -488,6 +488,44 @@ def _main_face_sheet(frames):
     return buf.getvalue()
 
 
+def _plan_clips(reel):
+    """The PLAN's own text per clip index, from shotlist.json — {} when the folder has no plan (a
+    hand-built or swept reel), so every caller reads it as 'nothing declared'."""
+    try:
+        with open(os.path.join(reel.dir, "shotlist.json"), encoding="utf-8") as f:
+            clips = json.load(f).get("clips") or []
+    except Exception:  # noqa: BLE001 — no plan is not an error, it just declares nothing
+        return {}
+    out = {}
+    for c in clips:
+        try:
+            out[int(c["idx"])] = " ".join(str(c.get(k) or "") for k in
+                                          ("prompt", "dialogue", "visual", "note"))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _time_jump_clips(reel):
+    """Clip indices the PLAN declares as a flashback / a different time.
+
+    The character check asks 'the same person?' and its face sheet asks for 'same AGE'. Across a
+    declared jump the same person is SUPPOSED to look younger, so that comparison is a question
+    the story has already answered. dadaji-ki-yadein (2026-10-19) is the reel that proved the
+    cost: its brief mandates 'Flashback: Young Dadaji ...', the panel review read the mandated age
+    change as a defect, the clip-vs-clip scan agreed (in a flashback frame the nearest face is not
+    the present-day one), and the gate queued 4 of the 5 clips for re-shoot — credits spent
+    erasing the reel's own reveal.
+
+    Words, not a schema field, because the plan the writer already produces says it in words
+    ('Flashback: ...', 'Back to present: ...'). The list itself lives in agents.FLASHBACK_WORDS,
+    beside the prompt builder that must agree with it — a clip the generator is told to render
+    young must be the same clip the gate stops asking an age question about. A DELIBERATE
+    ceiling: a jump the plan never names stays invisible here, and the eye pass catches that."""
+    import agents
+    return {i for i, txt in _plan_clips(reel).items() if agents.declares_flashback(txt)}
+
+
 def check_character_consistency(reel):
     """The owner asked for 'complete character consistency' across scenes. The clip PROMPTS carry
     a character lock, but a lock in a prompt is not evidence about the RENDER — a face can drift
@@ -513,10 +551,53 @@ def check_character_consistency(reel):
     if len(frames) < 2:
         return []                                   # one panel cannot disagree with itself
     import vision
-    sheet = _main_face_sheet(frames)
-    res = vision.compare_character(sheet) if sheet is not None else None
+    paths = _clip_paths(reel)
+    idxs = [_idx_of(p) for p in paths[:len(frames)]]
+    jump = {i for i in idxs if i in _time_jump_clips(reel)}
+    jump_pos = {p for p, i in enumerate(idxs) if i in jump}
+    present = [f for p, f in enumerate(frames) if p not in jump_pos]
+    flash = [f for p, f in enumerate(frames) if p in jump_pos]
+    mixed = bool(jump_pos) and len(present) >= 2
+    sheet = _main_face_sheet(present if mixed else frames)
+    # The age allowance is sent ONLY when the sheet really does mix two time periods (a jump that
+    # could not be excluded); on a sheet of one period a change of age is still evidence of a
+    # different person. It is a separate call, not a keyword default, so a caller that stubs the
+    # function with one argument keeps working.
+    if sheet is None:
+        res = None
+    elif jump_pos and not mixed:
+        res = vision.compare_character(sheet, allow_age_change=True)
+    else:
+        res = vision.compare_character(sheet)
+    fres = vision.compare_character(_main_face_sheet(flash)) if len(flash) >= 2 else None
     scan = vision.style_scan_cached(frames)
-    pairs_drift = [i for i, same in (scan or {}).get("people", {}).items() if not same]
+    pairs_drift = [i for i, same in (scan or {}).get("people", {}).items()
+                   if not same and i not in jump_pos]
+    if 0 in jump_pos:
+        # The pairwise scan compares every clip to clip 0. With clip 0 itself the jump, the whole
+        # comparison is anchored in the wrong time period, so it cannot testify about identity —
+        # its LOOK answer is still used, its person answer is not.
+        pairs_drift = []
+
+    def notes():
+        """What a declared jump owes a human. Never empty when there is a jump: a comparison that
+        was deliberately skipped has to SAY so, or silence reads as a pass and the reveal ships
+        unlooked-at."""
+        out = []
+        if fres is not None and not fres["consistent"]:
+            out.append(Unreviewed(
+                "the flashback's own clips do not show the same person ("
+                f"{fres['detail'] or 'the panels differ'}). Inside one flashback the age is "
+                "constant, so this IS a fair comparison — but with a single view it asks for eyes "
+                f"rather than a re-shoot: clip(s) {sorted(jump)}"))
+        if jump_pos:
+            out.append(Unreviewed(
+                f"flashback: clip(s) {sorted(jump)} are declared as a different time, so they "
+                "were left OUT of the 'same person, same age' comparison — the story asks for "
+                "that character to look younger there. Confirm by eye that the younger character "
+                "still reads as the same person, and that the return to the present is clear"))
+        return out
+
     scan_ok = scan is not None
     if res is None or not scan_ok:
         # One voice down is neither a pass nor a defect — it is a check that could not be run
@@ -532,25 +613,26 @@ def check_character_consistency(reel):
             f"character consistency could NOT be reviewed — {missing} could not run, so the two "
             f"views cannot be cross-checked; the voice that did run reported "
             f"{'a drift (' + found + ')' if drift else 'no drift'}. Look at the frames and confirm "
-            f"the same face and hair appear in every scene")]
+            f"the same face and hair appear in every scene")] + notes()
     if res is not None and not res["consistent"] and pairs_drift:
-        idxs = [i for i in (_idx_of(_clip_paths(reel)[i]) for i in pairs_drift) if i is not None]
+        bad = [i for i in (_idx_of(paths[i]) for i in pairs_drift) if i is not None]
         return [Reject(
             "the recurring character changes between scenes: "
             f"{res['detail'] or scan.get('person_detail') or 'the panels do not show the same person'}",
-            clips=idxs,
+            clips=bad,
             reason=f"the character is not the same person as in the rest of the film "
                    f"({res['detail'] or scan.get('person_detail')}): hold the SAME face shape, "
                    f"age, hair and features as the first clip, and no jewellery or make-up the "
-                   f"character does not wear there")]
+                   f"character does not wear there")] + notes()
     if (res is not None and not res["consistent"]) or pairs_drift:
         who = "the panel review" if (res is not None and not res["consistent"]) else \
               "the clip-against-clip scan"
         return [Unreviewed(
             f"{who} says the recurring character changes between scenes and the other view does "
             "not — the two do not agree, so this is not a conviction. Look at the frames and "
-            f"settle it ({res['detail'] if res is not None and not res['consistent'] else scan.get('person_detail', '')})")]
-    return []
+            f"settle it ({res['detail'] if res is not None and not res['consistent'] else scan.get('person_detail', '')})")] \
+            + notes()
+    return notes()
 
 
 def check_pacing(reel):
@@ -869,7 +951,11 @@ LESSONS = [
     dict(slug="character-consistency", check_id="character-consistency", severity="block",
          title="The recurring character is the same person in every scene (checked in the FRAMES)",
          why="the shot prompts carry a character lock, but a lock in a prompt is not evidence "
-             "about the render — a face can drift while every prompt names the same person"),
+             "about the render — a face can drift while every prompt names the same person. A "
+             "clip the PLAN declares as a flashback is left out of the age comparison (there the "
+             "younger face IS the story) and reported to a human instead — dadaji-ki-yadein, "
+             "2026-10-19, blocked on its own mandated 'Flashback: Young Dadaji' beat and queued "
+             "4 of its 5 clips for re-shoot"),
     dict(slug="pacing", check_id="pacing", severity="publish-gate",
          title="The reel's rhythm is usable — no shot too brief to register, no unfeedable length",
          why="a truncated generation or a 3-minute reel is broken whatever its content; mixed "
@@ -1393,6 +1479,48 @@ if __name__ == "__main__":
             assert any("bindi only on the right" in g for g in v7e["gate"]), \
                 f"the drift the surviving voice DID find must reach the person: {v7e['gate']}"
             vision.compare_character = lambda png: {"consistent": True, "detail": ""}
+
+            # A DECLARED FLASHBACK is not a character drift. dadaji-ki-yadein (2026-10-19) blocked
+            # on its own mandated beat — "Flashback: Young Dadaji ..." — because the face sheet
+            # asks for 'same AGE' and the clip-vs-clip scan reads a flashback frame's nearest face
+            # as a different person; the gate then queued 4 of its 5 clips for RE-SHOOT, which
+            # would have spent the credits erasing the reel's reveal. The plan says which shot is
+            # the jump, so the age question is simply not asked across it — and the skip is
+            # REPORTED to a human, never silent.
+            sp = os.path.join(d7, "shotlist.json")
+            _plan = lambda clips: json.dump({"clips": clips}, open(sp, "w"))     # noqa: E731
+            _plan([{"idx": 0, "prompt": "Two kids giggle in the courtyard"},
+                   {"idx": 1, "prompt": "The child asks Dadaji why he walks so slowly"},
+                   {"idx": 2, "prompt": "Flashback: young Dadaji dashes through a flood"}])
+            assert _time_jump_clips(Reel(d7)) == {2}, "the plan's own words must mark the jump"
+            assert _time_jump_clips(Reel(d)) == set(), "a folder with no plan declares nothing"
+            _plan([{"idx": 4, "prompt": "Back to present: the kids lean in, eyes wide"}])
+            assert _time_jump_clips(Reel(d7)) == set(), \
+                "the RETURN to the present is not the jump — marking it would exclude the wrong clip"
+            _plan([{"idx": 0, "prompt": "Two kids giggle"}, {"idx": 1, "prompt": "The child asks"},
+                   {"idx": 2, "prompt": "Flashback: young Dadaji runs through the flood"}])
+            # both voices agree on a drift that lives INSIDE the declared jump -> not a conviction
+            vision.compare_character = lambda png, allow_age_change=False: {
+                "consistent": False, "detail": "the character's age changes across panels"}
+            _scan({"flagged": [], "whole_reel": False, "detail": "",
+                   "people": {2: False}, "person_detail": "this man is younger"})
+            v7j = run(d7, st)
+            assert not v7j["block"], \
+                f"the brief's own flashback must not block the reel: {v7j['block']}"
+            assert any("flashback" in g and "[2]" in g for g in v7j["gate"]), \
+                f"the skipped comparison must be REPORTED, never silent: {v7j['gate']}"
+            # ...and the check is NOT weakened: a drift on a PRESENT-day clip still blocks, and the
+            # flashback clip stays out of the re-shoot list
+            _scan({"flagged": [], "whole_reel": False, "detail": "",
+                   "people": {1: False, 2: False}, "person_detail": "a different child"})
+            v7k = run(d7, st)
+            assert any("character changes between scenes" in b for b in v7k["block"]), v7k["block"]
+            assert v7k["reject"] and v7k["reject"][0]["clips"] == [1], \
+                f"only the present-day clip may be re-shot: {v7k['reject']}"
+            os.remove(sp)
+            vision.compare_character = lambda png: {"consistent": True, "detail": ""}
+            _scan({"flagged": [], "whole_reel": False, "detail": "", "people": {},
+                   "person_detail": ""})
 
             # REJECT — a finding the MACHINE can fix. The pairwise scan names the odd clip, and
             # the verdict carries the index + the reason so runner._regenerate can re-shoot it.

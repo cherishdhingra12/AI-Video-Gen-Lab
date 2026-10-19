@@ -28,6 +28,7 @@ manual fallback and the explanation of what the automation is doing.
 | bamboo-flute-music__bamboooye-archive-org__archive-org.mp3 | Bamboo Flute Music / BambooOye (archive.org) | [archive.org](https://archive.org/details/bamboo-flute-music-bamboo-oye) | CC0 1.0 Public Domain — no attribution required | soft bamboo flute; warm/neutral bed | not used yet |
 | tabla-solo-folk-matsya-tabla-by-joydeep__joydeep-archive-org__archive-org.mp3 | Tabla Solo (folk/matsya tabla, by joydeep) / joydeep (archive.org) | [archive.org](https://archive.org/details/10-oct-9.05-pm-pitch-2.30-tempo-121) | CC0 1.0 Public Domain — no attribution required | energetic tabla solo, bright/playful percussion; festival energy | not used yet |
 | folk-music-india-dholak__indian-sounds-classical-music__youtube.mp3 | Folk Music India Dholak / Indian Sounds & Classical Music | [youtube](https://www.youtube.com/watch?v=298UX9HxB4s) | UNVERIFIED — owner waived licence check (2026-10-06) | playful Indian folk dholak upbeat happy; measured fit 0.98 | not used yet |
+| bansuri-violin-fusion-soul-soothing__camvard-music__youtube.mp3 | Bansuri & Violin Fusion (soul soothing) / Camvard Music | [youtube](https://www.youtube.com/watch?v=9iFXVsnM5Vw) | UNVERIFIED — owner waived licence check (2026-10-06) | gentle nostalgic indian flute + violin; measured 117.5 bpm, hf -22.7 dB | dadaji-ki-yadein |
 
 ⚠️ **`wistful-warm-bed`**: this track was grabbed in an earlier session with no source/license
 recorded, and no metadata survives in the file. intezaar + ek_ghanta both use it. Its source

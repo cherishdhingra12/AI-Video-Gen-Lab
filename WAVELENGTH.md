@@ -149,6 +149,22 @@ in this order: the shot shortens first, then the lead goes (the LOOK line restat
 then a hard cut. **The identity lock is never trimmed off the end of a prompt** — the last clip of
 a long reel is exactly the clip a face drifts in.
 
+### A flashback is not a drift
+
+When the story itself jumps in time — a memory, a flood the grandfather once ran through — the
+same character is *supposed* to look younger. A machine that asks "is this the same person, same
+age?" across that jump is asking a question the story has already answered, and if it acts on the
+answer it re-shoots the reel's reveal.
+
+So the PLAN's own words decide it: a clip whose prompt declares a flashback / an earlier time
+(`qc._time_jump_clips`) is left **out of the age comparison**, and the present-day clips are
+judged against each other instead. Nothing is skipped silently — the exclusion is reported as an
+item for a human, and the flashback's own clips are compared to *each other*, where the age is
+constant and "same person?" is a fair question after all. A jump the plan forgets to name is not
+caught here; the by-eye pass is what catches that one. dadaji-ki-yadein (2026-10-19) is the reel
+that forced this: it blocked on its own mandated *"Flashback: Young Dadaji …"* beat and queued
+four of its five clips for re-shoot.
+
 ### The shape a site reads
 
 The words of a clip prompt are the same everywhere — one reel is one film. What `agents.clip_prompts`
