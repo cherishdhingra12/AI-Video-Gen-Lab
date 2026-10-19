@@ -44,9 +44,13 @@ The critic's second read leaves 7 findings, and they split in two:
   "it is a listicle" and "the architecture repeats" are findings about the BRIEF, not the writing.
   No writer can make a brief that says *four happy items, end on her grin* into a story with a turn
   unless it is allowed to change the items.
-- **Two real ones.** Beat 5 packs 20 words into 7 seconds (too fast to say), and the twist makes the
-  mandated moral — "सपनों की कोई उम्र नहीं होती" — about *Vikram's* dreams, not hers, so the story
-  does not quite earn the line the brief asked for.
+- **Two real ones — FIXED 2026-10-19 (owner approved the fix).** Beat 5 packed 20 words into 7
+  seconds, and the twist made the mandated moral — "सपनों की कोई उम्र नहीं होती" — about *Vikram's*
+  dreams, not hers. The fix keeps the twist AND earns the moral: the notebook's last page is a
+  flight Vikram wrote **for her** (planted silently in beat 3 — she glances at the last page and
+  smiles), beat 5's reveal is now "उड़ान उसने मेरे लिए लिखी थी… आज मेरा नंबर आ गया" (16 words in
+  7s, same rhythm the critic accepted in beat 2), and the visual prop is a text-free plane sketch
+  on the last page (no baked-text risk). The logline was updated to match.
 
 ## One rule this proof forced
 

@@ -103,6 +103,11 @@ mouth. The card then states it plainly.
 - **A moral the brief dictates is not yours to replace.** If the story cannot earn it, change the
   STORY until it does (§1, "The IDEA is the client") — that is the work, and it is the whole
   difference between a moral that lands and one that is read out.
+- **If the brief's own moral-card line contains a question, keep it.** (Owner ruling, 2026-10-19,
+  on the दादी bucket-list brief.) The two bullets above still describe how a moral is written when
+  it is ours to write; when the client mandated the words — question included — the critic may
+  note the shape once but must not treat it as a rewrite target. Fighting the brief's own line is
+  correct criticism and useless to the reel.
 
 ## 6. Never the same reel twice
 
