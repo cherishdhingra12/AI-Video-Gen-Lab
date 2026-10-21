@@ -326,6 +326,21 @@ def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
             # from. The pair is dry in the ledger, so no run picks it again before `back`.
             st.set_status(job["id"], "queued", error=f"credits: {w.detail} — dry until {when}"[:300])
             return "dry"
+        if w.kind == "login":
+            # A SIGNED-OUT SESSION IS A FACT ABOUT THE ACCOUNT, not about this clip. The same
+            # reasoning as the credits wall above: the attempt was refused before it cost
+            # anything, so it must not spend the clip's retry budget. It did (2026-10-22): three
+            # Google sessions expired at once, and each wall took one of clip 3's three retries —
+            # so two more would have marked the clip 'failed' and filed a crisis over a session
+            # that a person re-signs in under a minute. The retry is given BACK, the pair is
+            # cooled, and the reel waits for the sign-in.
+            cd = br.hit_wall(site, account, w.kind, step=job["status"], detail=w.detail)
+            st.set_status(job["id"], "queued",
+                          error=f"login: {w.detail} — the session is signed out; "
+                                f"a person must sign it back in (cool {cd:.0f}s)"[:300])
+            print(f"  wall on {site}/{account}: login -> cool {cd:.0f}s — the clip's retry is NOT "
+                  f"spent (a signed-out session is the account's, not the clip's)")
+            return "walled"
         cd = br.hit_wall(site, account, w.kind, step=job["status"], detail=w.detail)
         n = st.bump_retry(job["id"])
         # step back: requeue unless we've exhausted retries on this clip
@@ -729,6 +744,29 @@ if __name__ == "__main__":
             "a funded second account must be picked on the reel's own site"
         print("OK: a site that says it is out of credits is marked dry with its own refill time")
         print("OK: a second account on the same site un-blocks the reel without changing its look")
+
+        # A SIGNED-OUT SESSION IS THE ACCOUNT'S FACT, NOT THE CLIP'S. Three Google sessions
+        # expired at once on 2026-10-22 and each wall took one of clip 3's three retries — so
+        # two more would have marked the clip 'failed' and filed a crisis over a session a
+        # person re-signs in under a minute. The login wall must leave the retry budget alone.
+        lst = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+        lbr = Brain(lst)
+        lst.set_credits("googlevids", "g1", remaining=20)
+        lwall = types.SimpleNamespace(name="googlevids", credit_cost=1)
+        def lwall_submit(s, prompt):
+            raise Wall("login", "Choose an account")
+        lwall.submit, lwall.poll = lwall_submit, lambda s: "done"
+        lwall.download = lambda s, dest: dest
+        runner._adapter = lambda site: lwall if site == "googlevids" else fake
+        lst.add_job("loginreel", 0, "a clip on a site whose session died")
+        _lj = lst.db.execute("SELECT * FROM jobs WHERE project='loginreel' AND idx=0").fetchone()
+        assert runner.process_job(lst, lbr, _lj, headless=True) == "walled"
+        _lj = lst.db.execute("SELECT * FROM jobs WHERE id=?", (_lj["id"],)).fetchone()
+        assert _lj["retries"] == 0 and _lj["status"] == "queued", \
+            f"a signed-out session must not spend the clip's retries: {dict(_lj)}"
+        assert "signed out" in _lj["last_error"], \
+            f"the report must say what a person has to do: {_lj['last_error']}"
+        print("OK: a signed-out session does not spend the clip's retries")
 
         # ONE REEL, ONE SOURCE. "selftest" now has a done clip on kling, so kling is the reel's
         # lock. Put kling in cooldown and stand up a healthy other site: the next clip must WAIT
