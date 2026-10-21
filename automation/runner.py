@@ -1164,6 +1164,35 @@ if __name__ == "__main__":
         shutil.rmtree(_probe, ignore_errors=True)
         print("OK: an imported account remembers its Chrome profile, so a second account cannot "
               "silently inherit the first one's session")
+
+        # A REFRESH THAT LANDS ON A LOGIN WALL MUST NOT DESTROY THE WORKING SESSION. The
+        # persistent profile IS the account's session, so writing a signed-out cookie set over a
+        # working one loses the account (2026-10-22: a1 was signed in at 22:52, the 00:02 refresh
+        # injected signed-out cookies, and the reel lost the account that was working). The import
+        # now keeps the old jar and puts it back when the new one lands on a login wall.
+        import import_login
+        _jar = [{"name": "n", "value": "v", "domain": ".google.com", "path": "/"}]
+        class _FakeCtx:
+            def __init__(self): self.jar = []
+            def cookies(self): return list(self.jar)
+            def add_cookies(self, cs): self.jar.extend(cs)
+            def clear_cookies(self): self.jar = []
+        _ctx = _FakeCtx()
+        _ctx.jar = list(_jar)
+        # the refresh injects a signed-out set, and the landing page says 'login'
+        _ctx.add_cookies([{"name": "broken", "value": "x", "domain": ".google.com", "path": "/"}])
+        assert import_login._restore_if_worse(_ctx, _jar, "login") == "restored", \
+            "a login wall must fall back to the previous session"
+        assert [c["name"] for c in _ctx.cookies()] == ["n"], \
+            "the restore must put the PREVIOUS session back, not the broken one"
+        # a refresh that WORKS is left alone
+        _ctx.jar = []
+        _ctx.add_cookies([{"name": "fresh", "value": "y", "domain": ".google.com", "path": "/"}])
+        assert import_login._restore_if_worse(_ctx, _jar, "done") == "done"
+        assert [c["name"] for c in _ctx.cookies()] == ["fresh"], \
+            "a working refresh must not be rolled back"
+        print("OK: a refresh that lands on a login wall keeps the previous session")
+
         print("OK: hermetic self-check (temp dirs) + craft-gate verdict persisted")
         print("OK: observed balance updates the count before spend; a failed read never blocks a job")
     else:

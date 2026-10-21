@@ -107,6 +107,20 @@ def _to_pw(cookies) -> list:
     return out
 
 
+def _restore_if_worse(ctx, keep: list, state: str) -> str:
+    """Put the PREVIOUS session back when the new cookies land on a login wall.
+
+    The persistent profile IS the account's session, so a refresh that injects a signed-out
+    cookie set over a working one DESTROYS the account (2026-10-22: a1 was signed in at 22:52,
+    the 00:02 refresh injected signed-out cookies, and the reel lost the account that worked).
+    Returns the state to report: 'login' only if there was nothing better to fall back on."""
+    if state != "login" or not keep:
+        return state
+    ctx.clear_cookies()
+    ctx.add_cookies(keep)
+    return "restored"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("site")
@@ -159,6 +173,15 @@ def main():
 
     # inject into our persistent profile, then verify we land logged-in
     with Session(args.site, args.account, headless=True) as s:
+        # THE SESSION WE ARE ABOUT TO REPLACE. A refresh that lands on a login wall must not
+        # LEAVE the broken cookies behind: the persistent profile is the account's session, so
+        # writing a signed-out set over a working one DESTROYS it (2026-10-22: a1 was signed in
+        # at 22:52, the 00:02 refresh injected signed-out cookies, and the reel lost the account
+        # that was working). So the old cookie jar is kept, and put back if the new one is worse.
+        try:
+            keep = s._ctx.cookies()
+        except Exception:
+            keep = []
         s._ctx.add_cookies(pw_cookies)
         if prof:
             # Remember WHICH Chrome profile this account's session came from. The runner re-imports
@@ -174,6 +197,13 @@ def main():
         shot = os.path.join(_DIR, f"import_{args.site}_{args.account}.png")
         with open(shot, "wb") as f:
             f.write(s.screenshot())
+        if state == "login" and keep:
+            # The new cookies do not sign us in. Put the old jar back rather than leaving a
+            # signed-out session where a working one used to be, and say so plainly.
+            _restore_if_worse(s._ctx, keep, state)
+            print(f"  the new cookies land on a LOGIN wall — the PREVIOUS session was kept "
+                  f"({len(keep)} cookies restored)")
+            state = read_state(s.screenshot())["state"]
     print(f"  injected {len(pw_cookies)} cookies; landing page state={state}; shot={shot}")
     if state == "login":
         print("  ⚠ still shows login — the site may bind sessions to a device/UA. "
