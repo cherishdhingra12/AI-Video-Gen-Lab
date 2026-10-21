@@ -900,6 +900,20 @@ HOUSE_STYLE = ("soft stylized 3-D animation in a high-end animated-feature look:
 MEDIUM_REQUIREMENT = ("REQUIRED OUTPUT: 3-D ANIMATED VIDEO — a stylized animated-feature look in "
                       "every frame, never photoreal, never live action, never real footage, never 2-D.")
 
+# A DISASTER shot leads with the CARTOON form instead. Veo photorealises flood, rain and storm
+# whatever the prompt says — the generic 3-D lead did not hold the dhimi-chal flashback, which
+# came back live action TWICE (2026-10-22, once even after a re-shoot with the rejection folded
+# into the prompt). The lead is the one place the site reads FIRST, so for these shots it has to
+# name the cartoon form outright.
+CARTOON_LEAD = ("REQUIRED OUTPUT: PIXAR-STYLE CARTOON 3-D — chunky rounded cartoon "
+                "proportions, stylized animated-feature character, a frame from an "
+                "animated movie, NOT photoreal, NOT live action, NOT real footage. "
+                "STYLE for every frame: ")
+
+_DISASTER = re.compile(
+    r"\b(?:flood|inundat|storm|cyclone|typhoon|hurricane|rain(?:ing)?|river|torrent|"
+    r"blaze|fire|earthquake|rubble|wav(?:es|es)?|surge)\b", re.I)
+
 # The sites that run the SAME engine — Veo 3.1 — and are the waterfall's two primaries
 # (WAVELENGTH §5: Vids → Flow → the rest). They share one prompt pattern, so they share one
 # shape below; a reel that fails over between them is not re-written.
@@ -983,6 +997,12 @@ def clip_prompts(shot: dict, site: str = "") -> list:
     _OBJECT_WORDS = re.compile(
         r"\b(?:phone|mobile|smartphone|hand|watch|clock|screen|keyboard|book|cup|"
         r"tablet|laptop|wallet|remote)\b", re.I)
+    # A FLASHBACK gets the same treatment, for a different reason. Veo photorealises DISASTER —
+    # flood, rain, a man running for his life — whatever the prompt says, and the same prompt
+    # renders the calm courtyard clips in clean 3-D (dadaji-ki-dhimi-chal, 2026-10-22: the
+    # flashback clip came back live action TWICE, once after the re-shoot, and the generic
+    # "REQUIRED OUTPUT: 3-D ANIMATED VIDEO" lead did not hold it). The lead is the one place
+    # the site reads FIRST, so it has to name the cartoon form outright for these shots.
 
     # The medium is the FIRST thing a site reads, so the requirement to render 3-D animation is
     # stated before anything else — catching the medium at generation time, not after.
@@ -994,6 +1014,8 @@ def clip_prompts(shot: dict, site: str = "") -> list:
         _p = (c.get("prompt") or "")
         if _CLOSEUP_OF.search(_p) and _OBJECT_WORDS.search(_p):
             _per_clip_lead = _PIXAR_LEAD + style.split(".")[0].strip() + "."
+        elif _DISASTER.search(_p):
+            _per_clip_lead = CARTOON_LEAD + style.split(".")[0].strip() + "."
         else:
             _per_clip_lead = lead
         says = (c.get("dialogue") or "").strip()
@@ -1064,6 +1086,10 @@ def validate_plan(shot: dict, prompts: list = None) -> dict:
         for i, pr in enumerate(prompts):
             if not pr.startswith(MEDIUM_REQUIREMENT[:40]) and not pr.startswith("REQUIRED OUTPUT: PIXAR"):
                 bad.append(f"clip {i}: the 3-D medium requirement is gone from the prompt")
+            if _DISASTER.search(clips[i].get("prompt") or "") and \
+                    not pr.startswith("REQUIRED OUTPUT: PIXAR-STYLE CARTOON 3-D"):
+                bad.append(f"clip {i}: a disaster/flashback shot must lead with the CARTOON "
+                           "lead — Veo photorealises flood and rain whatever the prompt says")
             if NO_TEXT not in pr:
                 bad.append(f"clip {i}: the no-text rule is gone from the prompt")
             if not _anti(style if _is_animated(style) else HOUSE_STYLE) in pr:
@@ -1489,7 +1515,13 @@ def _prompt_selfcheck(shot):
     prompts = clip_prompts(shot)
     assert len(prompts) == len(shot["clips"]), "clip_prompts count mismatch"
     for i, pr in enumerate(prompts):
-        assert pr.startswith(MEDIUM_REQUIREMENT), \
+        # A DISASTER shot leads with the CARTOON form of the same requirement — Veo photorealises
+        # flood and rain under the generic lead (dhimi-chal, 2026-10-22, twice). Both leads carry
+        # the 3-D requirement; only the wording differs, and the shot decides which.
+        _disaster = _DISASTER.search(shot["clips"][i].get("prompt") or "")
+        _lead_ok = (pr.startswith(MEDIUM_REQUIREMENT) if not _disaster
+                    else pr.startswith(CARTOON_LEAD))
+        assert _lead_ok, \
             f"clip {i}: the 3-D requirement must LEAD every prompt — the medium is caught at " \
             "generation time, before a photoreal frame is ever rendered"
         assert "style for every frame" in pr.lower(), \
@@ -1596,6 +1628,22 @@ if __name__ == "__main__":
         assert "notebook" in _tp.lower() and "pushes in" in _tp.lower(), \
             "only the text-asking sentence is dropped — the rest of the shot must survive"
         assert NO_TEXT in _tp, "the code-level no-text rule must still be attached"
+        # A DISASTER shot leads with the CARTOON lead. Veo photorealises flood/rain/storm
+        # whatever the prompt says — the generic 3-D lead did not hold the dhimi-chal flashback
+        # (it came back live action twice, including on a re-shoot with the rejection folded in).
+        _flood = dict(_shot, clips=[{"idx": 0,
+                                     "prompt": ("Flashback: a young man runs through a "
+                                                "flood-filled village path, water up to his knees, "
+                                                "heavy rain falling."),
+                                     "dialogue": ""}])
+        _fp = clip_prompts(_flood)[0]
+        assert _fp.startswith("REQUIRED OUTPUT: PIXAR-STYLE CARTOON 3-D"), \
+            f"a flood/flashback shot must lead with the CARTOON lead, got: {_fp[:60]!r}"
+        assert "NOT photoreal" in _fp, "the cartoon lead must negate photoreal outright"
+        _calm = clip_prompts(dict(_shot, clips=[{"idx": 0, "prompt": "He smiles in the courtyard.",
+                                                   "dialogue": ""}]))[0]
+        assert _calm.startswith(MEDIUM_REQUIREMENT), \
+            "a calm shot must keep the ordinary 3-D lead — the cartoon lead is not the default"
         # The spoken line rides along as SOUND, never as a quoted string a renderer can typeset.
         # dadi-ki-dhansuchi came back with its dialogue burned into all four clips as garbled
         # Devanagari subtitles — a quoted Hindi line beside "speaks this line" reads as a caption.

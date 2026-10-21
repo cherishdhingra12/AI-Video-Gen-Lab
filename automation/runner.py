@@ -1038,6 +1038,34 @@ if __name__ == "__main__":
         assert {c["slug"] for c in st.candidates()} >= {"missing-check-preflight-style-uniform"}, \
             "the cap must file the check that would have caught it, keyed by that check"
 
+        # A WHOLESALE PROMPT REPLACEMENT is a new hypothesis, not the same rejection again, so it
+        # must not spend the old budget. The cap exists to stop ONE feedback looping; when the
+        # code itself changed what the site is told (2026-10-22: the disaster-shot CARTOON lead,
+        # after two identical photoreal rejections), counting it against the old fix would cap a
+        # repair that has not been tried. An APPEND — the 'RE-SHOOT —' note — keeps the count.
+        _hyp = os.path.join(runner.PROJECTS_DIR, "hypthetest")
+        os.makedirs(_hyp, exist_ok=True)
+        _hid = st.add_job("hypthetest", 0, "the prompt that produced the defect")
+        st.set_status(_hid, "done", video_path=os.path.join(_tmp, "clips", "hypthetest", "clip_000.mp4"))
+        st.db.execute("UPDATE jobs SET requeues=? WHERE id=?", (runner.REQUEUE_CAP, _hid))
+        st.db.commit()
+        assert runner._regenerate(st, _hyp, [0], "the same rejection, same fix") == [], \
+            "an APPENDED note is the same hypothesis — it must still hit the cap"
+        _hrow = st.project_clips("hypthetest")[0]
+        assert _hrow["requeues"] == runner.REQUEUE_CAP, \
+            f"the same hypothesis must keep its count, got {_hrow['requeues']}"
+        st.set_status(_hid, "done")
+        st.db.execute("UPDATE jobs SET requeues=? WHERE id=?", (runner.REQUEUE_CAP, _hid))
+        st.db.commit()
+        _new = "REQUIRED OUTPUT: PIXAR-STYLE CARTOON 3-D — a different prompt entirely"
+        st.set_status(_hid, "done")
+        st.requeue("hypthetest", [0], prompt=_new)
+        _hrow2 = st.project_clips("hypthetest")[0]
+        assert _hrow2["requeues"] == runner.REQUEUE_CAP - 1, \
+            f"a wholesale prompt replacement must give the cap its budget back, got " \
+            f"{_hrow2['requeues']}"
+        assert _hrow2["prompt"] == _new, "the new prompt must be the one queued"
+
         # A CLIP OUT OF RETRIES is the other end of the same rule: its job goes to 'failed', and a
         # 'failed' job is a reel that can never assemble — while the reel is locked to ONE site, so
         # there is no other site to try. That is a person's, and it must not be just a row.

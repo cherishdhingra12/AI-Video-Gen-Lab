@@ -216,18 +216,34 @@ class State:
 
         `requeues` counts these and is NOT cleared here: retries budget a flaky SITE, requeues
         budget the GATE's patience. Without a counter that survives, "re-shoot the clip the gate
-        rejected" is a loop with no exit — the same clip coming back slightly different forever."""
+        rejected" is a loop with no exit — the same clip coming back slightly different forever.
+
+        ONE EXCEPTION, and it is the point of the counter: a prompt REPLACED WHOLESALE is a new
+        hypothesis, not the same rejection again. The counter exists to stop the SAME feedback
+        looping; when the code itself changed what the site is told (2026-10-22: the disaster-shot
+        CARTOON lead, after two identical photoreal rejections), spending the old budget on the
+        new fix would cap a repair that has not been tried. An APPEND (the 'RE-SHOOT —' note the
+        runner folds onto the old prompt) is the same hypothesis and keeps the count."""
         out = []
         for idx in idxs:
-            r = self.db.execute("SELECT id FROM jobs WHERE project=? AND idx=?",
+            r = self.db.execute("SELECT id, prompt FROM jobs WHERE project=? AND idx=?",
                                 (project, idx)).fetchone()
             if not r:
                 raise SystemExit(f"no job for {project}#{idx}")
+            same_hypothesis = True
+            if prompt:
+                old = r["prompt"] or ""
+                # An APPEND keeps the old prompt and adds to it (the runner's 'RE-SHOOT —' note),
+                # so the NEW text starts with the OLD — that is the same hypothesis, and the
+                # count goes UP. A REPLACEMENT (the new text does not begin with the old) is a
+                # new hypothesis, so the count goes back down.
+                same_hypothesis = not old or prompt.startswith(old[:40])
             self.db.execute(
-                "UPDATE jobs SET status='queued', retries=0, requeues=requeues+1, "
+                "UPDATE jobs SET status='queued', retries=0, requeues=MAX(0, requeues+?), "
                 "last_error=NULL, updated=?"
                 + (", prompt=? " if prompt else " ") + "WHERE id=?",
-                ((time.time(), prompt, r["id"]) if prompt else (time.time(), r["id"])))
+                ((1 if same_hypothesis else -1, time.time(), prompt, r["id"]) if prompt
+                else (1, time.time(), r["id"])))
             out.append(r["id"])
         self.db.commit()
         return out
