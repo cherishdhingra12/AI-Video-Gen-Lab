@@ -215,13 +215,19 @@ def _fallback(facts):
     is still complete and postable — a publish pack is not worth failing a reel over, and an
     outage must never read as a defect (qc's Unreviewed rule, one layer along)."""
     caps = facts.get("cards") or {}
-    hook = " ".join((caps.get("hook") or {}).get("lines") or [])
+    hook_lines = (caps.get("hook") or {}).get("lines") or []
+    hook = " ".join(hook_lines)
     moral = " ".join((caps.get("moral") or {}).get("lines") or [])
     cta = " ".join((caps.get("cta") or {}).get("lines") or [])
     addr = cta or facts.get("title", "")
+    # The GRID shows the card's FIRST line, so the caption must OPEN on that one line alone.
+    # Joining the whole hook into the opening line put a sentence in the grid that the reel
+    # never says. The rest of the hook follows as its own paragraph — still in the body.
+    first, rest = (hook_lines[0], " ".join(hook_lines[1:])) if hook_lines else ("", "")
+    caption = "\n\n".join(x for x in (first, rest, moral, addr) if x)
     return {"youtube_title": f"{hook} #Shorts".strip()[:90],
             "youtube_title_alt": f"{facts.get('title', '')} | Standard Sunrise Foundation",
-            "caption": f"{hook}\n\n{moral}\n\n{addr}".strip(),
+            "caption": caption.strip(),
             "youtube_description": f"{hook}\n\n{moral}\n\n{addr}".strip(),
             "tags": f"{facts.get('title', '')}, hindi emotional story, hindi reels, "
                     "old age care, ngo india, standard sunrise foundation",
@@ -262,7 +268,10 @@ def _sheet_text(project_dir, copy, facts):
         if bed.get("floor") is not None:
             score.append(f"the cut's own audio floor measures {bed['floor']} dB "
                          f"(the −46 floor gate is the failure line)")
-    hook = " ".join((cards.get("hook") or {}).get("lines") or [])
+    # The GRID shows the card's FIRST line, so the caption must open on that one line. Printing
+    # the whole hook joined here made the sheet disagree with the caption it ships with.
+    hook_lines = (cards.get("hook") or {}).get("lines") or []
+    hook = hook_lines[0] if hook_lines else ""
     return f"""# {facts['title']} — publishing sheet
 
 Deliverables in this folder: {', '.join('`%s`' % f for f in present)}.
@@ -481,6 +490,12 @@ def _selfcheck():
                      "## Keywords", "## Cover", "## Score", agents.BRAND_URL):
             assert want in text, f"the sheet is missing {want!r}"
         assert "अस्सी की उम्र में" in text, "the sheet must carry the reel's own hook line"
+        # the GRID block must show the card's FIRST line alone; the rest of the hook may appear
+        # in the caption body, so the check is scoped to that one block.
+        grid = text.split("**Instagram / Facebook first line**", 1)[1].split("##", 1)[0]
+        assert "मैंने ये बातें सीखीं" not in grid, \
+            "the sheet's IG/FB first-line block must show the card's FIRST line only — the " \
+            "caption opens on that one line, so a joined hook here would contradict it"
         assert "BED" not in text or "music_raw.mp3" in text, "the score line must name the bed"
         # a sheet the AGENT wrote is what normally ships: prove _sheet_text renders that too
         os.remove(os.path.join(pdir, "publishing.md"))
