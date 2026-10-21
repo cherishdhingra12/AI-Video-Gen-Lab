@@ -1358,11 +1358,19 @@ def publishing_copy(facts: dict) -> dict:
         "NGO. It is posted to YouTube Shorts, Instagram Reels and Facebook. You write ONLY the "
         "words it ships with. Output ONLY valid JSON, no prose."
     )
-    hook = " / ".join((facts.get("cards") or {}).get("hook", {}).get("lines") or [])
+    hook_lines = [l for l in ((facts.get("cards") or {}).get("hook", {}).get("lines") or [])
+                  if l.strip()]
+    # The grid shows the reel's FIRST line — so the caption must open on that one line, not on the
+    # whole card. A card split over two lines used to be joined with " / " here, and the model was
+    # asked to repeat a join that is not a line of the reel: it never did, and the sheet fell back
+    # to the reel's own words every time. The card is given as its lines; the check takes the first.
+    hook = hook_lines[0] if hook_lines else ""
     user = (
         f"REEL TITLE: {facts.get('title', '')}\n"
         f"LENGTH: {facts.get('seconds', 0):.0f} seconds, vertical 9:16\n"
-        f"THE REEL'S OWN OPENING CARD (verbatim): {hook}\n\n"
+        f"THE REEL'S OWN OPENING CARD (verbatim, one line per line):\n"
+        + "".join(f"  {i+1}. {l}\n" for i, l in enumerate(hook_lines))
+        + "\n"
         f"SCRIPT:\n{facts.get('script', '')}\n\n"
         f"CAPTION CARDS:\n{json.dumps(facts.get('cards') or {}, ensure_ascii=False)}\n\n"
         f"WHAT IT IS (from the shot plan):\n{facts.get('plan', '')}\n\n"
@@ -1371,8 +1379,9 @@ def publishing_copy(facts: dict) -> dict:
         "description are in Hindi (a Roman brand name or hashtag is fine inside Hindi text).\n"
         "- 'youtube_title' front-loads what someone would actually TYPE to find this; keep it "
         "under 90 characters.\n"
-        "- 'caption' MUST begin with the opening card's line VERBATIM, then a blank line, then "
-        "the body. The profile grid shows the first line, so it has to be the reel's own promise.\n"
+        "- 'caption' MUST begin with the opening card's FIRST line VERBATIM, then a blank line, "
+        "then the body. The profile grid shows the first line, so it has to be the reel's own "
+        "promise. Do not copy the line numbers or join the lines together.\n"
         "- The caption body: 2-4 short paragraphs or bullets drawn from the reel's actual lines, "
         "then the moral, then ONE question that invites a comment, then the foundation's address "
         f"{BRAND_URL} — spelled exactly like that, no other address, never invented or shortened.\n"
@@ -1514,9 +1523,17 @@ def _prompt_selfcheck(shot):
     tags = re.findall(r"\b([A-Z]{3,})\b", world)
     lock = _char_lock(shot)
     assert lock, "a reel with a cast must get an identity lock"
-    assert all(lock in pr for pr in prompts), \
-        "the identity lock must sit in EVERY clip prompt — the first scene and the last are " \
-        "the same person only if every clip is told the same thing"
+    # A FLASHBACK clip carries the reel's lock in its flashback form (same person, younger, in
+    # that day's clothes) — the standard lock would hand the generator two opposite orders about
+    # the one thing the shot is about, and it would pick one (dadaji-ki-yadein, 2026-10-19). So
+    # the check accepts EITHER form, and demands that the one in the prompt is the right one for
+    # that clip: the standard lock everywhere else, the flashback form exactly on the clips whose
+    # own text declares the earlier time.
+    for i, pr in enumerate(prompts):
+        _want = _clip_lock(shot, shot["clips"][i], lock)
+        assert _want in pr, \
+            f"clip {i}: the identity lock must sit in EVERY clip prompt — the first scene and " \
+            "the last are the same person only if every clip is told the same thing"
     assert all(c in lock for c in _char_clauses(world)), \
         "the lock must quote the character's own description verbatim, not just their tag"
     for t in tags:
@@ -1717,6 +1734,26 @@ if __name__ == "__main__":
             "a `world` with no ALL-CAPS tag must lock the SUBJECT, not the room it sits in"
         print("OK: one identity lock per reel, quoted from the character's own description and "
               "repeated VERBATIM on every clip — and it survives the length trim")
+        # a FLASHBACK clip carries the lock in its flashback form — the same person, younger, in
+        # that day's clothes. The reel's own check must accept it: it demanded the standard lock
+        # everywhere, so any plan with a flashback failed the check outright.
+        _fb = {"world": "The recurring character is an elderly Indian grandfather, about 70, thin, "
+                        "balding, wearing a simple teal-green khadi kurta and cotton pajama, no "
+                        "glasses, no hat, no jewellery, no accessories.",
+               "style": "soft warm morning palette, rounded 3-D animation, shallow depth of field, "
+                        "global illumination.",
+               "clips": [{"idx": 0, "prompt": "Dadaji walks slowly down the lane."},
+                         {"idx": 1, "prompt": "Flashback: young Dadaji in 1975 runs through the "
+                                               "flood water, soaked to the waist."}]}
+        _fbp = clip_prompts(_fb)
+        assert _char_lock(_fb) in _fbp[0], "a normal clip keeps the reel's standard lock"
+        assert "FLASHBACK — THE SAME PERSON" in _fbp[1], \
+            "a flashback clip must carry the lock in its flashback form"
+        assert _char_lock(_fb) not in _fbp[1], \
+            "a flashback clip must not carry the standard lock — it contradicts the shot"
+        _prompt_selfcheck(_fb)
+        print("OK: a flashback clip carries the identity lock in its flashback form, and the "
+              "reel's own check accepts it")
         print("OK: Vids and Flow get the labelled Veo brief, every other site the plain "
               "paragraph — the same words either way")
         print("OK: clip_prompts LEADS with the 3-D requirement, then the style anchor (restated), "
@@ -2051,6 +2088,22 @@ if __name__ == "__main__":
                 continue
             raise AssertionError(f"publishing_sheet accepted a sheet it must refuse: {_bad}")
         print("OK: a publishing sheet must open on the reel's own hook and the real address")
+        # a hook card split over two lines: the caption must open on the FIRST line (the one the
+        # profile grid shows) — the check must not demand a join of the two that is not a line.
+        _two = {"youtube_title": "दादाजी की धीमी चाल", "youtube_title_alt": "धीमी चाल",
+                "caption": f"बच्चे दादाजी की धीमी चाल पर हँस रहे थे...\n\n{BRAND_URL}\n",
+                "youtube_description": "एक धीमी चाल की कहानी",
+                "tags": "a, b", "keywords": "a, b",
+                "hashtags": " ".join(f"#h{i}" for i in range(12))}
+        _publishing_selfcheck(_two, "बच्चे दादाजी की धीमी चाल पर हँस रहे थे...")
+        for _bad in ({**_two, "caption": "फिर दीवार पर एक फ़ोटो दिखी।\n\n" + BRAND_URL},
+                     {**_two, "caption": _two["caption"].replace("धीमी चाल", "तेज़ चाल")}):
+            try:
+                _publishing_selfcheck(_bad, "बच्चे दादाजी की धीमी चाल पर हँस रहे थे...")
+            except AssertionError:
+                continue
+            raise AssertionError(f"publishing_sheet accepted a sheet it must refuse: {_bad}")
+        print("OK: a two-line hook card opens the caption on its FIRST line")
         print("OK: presentation() rejects overflow, an empty card, an English-only hook, "
               "a photoreal identity, and an unknown font")
 
