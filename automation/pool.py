@@ -2,7 +2,8 @@
 pool.py — the Google account pool: three accounts, one cycle, an honest credit count.
 
 The owner's setup (2026-10-22): three Google accounts on Vids AND Flow. When one is exhausted
-the load moves to the next, in a CYCLE, and the machine heals itself. And — the part that
+the load moves to the next, in a WATERFALL (fullest-first: a1 drains before a2 before a3, and
+all of Vids before all of Flow), and the machine heals itself. And — the part that
 matters most — the credits left in each account must be tracked ACCURATELY, because Google Vids
 shows no balance anywhere (confirmed live 2026-10-22: the home page, /settings, /account and
 /usage all render the same body with no counter; labs.google/fx/tools/veo is deprecated).

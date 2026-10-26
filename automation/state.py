@@ -425,20 +425,18 @@ class State:
         return f"{head}, resets={when}, used={r['used']}, source={r['source']}"
 
     def rotation(self, site: str, accounts: list) -> list:
-        """The account order this site should be used in, starting from the one that has gone
-        longest without a generation.
+        """The account order this site should be used in: the fullest first.
 
-        The owner's rule (2026-10-22): three Google accounts, the load moves on to the next when
-        one is exhausted, and it moves in a CYCLE. A cycle needs a cursor, and the cursor that
-        never lies is time — the account that last spent a generation goes to the back of the
-        queue, so the next generation lands on the one that has been idle longest. That is the
-        rotation, and it needs no state of its own: `used_at` already says who just ran.
+        The owner's rule (2026-10-26): three Google accounts, and the load falls through in a
+        WATERFALL, not a cycle — you always spend the fullest first so a1 drains to 0 before a2
+        starts, a2 before a3, matching `Vids1 -> Vids2 -> Vids3 -> Flow1 -> Flow2 -> Flow3` on
+        exhaustion. The cursor that never lies is remaining credit: the account with the most
+        credit left goes first. Reordering by credits left is the explicit change from the
+        old cycle (which used `used_at` so a1 bounced back while still funded)."""
 
-        Accounts that have NEVER run tie at 0 and are ordered by label, so the order is stable
-        and reproducible (a reel is not shot by an account chosen at random)."""
         rows = {r["account"]: r for r in self.db.execute(
-            "SELECT account, used_at FROM credits WHERE site=?", (site,)).fetchall()}
-        return sorted(accounts, key=lambda a: (rows[a]["used_at"] if a in rows else 0.0, a))
+            "SELECT account, remaining FROM credits WHERE site=?", (site,)).fetchall()}
+        return sorted(accounts, key=lambda a: (-(rows[a]["remaining"] if a in rows else 0), a))
 
     def mark_dry(self, site: str, account: str, refill_at: float = 0.0):
         """The SITE told us it is empty (quota, paywall, insufficient credits) — record the fact.

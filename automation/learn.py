@@ -146,13 +146,12 @@ class Brain:
         finished at all; among affordable sites the quality order still wins, and when nobody
         can afford the whole reel the order is exactly what it was.
 
-        THE ACCOUNT CYCLE (owner, 2026-10-22): a site with several accounts must use them in
-        turn, not burn the fullest one first. Within one site the accounts are ordered by how
-        long ago they last spent a generation (state.rotation), so the load walks a1 -> a2 ->
-        a3 -> a1 and an exhausted account is simply SKIPPED — the next one takes the job with no
-        human deciding anything. `used_at` is the whole cursor: it is written by spend_credit
-        and read by the rotation, so there is no separate "where were we" state to fall out of
-        sync with the ledger."""
+        THE ACCOUNT WATERFALL (owner, 2026-10-26): a site with several accounts must spend
+        the fullest one first — a1 drains to 0 before a2 starts, a2 before a3 — matching
+        `Vids1 -> Vids2 -> Vids3 -> Flow1 -> Flow2 -> Flow3` on exhaustion. The cursor is
+        remaining credit itself: state.rotation orders by credit left, so there is no separate
+        "where were we" state to fall out of sync with the ledger. (This replaced the older
+        used_at cycle, which bounced back to a funded a1.)"""
         def afford(c) -> int:
             cost = max(1, int(getattr(cost_of(c["site"]), "credit_cost", 1) if cost_of else 1))
             return c["remaining"] // cost
@@ -164,9 +163,10 @@ class Brain:
         # to a fat krea one.
         # Affordability sits ABOVE all of it (see `need`): it is the one thing that decides whether
         # the reel can be finished at all, and a source that strands it is no source.
-        # …and WITHIN one site the accounts take turns (the rotation, below). The rotation rank
-        # is comparable only inside a site, so it sits BELOW the site order in the key and the
-        # credit tiebreak sits below it — a difference of site decides first.
+        # …and WITHIN one site the accounts run as a waterfall (the rotation, below), the
+        # fullest first. The rotation rank is comparable only inside a site, so it sits BELOW
+        # the site order in the key and the credit tiebreak sits below it — a difference of
+        # site decides first.
         rank = {}
         for site in {c["site"] for c in cands}:
             here = [c["account"] for c in cands if c["site"] == site]
@@ -276,36 +276,30 @@ if __name__ == "__main__":
     print("OK: a site is ranked by the clips it can afford, and a dry one returns at the refill "
           "time it named (or stays unknown when it named none)")
 
-    # THE ACCOUNT CYCLE (owner, 2026-10-22): three Google accounts on one site, used in turn,
-    # and when one is exhausted the next takes over without anybody deciding anything.
+    # THE ACCOUNT WATERFALL (owner, 2026-10-26): three Google accounts on 'googlevids', used in
+    # order of remaining credit — the fullest is always picked, so a1 drains before a2 before a3.
     rst = State(os.path.join(tempfile.mkdtemp(), "t.db"))
     rbr = Brain(rst)
-    for a in ("a1", "a2", "a3"):
-        rst.set_credits("googlevids", a, remaining=50)
-    # the cycle: the account that ran longest ago goes next. All three are fresh, so the order
-    # is the label order — reproducible, never a coin toss.
+    # a1 funded; a2, a3 dry (refill far in the future) -> a1 alone carries the reel
+    rst.set_credits("googlevids", "a1", remaining=50)
+    rst.set_credits("googlevids", "a2", remaining=0, resets_at=time.time() + 9999)
+    rst.set_credits("googlevids", "a3", remaining=0, resets_at=time.time() + 9999)
     assert rbr.pick(want_site="googlevids") == ("googlevids", "a1"), \
-        "a fresh pool starts at the first account"
-    rst.spend_credit("googlevids", "a1", 1)                 # a1 has now run
+        "only a1 is funded -> a1 is picked"
+    # a1 drains to 1 while a2 refills to 50: the FULLEST (a2) goes, not a1
+    rst.set_credits("googlevids", "a1", remaining=1)
+    rst.set_credits("googlevids", "a2", remaining=50)
+    rst.set_credits("googlevids", "a3", remaining=49)
     assert rbr.pick(want_site="googlevids") == ("googlevids", "a2"), \
-        "the load must move to the NEXT account, not back to the one that just ran"
-    rst.spend_credit("googlevids", "a2", 1)
-    assert rbr.pick(want_site="googlevids") == ("googlevids", "a3"), "the cycle continues"
-    rst.spend_credit("googlevids", "a3", 1)
-    assert rbr.pick(want_site="googlevids") == ("googlevids", "a1"), \
-        "and it COMES BACK AROUND — a cycle, not a queue that empties"
-    # an exhausted account is SKIPPED, and the load shifts to whichever one is left
-    rst.mark_dry("googlevids", "a2", refill_at=time.time() + 9999)
-    rst.spend_credit("googlevids", "a1", 1)
-    assert rbr.pick(want_site="googlevids") == ("googlevids", "a3"), \
-        "a dry account must be skipped and the next one must take the job"
-    # and when the dry one comes back, it rejoins the cycle
-    rst.mark_dry("googlevids", "a2", refill_at=time.time() - 1)
-    rst.spend_credit("googlevids", "a3", 1)
-    assert rbr.pick(want_site="googlevids") == ("googlevids", "a2"), \
-        "a refilled account rejoins the rotation"
-    print("OK: the accounts run in a CYCLE (a1->a2->a3->a1), a dry one is skipped and the "
-          "load shifts on, and a refilled one rejoins the cycle")
+        "the fullest account goes — a2 (50) over a3 (49) over a1 (1)"
+    # all three dry -> None, so the scheduler cascades to the NEXT site (Flow)
+    rst.set_credits("googlevids", "a1", remaining=0, resets_at=time.time() + 9999)
+    rst.set_credits("googlevids", "a2", remaining=0, resets_at=time.time() + 9999)
+    rst.set_credits("googlevids", "a3", remaining=0, resets_at=time.time() + 9999)
+    assert rbr.pick(want_site="googlevids") is None, \
+        "when every Vids account is dry the waterfall returns None, cascading to Flow"
+    print("OK: the accounts run in a WATERFALL (fullest first — a1 drips to 0 before a2/a3), "
+          "and a dry site falls through (Vids1->Vids2->Vids3 then Flow)")
 
     # THE COUNT MUST BE HONEST (the owner's priority, 2026-10-22). Vids shows no balance, so
     # the count is derived: the bucket size is LEARNED from the refusal, and every generation
