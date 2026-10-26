@@ -115,6 +115,6 @@ The rest are still pending, but only because they are real next-work items, not 
 ## 4. How to read this doc without losing the evidence
 
 - The "front page" is this file.
-- The raw evidence for each promotion, dismissal, and non-promotion is in the `q` journal snapshots under `script-proof/` (and wherever the replay was stored).
+- The raw evidence for each promotion, dismissal, and non-promotion is `candidate_lessons` in `state.db` (the source of truth every decision was read from), and in git history.
 - The live system still holds all candidates under `candidate_lessons`; this doc is the curated read, and the cleanup's job was to make the read short enough that someone will actually read it.
 

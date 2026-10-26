@@ -1,6 +1,6 @@
 # TODO.md — reaching 100% on the project's own definitions
 
-This is the live todo. It is truth-anchored: every item maps to a concrete thing in the project's own records (`state.db`, `brain.py`, craft gate, `reel_qc`, `eye_review`, `SKILLS.md`, `WAVELENGTH.md`, `STORY.md`, or the transcript journal under `script-proof/`).
+This is the live todo. It is truth-anchored: every item maps to a concrete thing in the project's own records (`state.db`, `brain.py`, craft gate, `reel_qc`, `eye_review`, `SKILLS.md`, `WAVELENGTH.md`, `STORY.md`).
 
 ## 0. Done — the honest cleanup
 
