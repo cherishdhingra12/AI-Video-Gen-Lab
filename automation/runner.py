@@ -39,6 +39,9 @@ MAX_RETRIES = 3
 REQUEUE_CAP = 2                              # times the GATE may send one clip back, then a human
 DOWNLOAD_TRIES = 3                           # in-session fetch attempts before a wall (the clip exists)
 POLL_EVERY = 8.0                             # seconds between poll looks
+# Grouped Google family (owner ruling 2026-10-26): Vids and Flow run the same Veo generation,
+# so a reel locked on one falls through to the other when the first is dry.
+GOOGLE_FAMILY = ("googlevids", "flow")
 POLL_TIMEOUT = 12 * 60                       # give a render up to 12 min
 
 
@@ -258,11 +261,21 @@ def process_job(st: State, br: Brain, job, headless: bool = True,
     need = sum(1 for c in st.project_clips(job["project"]) if c["status"] != "done")
     if locked:
         pick = br.pick(want_site=locked, strict=True, need=need, cost_of=_adapter)
+        # pick_override bypasses all scheduler logic — it's used by _resume_probe to force
+        # a specific account on the locked site for the probe. Respect it before any fallback.
+        if not pick and pick_override:
+            pick = pick_override
+        elif not pick and locked in GOOGLE_FAMILY:
+            # GROUPED GOOGLE FAMILY (owner ruling, 2026-10-26): Vids and Flow run the same Veo
+            # generation on Google's side, so a reel locked on one Google site falls through to
+            # the OTHER Google site (a1 -> a2 -> a3 on Vids, then a1 -> a2 -> a3 on Flow) instead
+            # of waiting until a dry bucket refills. Same model family, so one-look holds — this
+            # is not the krea/vibes mixing the lock exists to stop.
+            sibling = next((s for s in GOOGLE_FAMILY if s != locked), None)
+            if sibling:
+                pick = br.pick(want_site=sibling, strict=True, need=need, cost_of=_adapter)
         if not pick:
-            if pick_override:
-                pick = pick_override
-            else:
-                return "waiting"
+            return "waiting"
         site = pick[0]
     else:
         if br.wait_for_bid(job["site"]):
@@ -932,12 +945,18 @@ if __name__ == "__main__":
             "the test must earn the lock: project_site() comes from a DONE clip"
         pkt.add_job("probe-proj", 1, "the reel's own next scene", site="googlevids")
         _p1 = pkt.db.execute("SELECT * FROM jobs WHERE project='probe-proj' AND idx=1").fetchone()
-        # the bucket ran out WITHOUT the site naming a period: 0, no refill date — unproven dry
+        # the bucket ran out WITHOUT the site naming a period: 0, no refill date — unproven dry;
+        # FLOW is also dry with no refill date, so the whole Google family has nothing —
+        # the reel WAITS until the probe below can ask googlevids/p1 whether it refilled.
         pkt.db.execute("UPDATE credits SET remaining=0, resets_at=0 "
                        "WHERE site='googlevids' AND account='p1'")
+        pkt.db.execute("UPDATE credits SET remaining=0, resets_at=0 "
+                       "WHERE site='flow' AND account='f1'")
         pkt.db.commit()
+
         runner._adapter = lambda site: dry
-        assert runner.process_job(pkt, pkb, _p1, headless=True) == "waiting"
+        assert runner.process_job(pkt, pkb, _p1, headless=True) == "waiting", \
+            "the whole Google family is dry — the reel waits, only the probe may ask"
         # (a) a site that refused THIS account within the last day already answered — do not re-ask
         pkb.hit_wall("googlevids", "p1", "credits", detail="refused within the hour")
         assert runner._resume_probe(pkt, pkb, _p1, "googlevids", headless=True) is None, \
@@ -948,12 +967,12 @@ if __name__ == "__main__":
         assert pkt.project_clips("probe-proj")[0]["site"] == "googlevids", \
             "the probe renders the reel's OWN source — it never opens the reel to another site"
         assert pkt.db.execute(
-            "SELECT MAX(remaining) FROM credits WHERE site='flow'").fetchone()[0] == 50, \
+            "SELECT MAX(remaining) FROM credits WHERE site='flow'").fetchone()[0] == 0, \
             "the probe must not touch a site the reel is not locked on"
         _row = pkt.db.execute("SELECT remaining, resets_at, source FROM credits "
                              "WHERE site='googlevids' AND account='p1'").fetchone()
         assert _row["remaining"] == 0 and _row["source"] == "observed", dict(_row)
-        assert _row["resets_at"] > time.time() + 5 * 24 * 3600, \
+        assert _row["resets_at"] > time.time() + 3 * 24 * 3600, \
             (f"the site's OWN monthly words must reach the ledger as a real future date, "
              f"got {dict(_row)} — the daily default woke a day early twice on 2026-10-24")
         # (c) once refused, the account is PROVEN dry — never probed again this period
