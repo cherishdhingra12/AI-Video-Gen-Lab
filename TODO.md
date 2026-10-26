@@ -9,31 +9,25 @@ This is the live todo. It is truth-anchored: every item maps to a concrete thing
 - [x] Strip the house's own 100% conversation out of the cross-reel evidence (the "3 closed, 11 open" QC truth is the house's tripwire, not an agent's slogan)
 - [x] Write the curated rules doc (`SKILLS.md`) so the next agent reads a front page instead of 29 pending candidates
 - [x] Write this todo
+- [x] Execute the batch close-out (2026-10-26) — removed the `--help` junk row from `reel_qc`, wrote the honest bucket close-notes + lesson-coverage map + dadaji decision shape into `brain_log`, then committed and pushed. See §1–§3 below.
 
 ## 1. Close the batch in the project's own records
 
-The QC table says 3 reels are `ok:true`: `aawaaz`, `filter_wala`, `the-lamp-s-silent-promise`. The other 11 are `ok:false` and are not open for the same reason. "All reels closed" is not a statement here; it is a thing the project can re-read.
+The QC table says 3 reels are `ok:true`: `aawaaz`, `filter_wala`, `the-lamp-s-silent-promise`. The others are `ok:false` and are not open for the same reason. "All reels closed" is not a statement here; it is a thing the project can re-read.
 
-Before any reel is marked closed by hand, split the 11 open reels into honest buckets:
+The batch was closed out on 2026-10-26 against the **live** `reel_qc` verdicts (15 rows = 3 pass + 12 held; the `--help` junk row — a `brain.py review --help` mis-parse artifact — was deleted, not a reel). The honest buckets, recorded in `brain_log` (session `batch-close-review-*`):
 
-- **Open, unfinished craft (missing deliverables):** `roz_ki_list`, `the-ascending-lantern`, `the-lunar-lantern`, `the-starlight-fox`
-  - `roz_ki_list` — `reel_qc` says no voiceover + not one art style
-  - `the-ascending-lantern`, `the-lunar-lantern`, `the-starlight-fox` — no caption cards, no VO, no moral card, no score
-- **Open, real defect still on the wall:** `dadaji-ka-kahani`, `dadaji-ki-yadein`, `dadaji-ki-dhimi-chal`, `dadi-ki-bucket-list`, `good-morning-dadaji`
-  - Each has a real block or a real non-conviction gate in `reel_qc`, not just "missing files"
-- **Open, outage-only:** `dadi-ki-dhansuchi`, `darzi-ka-tukda`
-  - Held because the vision/LLM gateway could not run, not because the reel is necessarily defective
+- **Closed by test (ok:true):** `aawaaz`, `filter_wala`, `the-lamp-s-silent-promise`
+- **Unfinished, missing deliverable (craft-layers blocks):** `roz_ki_list` (no VO + not one art style), `the-ascending-lantern`, `the-lunar-lantern`, `the-starlight-fox` (no caption cards, no VO, no moral card, no score)
+- **Finished but real defect still on the wall:** `dadaji-ka-kahani` (photoreal family photo inside animated scene @31.6s/36.5s), `dadaji-ki-yadein` (recurring character's age changes across panels), `dadi-ki-bucket-list` (flat silhouette vs fully-detailed 3D in one frame)
+- **Outage/eye-held, not closed:** `dadaji-ki-dhimi-chal`, `good-morning-dadaji`, `diwali-purana-sandook`, `dadi-ki-dhansuchi`, `darzi-ka-tukda` — vision/LLM gateway could not run, by-eye fallback not done
 
-Then, reel by reel, decide which you are closing now and which you are setting aside:
+No new `craft_lessons` were added: every held defect maps to an already-enforced check (craft-layers, style-uniform, visual-realism, character-consistency, caption-wording, video-playback), and per-reel duplicates would be the noise `SKILLS.md` rejects. The per-reel map is in the `lesson-coverage-map` note.
 
-- **Close by test:** the 3 already-ok reels — write a clean close-state note into `brain_log` so "all reels closed" is a readable project event, not a statement in chat.
-- **Close by decision where a decision is actually needed first:** `dadaji-ka-kahani`'s frame question (style is already a block, character is a non-conviction gate — settle what "same person" means there before calling it closed).
-- **Set aside honestly** where the reel is genuinely unfinished or genuinely not yet eye-reviewed.
-
-Associated work:
-- [ ] Write a short `brain_log` close-state note for the 3 ok reels
-- [ ] Decide, reel by reel, which of the 11 open reels you are actually closing now vs setting aside
-- [ ] Record the dadaji-ka-kahani "same person" decision shape before calling that reel closed
+Associated work — done:
+- [x] Write a short `brain_log` close-state note for the 3 ok reels (`closed-by-test`)
+- [x] Decide, reel by reel, which of the 12 open reels are closed now vs set aside (buckets above)
+- [x] Record the dadaji-ka-kahani "same person" decision shape (`dadaji-ka-kahani-same-person-decision-shape`)
 
 ## 2. Put every held reel into one of three honest buckets in the QC record
 
@@ -45,19 +39,19 @@ Associated work:
 
 This is the honest answer to "are all reels closed?" — the QC table already stores more than enough of this; the job is to make it unambiguous.
 
-- [ ] Read each held reel's current `reel_qc` verdict and put it into the right honest bucket
-- [ ] Where a reel is outage-only, record whether you actually looked by eye (close) or did not (not closed)
-- [ ] Make "closed" mean something re-readable, not just "no open blockers in this chat"
+- [x] Read each held reel's current `reel_qc` verdict and put it into the right honest bucket (done: buckets above, recorded in `brain_log`)
+- [x] Where a reel is outage-only, record whether you actually looked by eye (close) or did not (not closed) — **did not**: the vision gateway is down (2026-10-26), so the eye fallback could not run either. All 5 outage/eye-held reels stay not-closed.
+- [x] Make "closed" mean something re-readable, not just "no open blockers in this chat" — every bucket is a `brain_log` row the project can re-read.
 
 ## 3. Settle the dadaji-ka-kahani frame question by decision
 
 This is the one reel where the house's current rule and its current failure mode meet exactly: clip 2 is in a different look from the rest (style block already enforced), and the character check can't settle whether the recurring person is actually the same person across scenes (character side is a non-conviction gate).
 
-Before calling this reel closed:
-- [ ] Look at the frames for the recurring person across scenes
-- [ ] Decide what "same person" means here in concrete terms (same face and hair, or the younger version in the flashback counts as the same person, or clip 2 is genuinely a different character)
-- [ ] Record that decision shape, not just "closed"
-- [ ] Decide whether the reel ships with that decision, or whether the style-blocked clip 2 still keeps it from shipping
+Settled 2026-10-26 (recorded in the `dadaji-ka-kahani-same-person-decision-shape` note):
+- [x] Look at the frames for the recurring person across scenes — **could not run**: the vision/LLM gateway is unavailable and the by-eye fallback could not execute for the same reason. Recorded honestly rather than guessed.
+- [x] Decide what "same person" means here in concrete terms — the decision shape is recorded: same face and hair in every scene, and the younger flashback version must read as the same person. Until that is actually seen, the question stays a non-conviction.
+- [x] Record that decision shape, not just "closed" — done in `brain_log`.
+- [x] Decide whether the reel ships with that decision — it does not: its real style block (photoreal family photo at 31.6s/36.5s in an animated scene) independently keeps it from shipping regardless of the character question.
 
 ## 4. Prune the learned-rules noise toward a small inherited core
 
