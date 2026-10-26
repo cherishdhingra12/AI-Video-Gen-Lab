@@ -505,6 +505,12 @@ def _draft_script(idea: str, seconds: int = None) -> tuple:
         "STORY.md budget before you write it down.\n"
         "- MORAL: the closing card line, written out.\n"
         "- CTA: the closing line and the brand on the last frame, kept separate from the moral.\n"
+        "- CLOSING VOICEOVER (the owner's standing rule, 2026-10-22): the reel's LAST beat must "
+        "carry a line SPOKEN IN THE SCENE — a character says it to camera, in Hindi, and it is "
+        "engaging, emotional and relatable: the thing the viewer carries away, said out loud, not "
+        "just read off a card. It is spoken by someone IN the scene (never a narrator, never a "
+        "recorded voice laid over the film) and it is the last thing said. Write it as its own "
+        "beat, in the beat table, with the seconds it runs.\n"
         "Write the WHOLE document — an answer that stops mid-table is treated as broken. "
         "Keep it tight, concrete, and directable."
     )
@@ -1078,6 +1084,14 @@ def validate_plan(shot: dict, prompts: list = None) -> dict:
                     "reel loses the one thing the plan was written to look like")
     if clips and not any((c.get("dialogue") or "").strip() for c in clips):
         warn.append("no clip speaks — the reel will have no narration")
+    # THE CLOSING VOICEOVER (the owner's standing rule, 2026-10-22): every reel ends on a line
+    # SPOKEN IN THE SCENE — engaging, emotional, relatable. Not a card, not a narrator track: a
+    # character says it to camera and it is the last thing said. Linted HERE, before a credit is
+    # spent, because the only way to add it later is to buy another generation.
+    if clips and not (clips[-1].get("dialogue") or "").strip():
+        bad.append("the LAST clip has no spoken line — every reel ends on a closing voiceover "
+                   "spoken in the scene (a character to camera, in Hindi). A card cannot carry "
+                   "this: the closing line has to be HEARD.")
     prompts = clip_prompts(shot) if prompts is None else prompts
     if len(prompts) != len(clips):
         bad.append(f"{len(prompts)} prompts built for {len(clips)} clips")
@@ -1126,6 +1140,15 @@ _PRESENTATION_SCHEMA = """{
 
 
 def presentation(script: str, shot: dict, prior: list = None, brief: str = "") -> dict:
+    """Agent 3: the art director. From the script + shot list it emits the reel's identity and the
+    three caption cards (hook, moral, cta) plus what window each card landed in.
+
+    This is the call that produces caption_hook.png / caption_moral.png / caption_cta.png and
+    caption_place.json — the artifacts check_craft_layers HELDs a reel on when they are absent, and
+    what caption_safe_area / caption_on_face / caption_wording then measure.
+
+    It is stubbed by measure.py and qc.py's selfchecks, so the real path is through pipeline.kickoff."""
+
     """Agent 3: the reel's IDENTITY and its on-screen caption cards.
 
     These are the two things the owner had to hand-write per reel (projects/*/identity.json and
@@ -1235,9 +1258,37 @@ def presentation(script: str, shot: dict, prior: list = None, brief: str = "") -
     _orig_caps = obj["captions"]
     try:
         obj["captions"] = judge_captions(script, _orig_caps)["captions"] or _orig_caps
-        _presentation_selfcheck(obj)          # a repair that overflows a card is no repair
     except Exception:  # noqa: BLE001 — a review that cannot run must never cost the reel
         obj["captions"] = _orig_caps
+
+    # ---- generate + place the actual card PNGs ----
+    # caption_place.json is written by assemble.build AFTER the cut exists, because placement needs
+    # the frames the card will sit over. Here we produce the text decisions and the cards themselves
+    # from the script + cards; the placement y for each card is filled in once the final cut exists.
+    import io
+    import os as _os
+    import caption
+    _project_dir = ((shot.get("slug") or "").strip() and os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "projects", (shot.get("slug") or "").strip())) or _os.getcwd()
+    place = {}
+    for kind in ("hook", "moral", "cta"):
+        lines = (_orig_caps.get(kind) or _clean_caps.get(kind) or _near_lines.get(kind) or [])
+        if not lines:
+            continue
+        cardpng = _os.path.join(_project_dir, f"caption_{kind}.png")
+        try:
+            caption.render(lines, cardpng, y=0)
+        except Exception as e:
+            place[kind] = {"error": str(e)}
+        else:
+            place[kind] = {"y0": 0, "y1": 0, "x0": 0, "x1": 0, "start": 0.0, "end": 0.0}
+    obj["_caption_cards"] = []
+    for k in ("hook", "moral", "cta"):
+        p = _os.path.join(_project_dir, f"caption_{k}.png")
+        if _os.path.exists(p):
+            obj["_caption_cards"].append(p)
+    obj["_caption_place_template"] = place
+
+    _presentation_selfcheck(obj)            # a repair that overflows a card is no repair
     return obj
 
 
@@ -1447,6 +1498,80 @@ def _publishing_selfcheck(obj: dict, hook: str = "") -> bool:
         "publishing: a different domain reached the copy"
     assert len(obj["hashtags"].split()) >= 8, "publishing: too few hashtags"
     return True
+
+
+def finalize_caption_placement(obj: dict, video: str, windows=None) -> dict:
+    """Fill caption_place.json from the frozen cut, using the card PNGs produced in presentation.
+
+    presentation only wrote the cards and a zero-placeholder place; this is the step that needs the
+    actual frames. Called by assemble.build after the cut is stitched; idempotent — a reel that has
+    already been placed keeps its existing windows and only fills any still-empty ones.
+
+    `windows` maps kind -> (start, end) in SECONDS of the shipped cut. Without it nothing is
+    invented: every card gets an honest error entry instead of a fabricated window. Before this
+    argument existed the function sampled the whole reel (its 0.05–0.95 fractions) and then wrote
+    THOSE NUMBERS into the record as if they were screen times — every card claimed the same
+    overlapping second, corrupting the placement and every check that reads it
+    (diwali-purana-sandook, 2026-10-23). A placement nobody named is an error, not one second.
+
+    The merge only FILLS: an existing valid window is a previous placement's own answer and
+    silently overwriting it here corrupted `caption_place.json` after assemble.build had already
+    written the real post-pace windows.
+    """
+    import json as _json
+    import os as _os
+    import caption as _caption
+    pdir = obj.get("_project_dir") or _os.getcwd()
+    cards = obj.get("_caption_place_template") or {}
+    windows = windows or {}
+    out = {}
+    for kind, tpl in cards.items():
+        if "error" in tpl:
+            out[kind] = {"error": tpl["error"]}
+            continue
+        png = _os.path.join(pdir, f"caption_{kind}.png")
+        if not _os.path.exists(png):
+            out[kind] = {"error": f"card not found: caption_{kind}.png"}
+            continue
+        im = __import__("PIL").Image.open(png).convert("RGBA")
+        rows = __import__("numpy").where(__import__("numpy").asarray(im)[..., 3] > 150)
+        if not len(rows[0]):
+            out[kind] = {"error": "card has no opaque pixels"}
+            continue
+        top, bot = int(rows[0].min()), int(rows[0].max())
+        card_h = bot - top + 1
+        win = windows.get(kind)
+        if not win or len(win) < 2:
+            out[kind] = {"error": "no screen window given — placement needs the caller to name "
+                                  "the cut's own times; none were invented"}
+            continue
+        t0, t1 = float(win[0]), float(win[1])
+        if t1 <= t0 or t0 < -1e-9:
+            out[kind] = {"error": f"bad screen window given for {kind}: ({t0}, {t1})"}
+            continue
+        y = _caption.find_empty_band(video, t0, t1, card_h)
+        if y is None:
+            out[kind] = {"error": f"no empty band found for {kind} in ({t0:.2f}, {t1:.2f})s"}
+            continue
+        out[kind] = {"x0": 0, "y0": y, "x1": 560, "y1": y + card_h,
+                     "start": round(t0, 3), "end": round(t1, 3)}
+    place_p = _os.path.join(pdir, "caption_place.json")
+    existing = {}
+    if _os.path.exists(place_p):
+        try:
+            existing = _json.load(open(place_p, encoding="utf-8"))
+        except Exception:
+            pass
+    # fill, never overwrite: an existing valid window already names where its card is, and this
+    # step has no standing to second-guess it
+    merged = dict(existing)
+    for k, v in out.items():
+        old = merged.get(k)
+        is_placed = isinstance(old, dict) and "start" in old and "end" in old and not old.get("error")
+        if not is_placed:
+            merged[k] = v
+    _json.dump(merged, open(place_p, "w", encoding="utf-8"), indent=2)
+    return merged
 
 
 def _presentation_selfcheck(obj: dict) -> bool:

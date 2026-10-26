@@ -1,0 +1,13 @@
+{
+  "ts": 1792746426.917504,
+  "written_by": "cleanup-agent",
+  "label": "runner",
+  "slug": "cmdfail-cd-users-cherish-documents-ai-video-gen-",
+  "source_table": "candidate_lessons",
+  "verdict": {
+    "decision": "archive-do-not-inherit",
+    "reason": "runner/host-side failure, not a reel rule",
+    "action": "do not promote to a house rule; the fix site is the runner/host"
+  },
+  "note": "Evidence re-read sober, not as first-impression noise. This is the cleanup's front-page memory, not the raw query. The raw source of truth still lives under candidate_lessons; this file is what the next agent should read instead of the full pending list."
+}

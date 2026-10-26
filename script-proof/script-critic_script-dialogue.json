@@ -1,0 +1,12 @@
+{
+  "ts": 1792746426.917504,
+  "written_by": "cleanup-agent",
+  "label": "script-critic",
+  "slug": "script-dialogue",
+  "source_table": "candidate_lessons",
+  "verdict": {
+    "decision": "promote-to-script-critic",
+    "notes": "These survived the re-read on evidence, not first-impression noise. They are strong enough to be gates, not reminders."
+  },
+  "note": "Evidence re-read sober, not as first-impression noise. This is the cleanup's front-page memory, not the raw query. The raw source of truth still lives under candidate_lessons; this file is what the next agent should read instead of the full pending list."
+}

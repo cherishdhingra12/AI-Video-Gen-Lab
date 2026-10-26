@@ -1,0 +1,12 @@
+{
+  "ts": 1792746426.917504,
+  "written_by": "cleanup-agent",
+  "label": "reliability",
+  "slug": "missing-check-preflight-style-uniform",
+  "source_table": "candidate_lessons",
+  "verdict": {
+    "decision": "build-as-early-catch",
+    "notes": "Not 'remember this'; these are gaps the project keeps paying for. The work is to build the check, not just to write a candidate."
+  },
+  "note": "Evidence re-read sober, not as first-impression noise. This is the cleanup's front-page memory, not the raw query. The raw source of truth still lives under candidate_lessons; this file is what the next agent should read instead of the full pending list."
+}

@@ -1,0 +1,13 @@
+{
+  "ts": 1792746426.917504,
+  "written_by": "cleanup-agent",
+  "label": "wall-noise",
+  "slug": "wall-vibes-success",
+  "source_table": "candidate_lessons",
+  "verdict": {
+    "decision": "did-not-promote",
+    "reason": "recurring success/wall noise is not a durable house rule in this shape; do not inherit as written",
+    "action": "leave in candidate_lessons; do not promote to a house rule"
+  },
+  "note": "Evidence re-read sober, not as first-impression noise. This is the cleanup's front-page memory, not the raw query. The raw source of truth still lives under candidate_lessons; this file is what the next agent should read instead of the full pending list."
+}

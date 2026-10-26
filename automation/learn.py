@@ -145,20 +145,37 @@ class Brain:
         Affordability outranks the house waterfall ONLY when it decides whether the reel can be
         finished at all; among affordable sites the quality order still wins, and when nobody
         can afford the whole reel the order is exactly what it was.
-        """
+
+        THE ACCOUNT CYCLE (owner, 2026-10-22): a site with several accounts must use them in
+        turn, not burn the fullest one first. Within one site the accounts are ordered by how
+        long ago they last spent a generation (state.rotation), so the load walks a1 -> a2 ->
+        a3 -> a1 and an exhausted account is simply SKIPPED — the next one takes the job with no
+        human deciding anything. `used_at` is the whole cursor: it is written by spend_credit
+        and read by the rotation, so there is no separate "where were we" state to fall out of
+        sync with the ledger."""
         def afford(c) -> int:
             cost = max(1, int(getattr(cost_of(c["site"]), "credit_cost", 1) if cost_of else 1))
             return c["remaining"] // cost
 
         cands = self.st.available()
-        # The house waterfall decides the ORDER: Vids before Flow before the rest, and within a
-        # tier the most remaining credit first (spread load, delay hitting any one wall). This is
-        # a QUALITY order, not a credit order — a small Vids bucket must not lose to a fat krea one.
+        # The house waterfall decides the ORDER of SITES: Vids before Flow before the rest, and
+        # within a tier the most remaining credit first (spread load, delay hitting any one
+        # wall). This is a QUALITY order, not a credit order — a small Vids bucket must not lose
+        # to a fat krea one.
         # Affordability sits ABOVE all of it (see `need`): it is the one thing that decides whether
         # the reel can be finished at all, and a source that strands it is no source.
+        # …and WITHIN one site the accounts take turns (the rotation, below). The rotation rank
+        # is comparable only inside a site, so it sits BELOW the site order in the key and the
+        # credit tiebreak sits below it — a difference of site decides first.
+        rank = {}
+        for site in {c["site"] for c in cands}:
+            here = [c["account"] for c in cands if c["site"] == site]
+            for i, a in enumerate(self.st.rotation(site, here)):
+                rank[(site, a)] = i
         cands.sort(key=lambda c: (0 if afford(c) >= need else 1,
                                   0 if want_site and c["site"] == want_site else 1,
-                                  _order(c["site"]), -afford(c)))
+                                  _order(c["site"]), rank.get((c["site"], c["account"]), 99),
+                                  -afford(c)))
         if strict:
             cands = [c for c in cands if c["site"] == want_site]
         for c in cands:
@@ -258,3 +275,63 @@ if __name__ == "__main__":
         "a site that named no period stays UNKNOWN — 0 is never a guessed date"
     print("OK: a site is ranked by the clips it can afford, and a dry one returns at the refill "
           "time it named (or stays unknown when it named none)")
+
+    # THE ACCOUNT CYCLE (owner, 2026-10-22): three Google accounts on one site, used in turn,
+    # and when one is exhausted the next takes over without anybody deciding anything.
+    rst = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+    rbr = Brain(rst)
+    for a in ("a1", "a2", "a3"):
+        rst.set_credits("googlevids", a, remaining=50)
+    # the cycle: the account that ran longest ago goes next. All three are fresh, so the order
+    # is the label order — reproducible, never a coin toss.
+    assert rbr.pick(want_site="googlevids") == ("googlevids", "a1"), \
+        "a fresh pool starts at the first account"
+    rst.spend_credit("googlevids", "a1", 1)                 # a1 has now run
+    assert rbr.pick(want_site="googlevids") == ("googlevids", "a2"), \
+        "the load must move to the NEXT account, not back to the one that just ran"
+    rst.spend_credit("googlevids", "a2", 1)
+    assert rbr.pick(want_site="googlevids") == ("googlevids", "a3"), "the cycle continues"
+    rst.spend_credit("googlevids", "a3", 1)
+    assert rbr.pick(want_site="googlevids") == ("googlevids", "a1"), \
+        "and it COMES BACK AROUND — a cycle, not a queue that empties"
+    # an exhausted account is SKIPPED, and the load shifts to whichever one is left
+    rst.mark_dry("googlevids", "a2", refill_at=time.time() + 9999)
+    rst.spend_credit("googlevids", "a1", 1)
+    assert rbr.pick(want_site="googlevids") == ("googlevids", "a3"), \
+        "a dry account must be skipped and the next one must take the job"
+    # and when the dry one comes back, it rejoins the cycle
+    rst.mark_dry("googlevids", "a2", refill_at=time.time() - 1)
+    rst.spend_credit("googlevids", "a3", 1)
+    assert rbr.pick(want_site="googlevids") == ("googlevids", "a2"), \
+        "a refilled account rejoins the rotation"
+    print("OK: the accounts run in a CYCLE (a1->a2->a3->a1), a dry one is skipped and the "
+          "load shifts on, and a refilled one rejoins the cycle")
+
+    # THE COUNT MUST BE HONEST (the owner's priority, 2026-10-22). Vids shows no balance, so
+    # the count is derived: the bucket size is LEARNED from the refusal, and every generation
+    # is counted off the top.
+    pst2 = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+    pst2.set_pool("googlevids", "a1", 50, email="one@example.com")
+    assert pst2.account_email("googlevids", "a1") == "one@example.com", "the email is recorded"
+    pst2.set_credits("googlevids", "a1", remaining=50, source="manual")
+    for _ in range(7):
+        pst2.spend_credit("googlevids", "a1", 1)
+    assert pst2.db.execute("SELECT remaining FROM credits WHERE site='googlevids'").fetchone()[0] == 43, \
+        "each generation must come off the count"
+    assert pst2.db.execute("SELECT used FROM credits WHERE site='googlevids'").fetchone()[0] == 7, \
+        "and be counted, so the pool size can be learned from a refusal"
+    pst2.mark_dry("googlevids", "a1", refill_at=time.time() + 9999)
+    assert pst2.db.execute("SELECT used FROM credits WHERE site='googlevids'").fetchone()[0] == 0, \
+        "a spent bucket restarts its counter — the next refusal teaches the next period"
+    assert pst2.db.execute("SELECT pool FROM credits WHERE site='googlevids'").fetchone()[0] == 50, \
+        "a refusal must not shrink a pool below the generations that were actually made"
+    # a refilled bucket comes back at the pool's size, not at zero — but only when a generation
+    # actually goes through, which is the proof. A clock running out is NOT a refill.
+    pst2.mark_dry("googlevids", "a1", refill_at=time.time() - 1)
+    assert pst2.db.execute("SELECT remaining FROM credits WHERE site='googlevids'").fetchone()[0] == 0, \
+        "a passing refill time must NOT hand out credits on its own — that would be a fiction"
+    pst2.spend_credit("googlevids", "a1", 1)
+    assert pst2.db.execute("SELECT remaining FROM credits WHERE site='googlevids'").fetchone()[0] == 49, \
+        "a generation that goes through on a dry account IS the proof the bucket came back"
+    print("OK: every generation is counted off the balance, a refusal teaches the pool size, "
+          "and a bucket only refills when a generation proves it")

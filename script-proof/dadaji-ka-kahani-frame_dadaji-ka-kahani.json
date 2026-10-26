@@ -1,0 +1,48 @@
+{
+  "ts": 1792746797.7853692,
+  "written_by": "cleanup-agent-frame-reading",
+  "label": "dadaji-ka-kahani-frame",
+  "slug": "dadaji-ka-kahani",
+  "source_table": "reel_qc + project dir",
+  "verdict": {
+    "decision": "non-conviction-gate-settled-by-eye",
+    "by": "cleanup-agent frame reading (not a vision gateway; this is an eye decision recorded because the project asked for it)",
+    "what_i_looked_at": [
+      "projects/dadaji-ka-kahani/eye_review_1.png (frame 1)",
+      "projects/dadaji-ka-kahani/eye_review_2.png (frame 2 — the clip-2-side evidence frame)",
+      "projects/dadaji-ka-kahani/caption_hook.png, caption_cta.png, caption_moral.png (caption cards; not the reel look)",
+      "projects/dadaji-ka-kahani/final_veo.mp4 (ffprobe: 720x1280, 40.53s, video+audio present, not a still/silent render)"
+    ],
+    "ffprobe_final_render": {
+      "file": "projects/dadaji-ka-kahani/final_veo.mp4",
+      "video": "720x1280",
+      "duration_s": 40.533333,
+      "audio_present": true,
+      "playable_not_still_or_silent": true
+    },
+    "style_gate": {
+      "claim_in_reel_qc": "clip 2 in a different look from the rest of the reel (left frame more stylized/cartoonish with exaggerated proportions, right frame more realistic facial proportions)",
+      "eye_read": "The two review frames are close in palette and lighting (warm skin/wall, similar low-key look). They are NOT the same facial rendering: frame 1 looks like a more conventional photographed elder, frame 2 reads more stylized. So the style claim is not obviously false to the eye, but the frames I read are caption cards plus two review frames, and the project dir has NO clips/*.mp4 for this reel. So I can only read what is on the wall, not the full internal frame-by-frame look.",
+      "bottom_line": "style is not 'cleared' here by what I can see; it stays as a held question on the evidence available. The honest move is to record that, not to fake a clearance."
+    },
+    "character_gate": {
+      "claim_in_reel_qc": "the clip-against-clip scan says the recurring character changes between scenes and the other view does not — not a conviction; look at the frames and settle it (different facial proportions, nose shape, ear size, eye size)",
+      "eye_read": "On the two review frames I can read, the elder in frame 1 and the elder in frame 2 are close enough in face/head shape, hair, and cloth that they read to me as the same elderly male character, with the difference being rendering/style, not a different person. That is an eye conviction only on what is here; the gate's original 'not a conviction' was real — the two automated views disagreed. I am not overriding that with a blind claim; I am recording a human-eye read with its limits.",
+      "same_person_meaning_here": "same person = same elderly male recurring character across the scenes I can read; the differences I can see between frame 1 and frame 2 are consistent with a style/rendering difference, not a different person. If clip 2 is meant to be a younger version or a different character, that is a story framing I cannot confirm from the files on the wall.",
+      "bottom_line": "character side: I read same person on the evidence available, with the caveat that the files on the wall do not include the full clip set."
+    },
+    "did_close_the_reel_by_this_reading": false,
+    "why_not_closed_here": [
+      "no clips/*.mp4 on the wall for this reel, so I cannot confirm the full reel is finished and one-look",
+      "style gate still not cleared by what I can see — it is a real block in reel_qc and I did not invent a clearance for it",
+      "the eye read is a person decision on the available evidence, not a full QC clearance; the house's own 100% definition still wants the gate to pass cleanly on a finished reel with its real assets, not just a plausible read on two stills",
+      "per the house plan, this reel's close should be a real decision with a real note, and closing it now with the craft incomplete would make '100%' a statement again rather than a re-readable state"
+    ],
+    "what_would_close_it_honestly": [
+      "the full reel assets appear on the wall (clips + captions + VO + score if the house requires it)",
+      "style gate either cleared by eye on the real reel, or fixed so the reel is in one art style",
+      "the character decision recorded here is accepted by the person who owns the reel, with the same-person meaning written down for this reel before the next one is generated"
+    ]
+  },
+  "note": "Frame reading for dadaji-ka-kahani; see SKILLS.md and TODO.md for the house position."
+}

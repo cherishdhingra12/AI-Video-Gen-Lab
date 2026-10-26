@@ -87,7 +87,15 @@ POST = float(os.environ.get("POST", "0.60"))     # ... and after the last one
 # SPEAKS. The dadi reel measured 26.1-39.9 dB on its four spoken clips and 16.5 on the wordless
 # sunrise sweep — and level alone cannot tell them apart, because the sweep's ambience bridges a
 # -35dB silence gate and its loud fraction matches a spoken clip's.
-VOICE_RANGE = float(os.environ.get("VOICE_RANGE", "20"))
+#
+# RAISED from 20 to 30 dB (2026-10-22). Measured on the dadi reel's six clips, the split is not
+# marginal: the three SPEAKING clips ran 36.2 / 40.5 / 47.5 dB and the three WORDLESS ones
+# 12.9 / 24.0 / 24.1. At the old 20 dB gate the courtyard (24.0) and the pull-back (24.1) both
+# counted as SPEAKING, so the sound was allowed to trim them — and it cut the courtyard clip to
+# 2.93s, which DELETED the framed photograph appearing on the wall at 6.5-9.8s, the exact beat
+# the hook card names ("फिर दीवार पर एक फ़ोटो दिखी"). A clip with no voice must never be cut by
+# the sound (WAVELENGTH §5), so the gate has to sit in the measured GAP, not at its edge.
+VOICE_RANGE = float(os.environ.get("VOICE_RANGE", "30"))
 
 
 def _run(cmd):
@@ -147,9 +155,135 @@ def _keep_windows(p):
         return None
     a = max(0.0, sil[0][1] - PRE) if sil[0][0] <= 0.15 else 0.0        # opens silent: start late
     b = min(d, sil[-1][0] + POST) if sil[-1][1] >= d - 0.15 else d     # closes silent: end early
+    if (cut := _junk_tail(p)):                     # a repeat or a hallucination at the end
+        b = min(b, cut)
     if b - a < 0.30 or (a <= 0.05 and b >= d - 0.05):
         return None
     return [(a, b)]
+
+
+def _junk_tail(p) -> float:
+    """Where the REAL speech ends in this clip, or 0 when the whole clip is real speech.
+
+    A generated clip's tail is junk in two shapes, both measured on the dadi reel:
+      * a REPEAT — the same sentence spoken again (clip_004: the blessing said twice, the plan
+        asked once), and
+      * a HALLUCINATION — Veo continuing with an unrelated line, in English, after the scene's
+        line was finished (clip_001: "अगर आपको इसे आई वीडियो को विश्वास करते हैं…").
+
+    How the real end is found is the whole problem, and it is answered by WORD-LEVEL
+    transcription: whisper says exactly where the last real word ENDS (clip_001: 6.48s,
+    clip_002: 9.14s, clip_004: 5.06s). Everything after that point is the junk. The cut then
+    lands at the silence just after the last word, so a line is never clipped mid-word and the
+    picture is never spliced.
+
+    The judgement that matters: is what follows the tail REPEATED or something else?
+      * a segment whose words match an earlier segment -> a REPEAT -> cut it.
+      * a segment that is not Hindi at all -> a HALLUCINATION -> cut it.
+      * anything else -> UNKNOWN -> cut nothing. An unknown answer must never cut a line.
+
+    Returns 0 when there is no junk, or when the ASR could not run — a check that could not run
+    is not a finding (the outage rule)."""
+    try:
+        segs = _transcribe(p)
+    except Exception:                                             # noqa: BLE001
+        return 0.0                                                # no ASR -> cut nothing
+    segs = [s for s in segs if s.get("words")]
+    if not segs:
+        return 0.0
+
+    def norm(t):
+        return re.sub(r"[^\wऀ-ॿ ]", "", t).lower().split()
+
+    # the last word of the FIRST segment is the end of the real speech, unless a later segment
+    # repeats it (a repeat comes after, so it is the junk)
+    first = segs[0]
+    real_end = max(w["end"] for w in first["words"])
+    seen = [norm(" ".join(w["word"] for w in first["words"]))]
+    junk_words = []
+    for s in segs[1:]:
+        w = norm(" ".join(x["word"] for x in s["words"]))
+        if not w:
+            continue
+        latin = sum(1 for c in s["text"] if c.isascii() and c.isalpha())
+        hindi = sum(1 for c in s["text"] if "ऀ" <= c <= "ॿ")
+        repeat = any(_same_words(w, prev) for prev in seen)
+        not_hindi = latin > 8 and hindi == 0
+        if repeat or not_hindi:
+            junk_words = s["words"]
+            break
+        seen.append(w)
+        real_end = max(real_end, max(x["end"] for x in s["words"]))
+    if junk_words:
+        # the junk starts where the REPEAT starts; the cut goes just after the last real word
+        real_end = min(w["start"] for w in junk_words) - 0.05
+    if real_end <= 0.0:
+        return 0.0
+    d = _dur(p)
+    if real_end >= d - 0.30:
+        return 0.0                                                # nothing after the line: keep all
+    # the cut lands in the silence just after the last real word, so no word is ever clipped
+    for s, e in _merge(_silences(p)):
+        if e >= real_end - 0.05 and e - real_end < 1.2:
+            return e
+    return real_end
+
+
+def _same_words(a, b) -> bool:
+    """Do two transcripts say the same thing? Overlap, not equality — whisper transcribes the
+    same sentence slightly differently each time it hears it."""
+    if not a or not b:
+        return False
+    sa, sb = set(a), set(b)
+    inter = len(sa & sb)
+    return inter >= max(2, int(0.6 * min(len(sa), len(sb))))
+
+
+def _transcribe(p) -> list:
+    """Whisper segments for a clip, with word timings: [{'start','end','text','words'}].
+    Returns [] when no ASR is available.
+
+    mlx-whisper on Apple silicon is the fast path (the whole dadi reel transcribes in seconds);
+    faster-whisper is the fallback. Neither is REQUIRED: the trim works without them, it just
+    cannot spot a repeat or a hallucination."""
+    import json as _json
+    cache = p + ".asr.json"
+    if os.path.exists(cache):
+        try:
+            return _json.load(open(cache, encoding="utf-8"))
+        except Exception:                                         # noqa: BLE001
+            pass
+    segs = []
+    try:
+        import mlx_whisper
+        raw = subprocess.run(["ffmpeg", "-v", "error", "-i", p, "-f", "s16le", "-ac", "1",
+                              "-ar", "16000", "-"], capture_output=True).stdout
+        audio = np.frombuffer(raw, "<i2").astype(np.float32) / 32768.0
+        r = mlx_whisper.transcribe(audio, path_or_hf_repo="mlx-community/whisper-large-v3-mlx",
+                                   language="hi", word_timestamps=True, verbose=False,
+                                   no_speech_threshold=1.0, condition_on_previous_text=False,
+                                   hallucination_silence_threshold=None)
+        segs = [{"start": float(s["start"]), "end": float(s["end"]), "text": s["text"],
+                 "words": [{"start": float(w["start"]), "end": float(w["end"]),
+                            "word": w["word"]} for w in (s.get("words") or [])]}
+                for s in r["segments"]]
+    except Exception:                                             # noqa: BLE001
+        try:
+            from faster_whisper import WhisperModel
+            m = WhisperModel("large-v3", device="cpu", compute_type="int8")
+            rs, _ = m.transcribe(p, language="hi", vad_filter=False,
+                                 no_speech_threshold=1.0, condition_on_previous_text=False)
+            segs = [{"start": float(s.start), "end": float(s.end), "text": s.text, "words": []}
+                    for s in rs]
+        except Exception:                                         # noqa: BLE001
+            return []
+    if segs:
+        try:
+            with open(cache, "w", encoding="utf-8") as f:
+                _json.dump(segs, f, ensure_ascii=False)
+        except OSError:
+            pass
+    return segs
 
 
 def compress_gaps(clips, keep_windows=None):

@@ -60,11 +60,23 @@ class GoogleVids(SiteAdapter):
     _QUOTA = re.compile(r"(reached|out of|no more|limit).{0,40}"
                         r"(credit|generat|clip|quota|limit)", re.I)
 
-    # What that message means for the ledger. It names NO period — "Try again" is all it offers —
-    # so this is a RE-ASK interval, not a claim about Google's reset. Guessing 'monthly' would park
-    # a reel that already owns clips on this source until the 1st if the cap were really daily,
-    # while re-asking costs one refused browser run: no generation spent, and (runner) no retry.
+    # What that message means for the ledger. The words name a period only when they say so:
+    # most refusals say "Try again" and nothing more, so the default stays 'daily' — a RE-ASK
+    # interval, not a claim about Google's reset. Guessing 'monthly' would park a reel that
+    # already owns clips on this source until the 1st if the cap were really daily, while
+    # re-asking costs one refused browser run: no generation spent, and (runner) no retry.
     quota_refill = "daily"
+
+    def refill_period(self, line: str) -> str:
+        """The refill period the SITE'S OWN refusal words name — not a guess.
+
+        Twice on 2026-10-24 a bucket refused in words that DO name the period: "You've reached
+        your **monthly** limit. Wait until Nov 1 at 12:30 PM for limits to reset." The ledger
+        still wrote Oct 25 00:00 (this file's daily default), so the next resume woke a day
+        early, paid a refused browser run and re-parked with the same wrong date. The words are
+        the one thing the site directly says about its reset — read them before inventing one.
+        When the line names no period, the daily default stands, for exactly the reason above."""
+        return "monthly" if re.search(r"\bmonthly\b", line or "", re.I) else self.quota_refill
 
     # ---- passive capture of the rendered clip URL (gstatic.com/docs/... are promo decoys) ----
     def _watch(self, session):
@@ -146,7 +158,7 @@ class GoogleVids(SiteAdapter):
 
         if self._quota_blocked(session):
             raise Wall("credits", self._quota_line(session) or "Google Vids is out of generations",
-                       refill=self.quota_refill)
+                       refill=self.refill_period(self._quota_line(session)))
 
         # 4) prompt + fire. Real keyboard: Google SPAs ignore JS value injection.
         if not session.has(self.prompt_sel, timeout=8000):
@@ -162,7 +174,7 @@ class GoogleVids(SiteAdapter):
         time.sleep(4)
         if self._quota_blocked(session):
             raise Wall("credits", self._quota_line(session) or "Google Vids is out of generations",
-                       refill=self.quota_refill)
+                       refill=self.refill_period(self._quota_line(session)))
 
     def poll(self, session) -> str:
         """CONFIRMED live: the AI-clip panel shows a NN% + Cancel while Veo renders; when
@@ -182,7 +194,7 @@ class GoogleVids(SiteAdapter):
             # is really just a refill. Being empty is not a mistake to step back from.
             line = next((l.strip() for l in body.splitlines() if self._QUOTA.search(l)), "")
             raise Wall("credits", line or "Google Vids is out of generations",
-                       refill=self.quota_refill)
+                       refill=self.refill_period(line))
         try:                                    # result bar up = render finished
             if (pg.get_by_role("button", name="Insert", exact=True).first.is_visible()
                     and pg.get_by_role("button", name="Recreate", exact=True).first.count()):
@@ -269,8 +281,14 @@ if __name__ == "__main__":  # self-check: capture state must reset + rebind ever
     assert "limits for generating videos" in a._quota_line(_S(LIVE)), \
         "the wall must carry the site's words — they are what the report shows a person"
     import learn
-    assert learn.refill_at(a.quota_refill) > time.time(), \
-        f"the ledger needs a real time from {a.quota_refill!r}"
+    assert learn.refill_at(a.refill_period("")) > time.time(), \
+        f"the ledger needs a real time from an unnamed refusal: {a.quota_refill!r}"
+    assert a.refill_period("You've reached your monthly limit. Wait until Nov 1 at 12:30 PM "
+                           "for limits to reset.") == "monthly", \
+        "a refusal that names the period IN WORDS must be believed — the daily guess woke " \
+        "the ledger a day early twice on 2026-10-24"
+    assert a.refill_period("Try again tomorrow.") == "daily", \
+        "a refusal that names no period keeps the daily default — do not exaggerate a guess"
     HEALTHY = ("AI video clip\nOmni · 720p · 3s\nGenerate an AI video clip\nInsert\nRecreate\n"
                "REQUIRED OUTPUT: 3-D ANIMATED VIDEO — a stylized animated-feature look in every "
                "frame\nNo text of any kind anywhere in the frame EXCEPT on a phone or tablet "

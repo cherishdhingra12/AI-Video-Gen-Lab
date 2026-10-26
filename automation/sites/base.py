@@ -67,6 +67,36 @@ class SiteAdapter:
         except Exception:
             return None
 
+    # ---- WHICH ACCOUNT is this session? ------------------------------------------------
+    # A site with several accounts needs the runner to know which one it is holding before it
+    # spends a generation, because the failure is invisible otherwise: a cookie refresh that
+    # hands account 2 the session of account 1, so a2 quietly spends a1's limit and the
+    # per-account credit counts are wrong in a way no report would reveal.
+    #
+    # The site SAYS it, if you ask in the right dialect. Google's account avatar carries the
+    # address in its aria-label — live on vids.google.com, one element, exactly:
+    #   "Google Account: cherish dhingra  (cherishdhingra1234@gmail.com)"
+    # so the identity is read from the page, not guessed from a file name. Returns '' when the
+    # page says nothing, and '' means UNKNOWN — never a guess (see state.account_matches).
+    _ACCOUNT_JS = """() => {
+        const els = [...document.querySelectorAll('[aria-label*="Account" i],[aria-label*="account" i],'
+            + '[data-email],[data-account-email]')];
+        for (const e of els) {
+            const t = (e.getAttribute('aria-label') || e.getAttribute('data-email')
+                || e.getAttribute('data-account-email') || '');
+            const m = t.match(/[\\w.+-]+@[\\w-]+\\.[\\w.]+/);
+            if (m) return m[0];
+        }
+        return '';
+    }"""
+
+    def read_account(self, session) -> str:
+        """The email address this session is signed in as, or '' when the page does not say."""
+        try:
+            return (session.page.evaluate(self._ACCOUNT_JS) or "").strip()
+        except Exception:
+            return ""
+
     def _guard(self, session):
         """Vision check for a wall before we spend effort. Raise Wall if blocked."""
         st = read_state(session.screenshot())

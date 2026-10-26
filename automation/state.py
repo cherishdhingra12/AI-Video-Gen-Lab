@@ -66,6 +66,10 @@ CREATE TABLE IF NOT EXISTS credits (
   resets_at REAL NOT NULL DEFAULT 0, -- epoch; past = refill is due
   updated REAL NOT NULL,
   source  TEXT NOT NULL DEFAULT 'manual', -- 'manual' (entered at login) | 'observed' (read off the site)
+  email   TEXT NOT NULL DEFAULT '',    -- the address this account label MUST hold (Google)
+  used    INTEGER NOT NULL DEFAULT 0,  -- generations made since the bucket came back
+  pool    INTEGER NOT NULL DEFAULT 0,  -- the TRUE size of the bucket; 0 = not learned yet
+  used_at REAL NOT NULL DEFAULT 0,    -- when this account last SPENT a generation (the rotation)
   PRIMARY KEY (site, account)
 );
 CREATE TABLE IF NOT EXISTS lessons (
@@ -166,6 +170,17 @@ class State:
                 except sqlite3.OperationalError as e:
                     if "duplicate column" not in str(e).lower():
                         raise
+                # …and before the pool ledger existed (a site with no readable balance, like
+                # Google Vids, needs the bucket SIZE learned rather than read: see credits.pool)
+                for col, decl in (("email", "TEXT NOT NULL DEFAULT ''"),
+                                  ("used", "INTEGER NOT NULL DEFAULT 0"),
+                                  ("pool", "INTEGER NOT NULL DEFAULT 0"),
+                                  ("used_at", "REAL NOT NULL DEFAULT 0")):
+                    try:
+                        self.db.execute(f"ALTER TABLE credits ADD COLUMN {col} {decl}")
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column" not in str(e).lower():
+                            raise
                 self.db.commit()
                 return
             except sqlite3.OperationalError as e:
@@ -319,10 +334,111 @@ class State:
         self.db.commit()
 
     def spend_credit(self, site: str, account: str, n: int = 1):
+        """One generation happened. Walk the balance down AND move the rotation cursor.
+
+        `used` counts generations made since the bucket came back, and `used_at` is when this
+        account last spent one — together they are how the pool is tracked on a site with NO
+        readable balance (Google Vids shows no counter anywhere, confirmed live 2026-10-22):
+        the bucket size is LEARNED from the pool's first refusal, and every generation since is
+        subtracted from it, so the number in the report is derived from facts rather than
+        guessed. `used_at` is also what makes the rotation cyclic rather than alphabetical.
+
+        A bucket whose refill time has PASSED does NOT refill on its own — the site's refill
+        period is only a RE-ASK interval (Google Vids names no period, so 'daily' means "come
+        back and try", not "the bucket is full again on the 1st"). So the count is NOT restored
+        when the clock passes; it is restored when a generation actually SUCCEEDS on an account
+        that was at zero — that success is the proof the bucket came back, and not a moment
+        before. Claiming credits we have not been given is exactly the fiction this ledger
+        exists to avoid."""
+        now = time.time()
+        row = self.db.execute("SELECT remaining, pool, used, resets_at FROM credits "
+                              "WHERE site=? AND account=?", (site, account)).fetchone()
+        if row and row["remaining"] <= 0 and row["pool"]:
+            # the bucket came back (proved by this generation going through): a new period
+            self.db.execute(
+                "UPDATE credits SET remaining=?, used=0, resets_at=0, updated=? "
+                "WHERE site=? AND account=?", (row["pool"], now, site, account))
         self.db.execute(
-            "UPDATE credits SET remaining=MAX(0,remaining-?), updated=? WHERE site=? AND account=?",
-            (n, time.time(), site, account))
+            "UPDATE credits SET remaining=MAX(0,remaining-?), used=used+?, used_at=?, updated=? "
+            "WHERE site=? AND account=?",
+            (n, n, now, now, site, account))
         self.db.commit()
+
+    def set_pool(self, site: str, account: str, pool: int, email: str = None):
+        """The TRUE size of this account's bucket, learned or read.
+
+        `pool` is how many generations the account gets before it refuses (Vids: ~50/month).
+        `remaining` is what is LEFT of it. Both are needed because a site that shows no balance
+        can still be tracked exactly: the refusal names the end of the bucket, and every
+        generation is counted off the top. An email, when given, is the address this account
+        label must hold — the identity check that stops one account's session being used for
+        another (see state.account_matches)."""
+        now = time.time()
+        if email:
+            self.db.execute(
+                "INSERT INTO credits(site,account,remaining,resets_at,updated,source,email) "
+                "VALUES(?,?,0,0,?,'manual',?) "
+                "ON CONFLICT(site,account) DO UPDATE SET email=excluded.email, updated=excluded.updated",
+                (site, account, now, email))
+        self.db.execute(
+            "UPDATE credits SET pool=?, updated=? WHERE site=? AND account=?",
+            (pool, now, site, account))
+        self.db.commit()
+
+    def account_email(self, site: str, account: str) -> str:
+        r = self.db.execute("SELECT email FROM credits WHERE site=? AND account=?",
+                            (site, account)).fetchone()
+        return (r["email"] if r else "") or ""
+
+    def account_matches(self, site: str, account: str, email: str) -> bool:
+        """Does this session hold the account we THINK it holds?
+
+        The failure this prevents: three Google accounts, one pool of sessions, and a refresh
+        that hands account 2 the cookies of account 1 — so a2 spends a1's generation limit and
+        the ledger's per-account counts are wrong in a way nothing can see. The site DOES say
+        which account it is signed in as (Google's account avatar carries the address in its
+        aria-label), so the check is free and exact.
+
+        True when either side is unknown: a site with no email recorded, or a session that
+        reports none, cannot be judged — and a judge with no evidence must not accuse."""
+        want = self.account_email(site, account).lower().strip()
+        got = (email or "").lower().strip()
+        if not want or not got:
+            return True
+        return want == got
+
+    def pool_line(self, site: str, account: str) -> str:
+        """One line about a pool: what is left, how big it is, and how the number was learned.
+
+        The count matters most on the sites that show no balance — there it is DERIVED, and the
+        line has to say so rather than let a derived number pass for a read one."""
+        r = self.db.execute("SELECT * FROM credits WHERE site=? AND account=?",
+                            (site, account)).fetchone()
+        if not r:
+            return f"{site}/{account}: no row — the site is invisible to the scheduler"
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["resets_at"])) \
+            if r["resets_at"] else "no refill time"
+        if r["pool"]:
+            head = f"{site}/{account}: {r['remaining']} of {r['pool']} left"
+        else:
+            head = f"{site}/{account}: {r['remaining']} left (pool size unknown)"
+        return f"{head}, resets={when}, used={r['used']}, source={r['source']}"
+
+    def rotation(self, site: str, accounts: list) -> list:
+        """The account order this site should be used in, starting from the one that has gone
+        longest without a generation.
+
+        The owner's rule (2026-10-22): three Google accounts, the load moves on to the next when
+        one is exhausted, and it moves in a CYCLE. A cycle needs a cursor, and the cursor that
+        never lies is time — the account that last spent a generation goes to the back of the
+        queue, so the next generation lands on the one that has been idle longest. That is the
+        rotation, and it needs no state of its own: `used_at` already says who just ran.
+
+        Accounts that have NEVER run tie at 0 and are ordered by label, so the order is stable
+        and reproducible (a reel is not shot by an account chosen at random)."""
+        rows = {r["account"]: r for r in self.db.execute(
+            "SELECT account, used_at FROM credits WHERE site=?", (site,)).fetchall()}
+        return sorted(accounts, key=lambda a: (rows[a]["used_at"] if a in rows else 0.0, a))
 
     def mark_dry(self, site: str, account: str, refill_at: float = 0.0):
         """The SITE told us it is empty (quota, paywall, insufficient credits) — record the fact.
@@ -330,8 +446,42 @@ class State:
         This is not the same as a cooldown and must not be treated as one: the pair is OUT until
         its own refill time, so a ledger that says `remaining=0, resets_at=0` forever is what
         made every dry site look hand-entered and every report call it 'manual'. Source is
-        'observed' because the site itself was the source."""
+        'observed' because the site itself was the source.
+
+        The refusal is also the only moment the bucket's SIZE can be learned on a site that
+        shows no counter (Google Vids shows none, confirmed live 2026-10-22): the account let
+        us spend `used` generations and then refused, so the bucket held AT LEAST that many.
+        The learned size is the MAXIMUM of what we know and what the refusal proves — it never
+        shrinks a pool below generations that were actually made, and a hand-entered figure
+        (the site's documented allowance) is not thrown away by one early refusal.
+
+        `used` restarts at zero here: the bucket is spent, so the next period's count starts
+        fresh — which is what makes the next refusal teach the next period's size."""
+        row = self.db.execute("SELECT used, pool FROM credits WHERE site=? AND account=?",
+                              (site, account)).fetchone()
         self.set_credits(site, account, 0, resets_at=refill_at, source="observed")
+        if row and row["used"]:
+            self.db.execute("UPDATE credits SET pool=MAX(pool, ?), used=0 WHERE site=? AND account=?",
+                            (row["used"], site, account))
+            self.db.commit()
+
+    def unproven_dry(self, site: str) -> list:
+        """Accounts on `site` written off by the ledger with NO refill date: remaining <= 0
+        AND resets_at == 0. `available()` can never pick such a pair again, and a refusal
+        that names no period is a date the ledger never learns — so the rotor skips them
+        FOREVER on nothing but the last read. These are probe candidates, not dead ends:
+        the resident of the ledger may be stale (the same site told a DIFFERENT bucket on
+        2026-10-24 that its reset is monthly, Nov 1); if this account is also empty, the
+        site refuses again and the probe costs nothing but a browser run.
+        Ordered the same way the rotation is, so a probe walks the accounts oldest-first
+        and never hammers the one that just ran."""
+        rows = self.db.execute(
+            "SELECT account FROM credits WHERE site=? AND remaining<=0 "
+            "AND (resets_at IS NULL OR resets_at=0)", (site,)).fetchall()
+        accounts = [r["account"] for r in rows]
+        if not accounts:
+            return []
+        return self.rotation(site, accounts)
 
     def available(self, now: float = None) -> list:
         """(site,account) pairs with credit left and not in cooldown — for the

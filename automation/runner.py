@@ -117,6 +117,36 @@ def _observe_credits(st: State, adapter, session, site: str, account: str) -> No
     print(f"  {site}/{account}: observed {n} credits on the site")
 
 
+def _check_identity(st: State, adapter, session, site: str, account: str) -> bool:
+    """Is this session the account we think it is? Ask the SITE, before a credit is spent.
+
+    Three Google accounts share one pool of Chrome profiles, and a refresh that hands account 2
+    the cookies of account 1 is a failure with no visible symptom: a2 spends a1's generation
+    limit, and the per-account credit counts in the ledger — the whole point of tracking them
+    separately — become fiction. The site names the account it is signed in as (Google's avatar
+    carries the address), so this is one cheap check against a real fact.
+
+    Returns True when the session may proceed. A MISMATCH is refused — but only when the site
+    actually said which account it is: an empty answer means unknown, and unknown is not
+    evidence of wrongdoing, so it is allowed through and said out loud."""
+    reader = getattr(adapter, "read_account", None)
+    if reader is None:
+        return True
+    try:
+        email = reader(session)
+    except Exception:
+        return True
+    if not email:
+        return True                            # the page did not say — unknown is not a mismatch
+    if st.account_matches(site, account, email):
+        return True
+    print(f"  {site}/{account}: the session is signed in as {email}, NOT the account this row "
+          f"belongs to — refusing to spend its credit")
+    raise Wall("login", f"wrong account: this session holds {email}, but {site}/{account} is "
+                         f"{st.account_email(site, account) or 'unrecorded'}. The Chrome-profile "
+                         f"pin or the cookie import is pointing at the wrong session.")
+
+
 def _gave_up(job, site: str, detail: str) -> None:
     """One clip out of retries: its job is dead, so the reel it belongs to can never assemble on
     its own. The machine has nothing left here — the reel is locked to ONE site (WAVELENGTH §5),
@@ -200,9 +230,13 @@ def _park_reel(st: State, project: str, why: str) -> int:
     return n
 
 
-def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
+def process_job(st: State, br: Brain, job, headless: bool = True,
+                pick_override: tuple = None) -> str:
     """Drive one clip end to end. Returns final status. Any Wall -> cool down +
-    requeue (not a failure). Each step commits before the next, so a crash resumes."""
+    requeue (not a failure). Each step commits before the next, so a crash resumes.
+
+    `pick_override` = (site, account) skips the scheduler and drives THIS pair — used only
+    by _resume_probe to test one unproven-dry account with a real queued clip."""
     # One reel, one source (the owner's rule, 2026-10-09). Once ANY clip of this project has come
     # back, that site is the reel's lock and nothing else may add a scene to it — pick(strict=True)
     # returns None while it is cooling, so the loop WAITS for the primary instead of filling in from
@@ -225,7 +259,10 @@ def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
     if locked:
         pick = br.pick(want_site=locked, strict=True, need=need, cost_of=_adapter)
         if not pick:
-            return "waiting"
+            if pick_override:
+                pick = pick_override
+            else:
+                return "waiting"
         site = pick[0]
     else:
         if br.wait_for_bid(job["site"]):
@@ -252,6 +289,7 @@ def process_job(st: State, br: Brain, job, headless: bool = True) -> str:
         with _session(site, account, headless) as s:
             adapter.submit(s, job["prompt"])
             st.set_status(job["id"], "rendering")
+            _check_identity(st, adapter, s, site, account)   # the right account, before the spend
             _observe_credits(st, adapter, s, site, account)   # observed > hand-entered
             st.spend_credit(site, account, adapter.credit_cost)
 
@@ -457,8 +495,27 @@ def stitch_done_projects(st: State):
         # meant every pass re-attempted the four legacy reels, ran the vision style pre-flight over
         # ~18 of their clips and rejected them for the medium their own identity never declared.
         import qc
-        if any(os.path.exists(os.path.join(pdir, f)) for f in qc.Reel.FINALS):
-            continue                                  # already finished — never overwrite a cut
+        finals_here = [os.path.join(pdir, f) for f in qc.Reel.FINALS
+                       if os.path.exists(os.path.join(pdir, f))]
+        if finals_here:
+            cut = max(finals_here, key=os.path.getmtime)
+            # A finished cut is left alone — EXCEPT one that predates its own captions.
+            # diwali-purana-sandook (2026-10-23): the cut was stitched with no captions.json on
+            # disk (the caption pass was stalled on a gateway outage), this guard then made the
+            # absence permanent, and the caption pass only ever wrote the artifacts while
+            # nothing could re-stitch. So the guard listens for exactly that one stale-cut
+            # condition: a caption SPEC file newer than the cut means the cut predates its own
+            # words — archive it and re-stitch below. Specs only (captions*.json), never the
+            # card PNGs: build re-renders those itself, so counting them re-stitches every pass.
+            specs = sorted(os.path.join(pdir, f) for f in os.listdir(pdir)
+                           if f.startswith("captions") and f.endswith(".json")) \
+                if os.path.isdir(pdir) else []
+            newer = [f for f in specs if os.path.getmtime(f) > os.path.getmtime(cut)]
+            if not newer:
+                continue                              # already finished — never overwrite a cut
+            _archive_cut(pdir)
+            print(f"  {project}: cut predates its captions "
+                  f"({', '.join(os.path.basename(f) for f in newer)}) — archiving and re-stitching")
         paths = [c["video_path"] for c in clips]
         missing = [p for p in paths if not p or not os.path.exists(p)]
         if missing:
@@ -585,6 +642,49 @@ def _findings(v: dict) -> dict:
     return out
 
 
+def _refused_recently(st: State, site: str, account: str, hours: float = 24.0) -> bool:
+    """Did the SITE itself answer about this account recently? Then its answer is current
+    knowledge — do not re-ask. The probe exists for accounts the ledger has NOT heard from
+    (2026-10-24: googlevids/a1 sat at 0 with no refill date since Oct 21–22's refusals while
+    the SAME site told a3 that month's reset is monthly, Nov 1), not for an account that was
+    refused an hour ago."""
+    try:
+        rows = st.recent_lessons(site, account, kind="credits", limit=1)
+    except Exception:  # noqa: BLE001 — a ledger that will not answer must not cost a probe
+        return False
+    return bool(rows) and (time.time() - rows[0]["created"]) < hours * 3600.0
+
+
+def _resume_probe(st: State, br: Brain, job, locked: str, headless: bool = True):
+    """ONE probe per run, exactly when a locked reel's own source can produce nothing.
+
+    `available()` can never offer an account that is at 0 with NO refill date again — for a
+    refusal that named no period, that date never arrives, so the rotor would skip it
+    forever while the site may have refilled (and the reel locked on this source would wait
+    with it: one reel, one source). This walks the unproven-dry accounts oldest-first and
+    drives the NEXT QUEUED CLIP at the first one: the probe IS the production try. A
+    refilled account just renders the reel's real clip; an empty one is refused at submit
+    (no generation spent, no retry burned — the credits-wall handler keeps `retries`) and
+    the ledger learns the date from the site's own words. Either way the answer is real,
+    verified by the site, replacing a ledger entry nobody confirmed.
+
+    Refusals of today are not stale knowledge — _refused_recently keeps those out. Returns
+    the probe's process_job result, or None (no probe: not locked, a short cooldown, a
+    funded-but-busy source, nothing unproven)."""
+    if not locked or br.pick(want_site=locked, strict=True) or br.wait_for_bid(locked):
+        return None
+    cands = [a for a in st.unproven_dry(locked) if not _refused_recently(st, locked, a)]
+    if not cands:
+        return None
+    account = cands[0]
+    print(f"  {job['project']}: '{locked}' can produce nothing right now, but "
+          f"{locked}/{account} is marked dry with NO refill date — a ledger entry nobody "
+          f"has verified. Probing it with the REAL next clip: a refilled account just "
+          f"renders it; an empty one is refused at submit for nothing."
+          f"  ({st.credit_line(locked, account)})")
+    return process_job(st, br, job, headless=headless, pick_override=(locked, account))
+
+
 def loop(once: bool = False, headless: bool = True):
     st, br = State(), Brain()
     # 0) prime the brain: re-seed its canonical lessons so one added to qc.LESSONS since the last
@@ -616,6 +716,9 @@ def loop(once: bool = False, headless: bool = True):
         if r == "waiting":                           # the reel's own source is cooling/dry
             print("the reel's source is cooling down or out of credit — waiting on it rather "
                   "than adding a scene from another site; will resume next run.")
+            _pr = _resume_probe(st, br, job, st.project_site(job["project"]), headless=headless)
+            if _pr:
+                print(f"  probe finished ({_pr})")
             break
         if once:
             break
@@ -783,6 +886,85 @@ if __name__ == "__main__":
         assert runner.process_job(st, br, _jr, headless=True) != "waiting", \
             "the wait must end the moment the reel's own source is available again"
         print("OK: one reel = one source — a locked reel WAITS for its own site, never mixes")
+
+        # THE RESUME PROBE (owner ask, 2026-10-24): the three Google accounts sit in one
+        # rotation, and an account refused with NO period in its words lands in the ledger as
+        # 0 with no refill date — which `available()` can never pick again, so the rotor
+        # skips it FOREVER while the site may have refilled. At the moment a locked reel is
+        # about to stop on that very source, the loop PROBES the unproven account with the
+        # real queued clip instead of waiting in the dark: a refilled account just renders
+        # it; an empty one is refused at submit for nothing, and the ledger learns the date
+        # from the site's own words. The lock here is EARNED — clip 0 really rendered on
+        # googlevids, so project_site() owns the reel and the probe can never open it to
+        # another site.
+        _saved_adapter = runner._adapter
+        pkt = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+        pkb = Brain(pkt)
+        pkt.set_credits("googlevids", "p1", remaining=2)      # funded at the reel's start
+        pkt.set_credits("flow", "f1", remaining=50)           # the healthy tier: must NOT be touched
+
+        def _probe_adapter(empty_line):
+            def submit(s, prompt):
+                if empty_line:
+                    raise Wall("credits", empty_line, refill="monthly")
+            def download(s, dest):                # a real file — the first look must pass it
+                import subprocess as _sp
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                _sp.run(["ffmpeg", "-y", "-f", "lavfi",
+                         "-i", "testsrc=size=720x1280:rate=24:duration=4",
+                         "-f", "lavfi", "-i", "sine=frequency=440:d=4",
+                         "-pix_fmt", "yuv420p", "-shortest", dest],
+                        capture_output=True, check=True)
+                return dest
+            return types.SimpleNamespace(name="googlevids", credit_cost=1, submit=submit,
+                                         poll=lambda s: "done",
+                                         download=download,
+                                         read_credits=lambda s: None)
+
+        good = _probe_adapter(None)                    # the account works while it has credit
+        dry = _probe_adapter("You've reached your monthly limit. Wait until Nov 1 at 12:30 "
+                             "PM for limits to reset or upgrade now.")
+        pkt.add_job("probe-proj", 0, "a scene that renders", site="googlevids")
+        _p0 = pkt.db.execute("SELECT * FROM jobs WHERE project='probe-proj'").fetchone()
+        runner._adapter = lambda site: good
+        assert runner.process_job(pkt, pkb, _p0, headless=True) == "done"
+        assert pkt.project_site("probe-proj") == "googlevids", \
+            "the test must earn the lock: project_site() comes from a DONE clip"
+        pkt.add_job("probe-proj", 1, "the reel's own next scene", site="googlevids")
+        _p1 = pkt.db.execute("SELECT * FROM jobs WHERE project='probe-proj' AND idx=1").fetchone()
+        # the bucket ran out WITHOUT the site naming a period: 0, no refill date — unproven dry
+        pkt.db.execute("UPDATE credits SET remaining=0, resets_at=0 "
+                       "WHERE site='googlevids' AND account='p1'")
+        pkt.db.commit()
+        runner._adapter = lambda site: dry
+        assert runner.process_job(pkt, pkb, _p1, headless=True) == "waiting"
+        # (a) a site that refused THIS account within the last day already answered — do not re-ask
+        pkb.hit_wall("googlevids", "p1", "credits", detail="refused within the hour")
+        assert runner._resume_probe(pkt, pkb, _p1, "googlevids", headless=True) is None, \
+            "a fresh site refusal is current knowledge, not stale — wait, do not re-ask"
+        # (b) an unproven one (no site answer in 24h) IS probed, once, with the real clip
+        pkt.db.execute("DELETE FROM lessons"); pkt.db.commit()
+        assert runner._resume_probe(pkt, pkb, _p1, "googlevids", headless=True) == "dry"
+        assert pkt.project_clips("probe-proj")[0]["site"] == "googlevids", \
+            "the probe renders the reel's OWN source — it never opens the reel to another site"
+        assert pkt.db.execute(
+            "SELECT MAX(remaining) FROM credits WHERE site='flow'").fetchone()[0] == 50, \
+            "the probe must not touch a site the reel is not locked on"
+        _row = pkt.db.execute("SELECT remaining, resets_at, source FROM credits "
+                             "WHERE site='googlevids' AND account='p1'").fetchone()
+        assert _row["remaining"] == 0 and _row["source"] == "observed", dict(_row)
+        assert _row["resets_at"] > time.time() + 5 * 24 * 3600, \
+            (f"the site's OWN monthly words must reach the ledger as a real future date, "
+             f"got {dict(_row)} — the daily default woke a day early twice on 2026-10-24")
+        # (c) once refused, the account is PROVEN dry — never probed again this period
+        assert pkt.unproven_dry("googlevids") == [], dict(_row)
+        assert runner._resume_probe(pkt, pkb, _p1, "googlevids", headless=True) is None, \
+            "a proven-dry account must be waited on, not re-probed"
+        # (d) a reel with no lock (or a merely-cooling bid) never triggers a probe
+        assert runner._resume_probe(pkt, pkb, _p1, None, headless=True) is None
+        runner._adapter = _saved_adapter
+        print("OK: the resume probe asks ONE dry-without-date account per run, with the "
+              "real clip it would render — verified facts replace unverified dryness")
 
         # WHOLE-REEL FAILOVER (owner, 2026-10-10): before ANY clip lands, a dry primary moves the
         # ENTIRE reel to the next waterfall site, and every queued scene follows. Once a clip is
@@ -1220,6 +1402,45 @@ if __name__ == "__main__":
         assert [c["name"] for c in _ctx.cookies()] == ["fresh"], \
             "a working refresh must not be rolled back"
         print("OK: a refresh that lands on a login wall keeps the previous session")
+
+        # THE ACCOUNT IDENTITY CHECK. Three Google accounts share one pool of Chrome profiles,
+        # and the failure this prevents is invisible: account 2 holding account 1's session,
+        # spending account 1's generation limit, and the per-account credit counts — the whole
+        # point of tracking them separately — turning into fiction.
+        ist = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+        ist.set_pool("googlevids", "a2", 50, email="cherishdhingra1234@gmail.com")
+
+        class _Sess:
+            def __init__(self, email): self.email = email
+            def __getattr__(self, _k): raise AttributeError
+        class _Pg:
+            def __init__(self, email): self.email = email
+            def evaluate(self, _js): return self.email
+        def _session(email):
+            s = _Sess(email); s.page = _Pg(email); return s
+        class _Ad:
+            def read_account(self, session): return session.page.email
+        _ad = _Ad()
+        # the right account -> it proceeds
+        assert runner._check_identity(ist, _ad, _session("cherishdhingra1234@gmail.com"),
+                                      "googlevids", "a2") is True, \
+            "the session holding the right account must be allowed to spend"
+        # the WRONG account -> refused before a credit is spent
+        try:
+            runner._check_identity(ist, _ad, _session("cherishdhingra12@gmail.com"),
+                                   "googlevids", "a2")
+            raise AssertionError("a session holding another account must be refused")
+        except Wall as w:
+            assert w.kind == "login", w.kind
+            assert "wrong account" in w.detail, w.detail
+        # the page says NOTHING -> unknown is not evidence, so it is allowed through
+        assert runner._check_identity(ist, _ad, _session(""), "googlevids", "a2") is True, \
+            "a page that does not say which account it is must not be treated as a mismatch"
+        # no adapter that can read an account -> the check is skipped, not failed
+        assert runner._check_identity(ist, object(), _session("x"), "googlevids", "a2") is True, \
+            "a site that cannot name its account must not block the job"
+        print("OK: the right account may spend; a session holding ANOTHER account is refused "
+              "before the credit is spent; an unknown account is not a mismatch")
 
         print("OK: hermetic self-check (temp dirs) + craft-gate verdict persisted")
         print("OK: observed balance updates the count before spend; a failed read never blocks a job")

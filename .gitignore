@@ -37,3 +37,14 @@ automation/model_picks.json
 
 # open crises: a to-do list of the stops waiting on a person, not code
 crises/
+
+# stray artifacts that belong nowhere in the tree:
+#  - a 0-byte leftover DB that once shadowed the live root state.db
+#  - a leading-space " automation" dir (typo'd copy of automation/)
+#  - caption test-litter dropped at repo root by a cwd run of a self-check
+automation/state.sqlite3
+automation/script_enforcer.py.cleaned   # stale intermediate of the enforcer (the .py is the working copy)
+[ ]automation/                         # a typo'd " automation" dir that once shadowed automation/
+/caption_cta.png
+/caption_hook.png
+/caption_moral.png

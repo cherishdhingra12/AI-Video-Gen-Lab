@@ -771,6 +771,145 @@ def check_caption_on_face(reel):
     return probs
 
 
+def check_captions_burned(reel):
+    """Are the cards actually IN the shipped cut, visible in its own frames?
+
+    craft-layers checks that caption_*.png exist on disk, but the cut is a separate artifact: a
+    reel can carry its cards as FILES and still ship a cut none of them appear in. diwali-
+    purana-sandook (2026-10-23) shipped exactly that — the cut was stitched while the caption
+    pass was stalled on an outage, the runner's never-overwrite-a-cut guard then made the
+    absence permanent, and the file-presence gate cleared the moment the cards were rendered.
+    Nothing asked the video itself. This does, using the assembler's own recorded placement
+    (caption_place.json) and the burn's own signature.
+
+    The assembler overlays each card with fade=t=in from the window's start and fade=t=out into
+    its end — so where a card IS burned, its glyph ink BRIGHTENS (a full-scale rise) across the
+    fade-in span and DIMS (a full-scale fall) across the fade-out, while the scene between the
+    glyphs (same box, same moments) moves only with the scene. One direction alone can be faked
+    by a scene's own lighting change; the PAIR cannot — a lamp flickering once does not reverse
+    on schedule at the recorded end minus fade. So the ink-vs-control change must be ≥ FADE_RISE
+    across the fade-in and ≤ −FADE_RISE across the fade-out. Offline, deterministic, no vision
+    gateway.
+
+    A MISSING placement or card is craft-layers' finding, not this check's: this only reacts
+    when both exist and the pixels still do not carry them."""
+    if not reel.final:
+        return []
+    p = os.path.join(reel.dir, "caption_place.json")
+    if not os.path.exists(p):
+        return []                                     # craft-layers owns "no placement"
+    cards = {os.path.basename(c)[len("caption_"):-len(".png")]: c for c in reel.captions}
+    import io
+    import numpy as np
+    from PIL import Image
+    # The pairs land mid-fade (the window's own edges pace them), so a CORRECT burn reads
+    # ~110–250, not full scale; everything unburned reads |rise| < 5. 60 keeps the burned
+    # margin comfortable and stays ~50x above unburned scene noise.
+    FADE_RISE = 60.0
+    probs = []
+    d = _duration(reel.final)
+    try:
+        place = json.load(open(p, encoding="utf-8"))
+        if not isinstance(place, dict):
+            place = {}
+    except Exception:  # noqa: BLE001 — an unreadable placement is craft-layers' business, never this gate's
+        return []
+    for kind, w in sorted(place.items()):
+        if not (isinstance(w, dict) and "start" in w and "end" in w):
+            continue
+        png = cards.get(kind)
+        if not png:
+            continue                                  # craft-layers owns "no card file"
+        card = Image.open(png).convert("RGBA")
+        a = np.asarray(card.getchannel("A"), dtype=np.uint8)
+        g = np.asarray(card.convert("L"), dtype=np.float32)
+        try:
+            y0, y1 = max(0, int(w["y0"])), min(a.shape[0], int(w["y1"]) + 1)
+            x0, x1 = max(0, int(w["x0"])), min(a.shape[1], int(w["x1"]) + 1)
+            cs, ce = float(w["start"]), float(w["end"])
+        except (KeyError, TypeError, ValueError):
+            probs.append(f"caption_{kind}.png: the placement record has no usable ink box or "
+                         "window — every check that samples it reads the wrong frames")
+            continue
+        span = ce - cs
+        if span <= 0.05 or d <= 0:
+            probs.append(f"caption_{kind}.png: window {cs:.2f}-{ce:.2f}s is not a usable span "
+                         f"with the cut at {d:.2f}s")
+            continue
+        ink = (a[y0:y1, x0:x1] > 200) & (g[y0:y1, x0:x1] > 180)   # solid bright glyph cores
+        ctrl = (a[y0:y1, x0:x1] < 100)                            # between-glyph scene window
+        # A card that paints its whole ink box (an opaque scrim with letters on it) has NO
+        # between-glyph pixels — the empty control would make every measurement a NaN and the
+        # "not enough to judge" bail-out would silently pass exactly the cards that need the
+        # scrutiny. Fall back to a scene band just OUTSIDE the box, same columns, where the
+        # card paints nothing: the scene's own change, read next door to the glyph.
+        band_h = 24
+        if ctrl.sum() < 50:
+            rows = [(max(0, y0 - band_h), y0), (y1, min(a.shape[0], y1 + band_h))]
+        else:
+            rows = [(y0, y1)]
+        if ink.sum() < 50:
+            continue                              # not enough ink to judge — others hold the line
+
+        def bright(t):
+            t = max(0.0, min(d - 0.001, t))
+            r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", reel.final,
+                                "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+                               capture_output=True)
+            if not r.stdout:
+                return None
+            f = np.asarray(Image.open(io.BytesIO(r.stdout)).convert("L"), dtype=np.float32)
+            if f.shape != a.shape:
+                return None
+            ink_box = f[y0:y1, x0:x1]
+            if not ink.any():
+                return None
+            # in-box control first; when the card paints its whole box, average the outer
+            # bands instead — the scene's own change, read next door to the glyph
+            if ctrl.sum() >= 50:
+                c = float(ink_box[ctrl].mean())
+            else:
+                bands = [f[r0:r1, x0:x1] for (r0, r1) in rows if r1 > r0]
+                if not bands:
+                    return None
+                c = float(np.mean([b.mean() for b in bands]))
+            return float(ink_box[ink].mean()), c
+
+        # Sample the ink-vs-control gap at five points INSIDE the window and just OUTSIDE
+        # both edges, then demand the inside samples clear the outside level by a margin. The
+        # The burn's ramps can sit anywhere in the window (overlay+fade interacts with the
+        # stream rate), and a card can show for only a span of frames — so sampled densely and
+        # with an early bias: no single mid-fade pair is a reliable fingerprint, but "the ink
+        # pixels are bright above their neighbourhood at some sampled moment inside the
+        # window, and dim outside it" is true of every correct burn and false of a cut the
+        # cards are not in (its gap stays flat). Opposite-window burns at the same box are the
+        # residual blind spot, and cross-card ink is accepted rather than invented detection.
+        probe = [0.02, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.98]
+        ts_in = [cs + p * span for p in probe]
+        t_pre = cs - 0.35
+        t_post = ce + 0.35
+        ts_out = [t for t in (t_pre, t_post)
+                  if 0.05 <= t <= d - 0.06
+                  and not (cs - 0.13 <= t <= cs + 0.13 or ce - 0.13 <= t <= ce + 0.13)]
+        ON = 80.0
+        gaps_in = []
+        gaps_out = []
+        for t in ts_in + ts_out:
+            g = bright(t)
+            if g is None:
+                continue
+            (gaps_in if t in ts_in else gaps_out).append(g[0] - g[1])
+        if gaps_in and gaps_out:
+            on = max(gaps_in) - min(gaps_out)
+            if abs(on) >= ON:
+                continue                          # the card's ink IS in the shipped pixels
+        probs.append(f"caption_{kind}.png: NOT visibly in the cut (ink-gap on/off "
+                     f"{['%+.0f' % x for x in gaps_in]}/{['%+.0f' % x for x in gaps_out]} "
+                     f"vs margin {ON:.0f} needed at {cs:.2f}-{ce:.2f}s) — the cards are "
+                     "files, not pixels; the cut predates the captions")
+    return probs
+
+
 def check_caption_wording(reel):
     """Do the caption CARDS say the right thing, in correct Hindi? — layer 2 of the caption gate.
 
@@ -810,6 +949,7 @@ def check_caption_wording(reel):
 
 CHECKS = {"playable": check_playable, "caption-safe-area": check_caption_safe_area,
           "caption-on-face": check_caption_on_face, "caption-wording": check_caption_wording,
+          "captions-burned": check_captions_burned,
           "realism": check_realism, "craft-layers": check_craft_layers,
           "reel-folder": check_reel_folder,
           "no-synth-voiceover": check_no_synth_voiceover,
@@ -862,6 +1002,16 @@ LESSONS = [
     dict(slug="caption-safe-area", check_id="caption-safe-area", severity="block",
          title="On-screen text clears the bottom 15% and far-right edge",
          why="the IG app paints the handle, caption, audio row and action buttons there"),
+    dict(slug="captions-burned", check_id="captions-burned", severity="block",
+         title="The cards are IN the shipped cut — files on disk are not the reel",
+         why="diwali-purana-sandook (2026-10-23) shipped with its hook/moral/CTA nowhere in the "
+             "video: the cut was stitched while the caption pass was stalled, the assembler "
+             "silently skipped the cards (no captions.json yet), and the runner's "
+             "never-overwrite-a-cut guard then blocked every retry — while craft-layers, which "
+             "checks the card FILES, cleared as soon as the PNGs were rendered. This is the gate "
+             "that asks the video: sample the cut at the assembler's own recorded windows and "
+             "look for the burn's fade signature on the card's own ink, against the scene "
+             "between the glyphs"),
     dict(slug="caption-never-on-a-face", check_id="caption-on-face", severity="block",
          title="A caption card NEVER overlaps a face — it sits in the frame's empty band",
          why="the owner caught the opening title printed straight across the grandfather's face. "
