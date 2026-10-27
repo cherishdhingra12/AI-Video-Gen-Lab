@@ -35,8 +35,11 @@ from vision import read_state
 class Flow(SiteAdapter):
     name = "flow"
     home = "https://flow.google.com/"
-    credit_cost = 12                 # the menu's own words: 'Generating will use 12 credits'
-                                     # (Video · 720p · 8s · x1) — re-read live on every submit
+    credit_cost = 10                 # the menu's own words with MODEL selected (Veo 3.1 - Lite):
+                                     # 'Generating will use 10 credits' — re-read live on every
+                                     # submit. Measured 2026-10-27 at 8s/720p/9:16/x1:
+                                     # Lite 10 · Omni 1.1 Flash 12 · Fast 20 · Quality 100
+                                     # (was 12, then 20 while the menu's Fast default rode through).
     aspect = "9:16"
     needs_cookie_refresh = True      # Google session cookies rotate fast — re-import each run
     cookie_keywords = ["google"]
@@ -171,6 +174,28 @@ class Flow(SiteAdapter):
                 pass
 
     # ---- contract ----------------------------------------------------------
+    # THE MODEL IS CHOSEN, NOT INHERITED (owner ruling, 2026-10-27): the menu's default was
+    # 'Veo 3.1 - Fast' at 20 credits while 'Veo 3.1 - Lite' renders the same 8s/720p/9:16 clip
+    # at 10 — every generation was costing double for nothing. The selection also PERSISTS
+    # across sessions on the account, so whatever a probe or a hand session left behind would
+    # otherwise ride through here. Hence MODEL is set explicitly on every submit.
+    MODEL = "Veo 3.1 - Lite"
+
+    def _select_model(self, session) -> bool:
+        """Explicitly select MODEL in the open settings menu. The select row shows the CURRENT
+        model's name (Veo ... or Omni ...); clicking it opens the option list above it. The
+        second click is idempotent when the model is already the right one."""
+        pg = session.page
+        try:
+            pg.locator("text=/Veo 3\\.1|Omni 1\\.1/i").last.click(timeout=8000)
+            time.sleep(1.5)
+            pg.get_by_text(self.MODEL, exact=True).last.click(timeout=8000)
+            time.sleep(1.5)
+            return True
+        except Exception:
+            return self.heal_click(
+                session, f"the model option named '{self.MODEL}' in the open model list")
+
     def submit(self, session, prompt: str):
         step = print                                      # step trace: the site drifts, and a
         pg = session.page                                 # blind wall costs three retries of a branch
@@ -205,6 +230,11 @@ class Flow(SiteAdapter):
                                   "the generation-settings chip in the prompt bar"):
             raise Wall("selector", "Flow settings chip not found — not even via vision self-heal")
         time.sleep(2)
+        if not self._select_model(session):
+            raise Wall("selector",
+                       f"Flow model '{self.MODEL}' could not be selected — not even via vision self-heal")
+        self._click_role(session, "Settings trigger")   # a model choice can close the menu
+        time.sleep(1.5)
         m = re.search(r"(\d+)\s*credits", self._body(session))
         if m and int(m.group(1)) > 0:
             self.credit_cost = int(m.group(1))            # observed like every other number
