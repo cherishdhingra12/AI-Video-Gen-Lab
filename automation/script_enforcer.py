@@ -8,6 +8,16 @@ class of mistake, not chase every historical instance. So this is the enforcemen
 script-critic families from SKILLS.md: hook, shape, concrete, dialogue, budget, moral, sameness, length.
 
 It lives OUTSIDE agents.py on purpose: the critic's _SCRIPT_CRITIC prompt is the natural-language
+------------------------------------------------------------------------------
+NOT WIRED, on evidence (2026-10-27): check() was written against an ASSUMED script format
+(HOOK:/BEATS:/DIALOGUE: sections) but the house writes `## Beats` with dialogue inline and the
+moral under `## Captions` — so on the real format this check FALSE-HOLDS a gate-PASS reel
+(aawaaz: "[moral] the moral reads as a platitude..."). The pipeline's real pre-credit gates are
+agents.critique_script (STORY.md, 2 rewrite rounds) and agents.validate_plan (every prompt must
+carry the medium lead, style anchor, NO_TEXT, anti-photoreal, character lock, <=4000 chars —
+exit 2 before any job is queued). Wiring THIS module is TODO.md §6 and starts with teaching
+_sections the real format, then re-running the calibration against all three gate-PASS scripts.
+------------------------------------------------------------------------------
 """
 from __future__ import annotations
 
@@ -52,13 +62,16 @@ def _sections(script: str) -> dict:
 
 def _spoken_lines(script: str) -> list[tuple[str, str | None]]:
     """Return (text, seconds) pairs for every row the script claims is spoken, plus None seconds
-    for rows that carry dialogue but no timing so the caller can still count words."""
+    for rows that carry dialogue but no timing so the caller can still count words. A row's
+    timing, when it has one, is a trailing 'NNs' / 'NN sec' marker; a line without one is still
+    returned, with None — the caller counts its words either way."""
     rows: list[tuple[str, str | None]] = []
-    for text, sec in _sections(script).get("DIALOGUE", "").splitlines():
-        text = text.strip()
+    for line in _sections(script).get("DIALOGUE", "").splitlines():
+        text = line.strip()
         if not text or text.upper().startswith(("MORAL", "CTA")):
             continue
-        rows.append((text, sec.strip() if sec else None))
+        m = re.search(r"\b(\d{1,2}(?:\.\d)?)\s*s(?:ec)?\b\.?$", text)
+        rows.append((text, m.group(1) if m else None))
     return rows
 
 
