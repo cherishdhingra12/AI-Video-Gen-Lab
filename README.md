@@ -28,9 +28,10 @@ and reroutes only when Vids is cooling down or out of credit. It is credit-sorte
 quality-ordered — there is no quality ranking between sites.
 
 Multiple email accounts per site multiply the daily free ceiling. Credit counts: **verify at
-signup** (`login.py --credits N` stores that first number as `manual`) — then every runner
-pass re-reads each account's real balance off the site and stores it as `observed`, so
-`brain.py` reports live numbers with their read age, not signup guesses. Nothing about credits
+signup** (`login.py --credits N` stores that first number as `manual`) — and before any reel
+chooses its source, the runner's balance sweep asks every choosable account's site what it
+ACTUALLY holds and stores the answer as `observed`, so the choice is made on the site's own
+numbers, not signup guesses (`runner.py --sweep` runs it standalone). Nothing about credits
 is hardcoded.
 
 The house rules live in **`WAVELENGTH.md`** — medium, subject, narration, captions, identity.

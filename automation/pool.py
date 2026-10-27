@@ -2,8 +2,10 @@
 pool.py — the Google account pool: three accounts, one cycle, an honest credit count.
 
 The owner's setup (2026-10-22): three Google accounts on Vids AND Flow. When one is exhausted
-the load moves to the next, in a WATERFALL (fullest-first: a1 drains before a2 before a3, and
-all of Vids before all of Flow), and the machine heals itself. And — the part that
+the load moves to the next in the owner's fixed CHAIN (2026-10-27): a1, then a2, then a3, and
+all of Vids before any of Flow — and the machine heals itself. Neither site shows a balance
+anywhere, so the count is DERIVED and the figures never decide the order; only the site's own
+refusal moves the chain on. And — the part that
 matters most — the credits left in each account must be tracked ACCURATELY, because Google Vids
 shows no balance anywhere (confirmed live 2026-10-22: the home page, /settings, /account and
 /usage all render the same body with no counter; labs.google/fx/tools/veo is deprecated).
@@ -18,9 +20,9 @@ So the count is DERIVED, not read:
 
 Until a refusal has happened the count is a hand-entered estimate and says so.
 
-The cycle needs no separate cursor: `used_at` says who ran last, so the account that has been
-idle longest goes next (state.rotation). An account that is dry, cooling or signed out is
-skipped, and the next one takes the job.
+The chain needs no separate cursor and no figure: `state.rotation` returns the accounts in
+their fixed order (a1, a2, a3), and an account that is cooling, refused-until-refill or signed
+out is skipped, so the next one takes the job.
 
     python3 automation/pool.py --list                 # what the ledger believes, per account
     python3 automation/pool.py --setup                # register the three accounts on both sites

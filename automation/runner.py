@@ -120,6 +120,82 @@ def _observe_credits(st: State, adapter, session, site: str, account: str) -> No
     print(f"  {site}/{account}: observed {n} credits on the site")
 
 
+SWEEP_MAX_AGE = 3600.0    # a balance observed within the last hour is fresh enough to choose on
+
+
+def sweep_balances(st: State, headless: bool = True, max_age: float = None,
+                   sites=None, log=print) -> dict:
+    """Ask every site the scheduler can actually choose, what it ACTUALLY holds — before any
+    reel chooses its source (owner rule, 2026-10-27).
+
+    A ledger number is only as good as its last read: a hand-entered 50 hides an account the
+    site has already emptied, and a stale 0 hides one that refilled — either way `Brain.pick`
+    hands a reel to a source that cannot carry it. So the site itself is asked, and its answer
+    is recorded `observed`. Google Vids has no counter anywhere (confirmed live 2026-10-22),
+    so it answers None and its derived count stands — that IS the honest read for that site.
+
+    The sweep refreshes exactly the set `pick()` ranks — `st.available()` — and nothing else:
+    a pair that is cooling is not visited (stepping back means stepping back), and a dry pair
+    whose refill has not arrived cannot be picked, so visiting it would only buy a page view.
+    Reviving a 0/no-refill row stays a human command (`login.py --check`).
+
+    House rules are not touched: this runs BEFORE pick and pick still decides everything —
+    the Vids -> Flow waterfall, one reel one source, affordability. The sweep only makes sure
+    the decision is made on the site's own numbers.
+
+    Fail-open everywhere: a signed-out session, a dead site, a crashed read — the row survives
+    and the run continues. A session the site NAMES as another account records nothing: a1's
+    balance must never be written into a2's row (pool.py's disaster). Returns a summary dict
+    {observed, unreadable, skipped, mismatch, failed} for the report and the self-check."""
+    out = {"observed": [], "unreadable": [], "skipped": [], "mismatch": [], "failed": []}
+    now = time.time()
+    for c in st.available():
+        site, account = c["site"], c["account"]
+        if sites and site not in sites:
+            continue
+        if max_age is not None:
+            row = st.db.execute("SELECT updated FROM credits WHERE site=? AND account=?",
+                                (site, account)).fetchone()
+            if row and (now - row["updated"]) < max_age:
+                out["skipped"].append((site, account, "fresh"))
+                continue
+        try:
+            adapter = _adapter(site)
+            if getattr(adapter, "needs_cookie_refresh", False):
+                _refresh_cookies(site, account, getattr(adapter, "cookie_keywords", []))
+            with _session(site, account, headless=headless) as s:
+                s.goto(adapter.home)
+                time.sleep(4)      # SPA hydration: a screenshot taken too early sees the
+                                   # loading shell, not the number (flow/a1, 2026-10-27)
+                # whose session is this? a refresh that handed a1's cookies to a2 must not
+                # write a1's balance into a2's row — ask the site before recording anything.
+                who = None
+                reader = getattr(adapter, "read_account", None)
+                if reader is not None:
+                    try:
+                        who = reader(s)
+                    except Exception:                    # noqa: BLE001
+                        who = None
+                if who and not st.account_matches(site, account, who):
+                    out["mismatch"].append((site, account, who))
+                    log(f"  sweep: {site}/{account} holds {who} — NOT this account; "
+                        f"balance not recorded")
+                    continue
+                n = read_balance(adapter, s)
+        except Exception as e:                           # noqa: BLE001
+            out["failed"].append((site, account))
+            log(f"  sweep: {site}/{account} could not be read ({str(e)[:90]})")
+            continue
+        if n is None:
+            out["unreadable"].append((site, account))
+            log(f"  sweep: {site}/{account} — the page did not state a balance; ledger untouched")
+            continue
+        st.observe_credits(site, account, n)
+        out["observed"].append((site, account, n))
+        log(f"  sweep: {site}/{account} — {n} credits observed on the site")
+    return out
+
+
 def _check_identity(st: State, adapter, session, site: str, account: str) -> bool:
     """Is this session the account we think it is? Ask the SITE, before a credit is spent.
 
@@ -283,6 +359,13 @@ def process_job(st: State, br: Brain, job, headless: bool = True,
             # projects' queued jobs too. Fine while one reel is in flight at a time (how this
             # house runs); skip-to-the-next-project if a second reel is ever queued alongside.
             return "waiting"                               # a short cooldown is not a dead end
+        # The choice of source is about to be made — make it on the site's own numbers
+        # (owner rule, 2026-10-27): anything observed within the last hour stands, the rest
+        # is re-read now. Fail-open; pick() below still decides everything.
+        try:
+            sweep_balances(st, headless=headless, max_age=SWEEP_MAX_AGE)
+        except Exception as e:  # noqa: BLE001
+            print(f"  pre-choice balance sweep skipped ({str(e)[:90]})")
         pick = br.pick(want_site=job["site"], strict=False, need=need, cost_of=_adapter)
         if not pick:
             return "waiting"                                # nothing attackable right now
@@ -684,7 +767,8 @@ def _resume_probe(st: State, br: Brain, job, locked: str, headless: bool = True)
     Refusals of today are not stale knowledge — _refused_recently keeps those out. Returns
     the probe's process_job result, or None (no probe: not locked, a short cooldown, a
     funded-but-busy source, nothing unproven)."""
-    if not locked or br.pick(want_site=locked, strict=True) or br.wait_for_bid(locked):
+    if not locked or br.pick(want_site=locked, strict=True, proven_only=True) \
+            or br.wait_for_bid(locked):
         return None
     cands = [a for a in st.unproven_dry(locked) if not _refused_recently(st, locked, a)]
     if not cands:
@@ -707,6 +791,13 @@ def loop(once: bool = False, headless: bool = True):
         _qc.seed(st)
     except Exception as e:  # noqa: BLE001
         print(f"  brain preflight skipped ({str(e)[:100]})")
+    # 0.5) the ledger's numbers are only as good as their last read: before any reel chooses
+    # its source, ask every choosable site what it ACTUALLY holds (owner rule, 2026-10-27).
+    # Fail-open — a sweep that cannot run must never stop the run.
+    try:
+        sweep_balances(st, headless=headless)
+    except Exception as e:  # noqa: BLE001
+        print(f"  balance sweep skipped ({str(e)[:100]})")
     # 1) resume anything caught mid-flight by a shutdown — as if it never happened
     for job in st.resume():
         # NEVER RE-SUBMIT A RENDER THAT ALREADY EXISTS: a shutdown between the download and the
@@ -945,9 +1036,11 @@ if __name__ == "__main__":
             "the test must earn the lock: project_site() comes from a DONE clip"
         pkt.add_job("probe-proj", 1, "the reel's own next scene", site="googlevids")
         _p1 = pkt.db.execute("SELECT * FROM jobs WHERE project='probe-proj' AND idx=1").fetchone()
-        # the bucket ran out WITHOUT the site naming a period: 0, no refill date — unproven dry;
-        # FLOW is also dry with no refill date, so the whole Google family has nothing —
-        # the reel WAITS until the probe below can ask googlevids/p1 whether it refilled.
+        # THE OWNER'S CHAIN (2026-10-27): an unproven 0 — the site has never answered — is a
+        # guess, and a guess may not gate the chain. The reel ATTEMPTS the site, and the
+        # refusal (free: no generation happens when the site is out) moves the chain on:
+        # googlevids/p1 refuses with its monthly words, the family falls to flow/f1, which
+        # refuses too; only then does the reel WAIT.
         pkt.db.execute("UPDATE credits SET remaining=0, resets_at=0 "
                        "WHERE site='googlevids' AND account='p1'")
         pkt.db.execute("UPDATE credits SET remaining=0, resets_at=0 "
@@ -955,8 +1048,19 @@ if __name__ == "__main__":
         pkt.db.commit()
 
         runner._adapter = lambda site: dry
+        _r = runner.process_job(pkt, pkb, _p1, headless=True)
+        assert _r == "dry", f"the chain attempts an unproven 0 — the site refuses for free: {_r}"
+        assert pkt.db.execute("SELECT resets_at FROM credits "
+                              "WHERE site='googlevids' AND account='p1'").fetchone()["resets_at"] > time.time(), \
+            "the refusal's own words reached the ledger as the refill fact"
+        _r = runner.process_job(pkt, pkb, _p1, headless=True)
+        assert _r == "dry", f"the family falls to flow/f1, which refuses too: {_r}"
         assert runner.process_job(pkt, pkb, _p1, headless=True) == "waiting", \
-            "the whole Google family is dry — the reel waits, only the probe may ask"
+            "every Google pair now carries the site's own refusal — the reel waits"
+        # back to the unproven state for the probe tests below
+        pkt.db.execute("UPDATE credits SET remaining=0, resets_at=0 "
+                       "WHERE site IN ('googlevids','flow')")
+        pkt.db.execute("DELETE FROM lessons"); pkt.db.commit()
         # (a) a site that refused THIS account within the last day already answered — do not re-ask
         pkb.hit_wall("googlevids", "p1", "credits", detail="refused within the hour")
         assert runner._resume_probe(pkt, pkb, _p1, "googlevids", headless=True) is None, \
@@ -985,12 +1089,14 @@ if __name__ == "__main__":
         print("OK: the resume probe asks ONE dry-without-date account per run, with the "
               "real clip it would render — verified facts replace unverified dryness")
 
-        # WHOLE-REEL FAILOVER (owner, 2026-10-10): before ANY clip lands, a dry primary moves the
-        # ENTIRE reel to the next waterfall site, and every queued scene follows. Once a clip is
-        # done, project_site() owns the lock and nothing may move the reel again.
+        # WHOLE-REEL FAILOVER (owner, 2026-10-10): before ANY clip lands, a primary the SITE
+        # refuses moves the ENTIRE reel to the next waterfall site, and every queued scene
+        # follows. (The chain attempts an unproven ledger 0 first — the refusal, free of any
+        # generation, is what proves the dry — owner rule 2026-10-27.) Once a clip is done,
+        # project_site() owns the lock and nothing may move the reel again.
         fst = State(os.path.join(tempfile.mkdtemp(), "t.db"))
         fbr = Brain(fst)
-        fst.set_credits("googlevids", "g1", remaining=0)    # primary dry from the start
+        fst.set_credits("googlevids", "g1", remaining=0)    # primary at an unproven 0
         fst.set_credits("flow", "f1", remaining=8)          # next in waterfall
         runner._adapter = lambda site: fake
         runner._session = lambda site, account, headless: _NullSession()
@@ -1008,9 +1114,11 @@ if __name__ == "__main__":
         fake2.read_credits = lambda s: None
         fjid = fst.add_job("failover-proj", 0, "a scene", site="googlevids")
         fst.add_job("failover-proj", 1, "another scene", site="googlevids")
-        runner._adapter = lambda site: fake if site != "flow" else fake2
+        runner._adapter = lambda site: dry if site == "googlevids" else fake2
+        _r = runner.process_job(fst, fbr, fst.next_queued("failover-proj"), headless=True)
+        assert _r == "dry", f"the chain attempts the unproven primary 0 — the site refuses: {_r}"
         assert runner.process_job(fst, fbr, fst.next_queued("failover-proj"), headless=True) == "done", \
-            "a dry primary must fail the WHOLE reel over to flow"
+            "a refused primary fails the WHOLE reel over to flow on the next pass"
         _all = fst.project_clips("failover-proj")
         assert all(j["site"] == "flow" for j in _all), \
             f"every queued scene must follow the reel to flow, got {[j['site'] for j in _all]}"
@@ -1038,6 +1146,7 @@ if __name__ == "__main__":
         assert bst.project_site("cooling-proj") is None, \
             "a cooling primary must not move the reel to a lower tier"
         bst.db.execute("UPDATE lessons SET cooldown_until=0"); bst.db.commit()
+        runner._adapter = lambda site: fake    # the primary works again — it was only cooling
         assert runner.process_job(bst, bbr, bst.next_queued("cooling-proj"), headless=True) == "done", \
             "the wait must end the moment the primary is back"
         assert bst.project_clips("cooling-proj")[0]["site"] == "googlevids", \
@@ -1461,7 +1570,79 @@ if __name__ == "__main__":
         print("OK: the right account may spend; a session holding ANOTHER account is refused "
               "before the credit is spent; an unknown account is not a mismatch")
 
+        # THE PRE-CHOICE BALANCE SWEEP (owner rule, 2026-10-27): before any reel chooses its
+        # source, every choosable account is asked what it ACTUALLY holds, and the site's
+        # answer outranks the ledger's guess. What must hold here: a number read is recorded
+        # observed; a cooling pair is never visited; a site that states no balance keeps its
+        # row; a session holding ANOTHER account records nothing; a crashed read fails open;
+        # and a row just observed is not re-read within the sweep's max age.
+        sst = State(os.path.join(tempfile.mkdtemp(), "t.db"))
+        sst.set_credits("flow", "a1", remaining=3)          # the ledger GUESSES 3 (manual)
+        sst.set_pool("flow", "a1", 50, email="one@example.com")
+        sst.set_credits("flow", "a2", remaining=50)
+        sst.record_lesson("flow", "captcha", account="a2", cooldown_s=9999)   # step back
+        sst.set_credits("novid", "b1", remaining=7)
+        rich = types.SimpleNamespace(name="flow", credit_cost=1, home="https://flow.test")
+        rich.read_credits = lambda s: 61
+        rich.read_account = lambda s: "one@example.com"
+        novid = types.SimpleNamespace(name="novid", credit_cost=1, home="https://novid.test")
+        novid.read_credits = lambda s: None                 # the page shows no counter (Vids)
+        runner._adapter = lambda site: rich if site == "flow" else novid
+        class _GotoSession:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def goto(self, url): pass
+        runner._session = lambda site, account, headless: _GotoSession()
+        out = runner.sweep_balances(sst, headless=True)
+        row = sst.db.execute("SELECT remaining, source FROM credits "
+                             "WHERE site='flow' AND account='a1'").fetchone()
+        assert row["remaining"] == 61 and row["source"] == "observed", \
+            f"the site's own number outranks the ledger's guess: {dict(row)}"
+        assert ("flow", "a1", 61) in out["observed"], out
+        row = sst.db.execute("SELECT remaining FROM credits "
+                             "WHERE site='flow' AND account='a2'").fetchone()
+        assert row["remaining"] == 50, "a cooling pair must not be visited at all"
+        assert ("flow", "a2") not in [(s, a) for s, a, *_ in
+                                      out["observed"] + out["unreadable"] + out["failed"]], out
+        row = sst.db.execute("SELECT remaining, source FROM credits "
+                             "WHERE site='novid'").fetchone()
+        assert row["remaining"] == 7 and row["source"] == "manual", \
+            f"a site that states no balance must not have its row rewritten: {dict(row)}"
+        # a session holding ANOTHER account: the read is refused, the row survives
+        liar = types.SimpleNamespace(name="liar", credit_cost=1, home="https://liar.test")
+        liar.read_credits = lambda s: 999
+        liar.read_account = lambda s: "someone@else.example.com"
+        runner._adapter = lambda site: liar
+        sst.set_credits("liar", "a1", remaining=10)
+        sst.set_pool("liar", "a1", 50, email="real@example.com")
+        out = runner.sweep_balances(sst, headless=True, sites=["liar"])
+        row = sst.db.execute("SELECT remaining, source FROM credits WHERE site='liar'").fetchone()
+        assert row["remaining"] == 10 and row["source"] == "manual", \
+            f"a wrong-account session must not write a balance: {dict(row)}"
+        assert out["mismatch"], out
+        # a crashed read fails open — never a number, never a stop
+        def _boom(s): raise RuntimeError("gateway down")
+        liar.read_credits = _boom
+        out = runner.sweep_balances(sst, headless=True, sites=["liar"])
+        row = sst.db.execute("SELECT remaining FROM credits WHERE site='liar'").fetchone()
+        assert row["remaining"] == 10, "a crashed read must not become a number"
+        # freshness: a row just observed is not re-read within max_age
+        out = runner.sweep_balances(sst, headless=True, sites=["flow"], max_age=10_000)
+        assert out["observed"] == [] and out["skipped"], out
+        print("OK: the pre-choice sweep records the site's own number (observed > guess), never "
+              "visits a cooling pair, never rewrites a no-counter row, refuses a wrong-account "
+              "session, fails open on a crash, and skips fresh rows")
+
         print("OK: hermetic self-check (temp dirs) + craft-gate verdict persisted")
         print("OK: observed balance updates the count before spend; a failed read never blocks a job")
+    elif "--sweep" in sys.argv:
+        # The standalone form of the sweep the loop runs before any reel chooses its source:
+        # ask every choosable site what it holds right now, then print the whole ledger.
+        _st = State()
+        sweep_balances(_st, headless="--headed" not in sys.argv)
+        print("\nthe ledger now believes:")
+        for r in _st.db.execute("SELECT site, account FROM credits ORDER BY site, account"):
+            print("  " + _st.credit_line(r["site"], r["account"]))
+        _st.close()
     else:
         loop(once="--once" in sys.argv, headless="--headed" not in sys.argv)

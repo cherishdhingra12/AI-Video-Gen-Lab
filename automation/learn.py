@@ -23,6 +23,13 @@ from state import State, backoff_seconds
 # still ONE source: this only decides which site a reel STARTS on (see runner.process_job).
 SITE_ORDER = ["googlevids", "flow"]
 
+# Sites whose ledger balance is a DERIVED count, not a read one: the site shows no balance
+# anywhere (Google Vids confirmed live 2026-10-22; Google Flow probed 2026-10-27 — home page,
+# settings menu, help: no counter). On these the ledger's `remaining` is a guess and must
+# NEVER decide candidacy, order, or affordability — only the site's own refusal (a `credits`
+# wall, recorded with the refill time the site itself named) may keep a pair out of the chain.
+DERIVED_BALANCE_SITES = {"googlevids", "flow"}
+
 
 def _order(site: str) -> int:
     return SITE_ORDER.index(site) if site in SITE_ORDER else len(SITE_ORDER)
@@ -126,7 +133,7 @@ class Brain:
         return True                            # funded but cooling: worth the wait
 
     def pick(self, want_site: str = None, strict: bool = False, need: int = 0,
-             cost_of=None) -> tuple:
+             cost_of=None, proven_only: bool = False) -> tuple:
         """Scheduler helper: best (site,account) that has credit AND isn't cooling.
         want_site is a soft PREFERENCE (tried first), not a filter — a job whose last
         site is now cooling must still reroute, or the whole waterfall stalls on it.
@@ -146,27 +153,52 @@ class Brain:
         finished at all; among affordable sites the quality order still wins, and when nobody
         can afford the whole reel the order is exactly what it was.
 
-        THE ACCOUNT WATERFALL (owner, 2026-10-26): a site with several accounts must spend
-        the fullest one first — a1 drains to 0 before a2 starts, a2 before a3 — matching
-        `Vids1 -> Vids2 -> Vids3 -> Flow1 -> Flow2 -> Flow3` on exhaustion. The cursor is
-        remaining credit itself: state.rotation orders by credit left, so there is no separate
-        "where were we" state to fall out of sync with the ledger. (This replaced the older
-        used_at cycle, which bounced back to a funded a1.)"""
+        THE OWNER'S CHAIN (2026-10-27): within a site the accounts run in ONE FIXED ORDER — a1,
+        then a2, then a3 — matching `Vids1 -> Vids2 -> Vids3 -> Flow1 -> Flow2 -> Flow3`, and a
+        ledger figure never decides anything: on a site that shows no counter (DERIVED_BALANCE_SITES)
+        the number cannot be real, so the pair stays in the chain at its turn and the SITE's own
+        refusal — never a stored guess — is what moves the chain on. (This supersedes the
+        2026-10-26 fullest-first rule and the older used_at cycle before it.)"""
+        need = max(need, 0)
+
         def afford(c) -> int:
+            # A derived-balance site's figure is fiction: assume the site can afford the reel
+            # and let IT refuse — that refusal is the only fact. `max(need, 1)` parks the pair
+            # in the affordable tier without inventing a number.
+            if c["site"] in DERIVED_BALANCE_SITES:
+                return max(need, 1)
             cost = max(1, int(getattr(cost_of(c["site"]), "credit_cost", 1) if cost_of else 1))
             return c["remaining"] // cost
 
         cands = self.st.available()
-        # The house waterfall decides the ORDER of SITES: Vids before Flow before the rest, and
-        # within a tier the most remaining credit first (spread load, delay hitting any one
-        # wall). This is a QUALITY order, not a credit order — a small Vids bucket must not lose
-        # to a fat krea one.
-        # Affordability sits ABOVE all of it (see `need`): it is the one thing that decides whether
-        # the reel can be finished at all, and a source that strands it is no source.
-        # …and WITHIN one site the accounts run as a waterfall (the rotation, below), the
-        # fullest first. The rotation rank is comparable only inside a site, so it sits BELOW
-        # the site order in the key and the credit tiebreak sits below it — a difference of
-        # site decides first.
+        # A ledger 0 with no recorded refusal is a GUESS, and on a derived-balance site the
+        # guess may not gate the chain: add every non-cooling row of these sites that
+        # available() excluded, unless the SITE refused it and named a future refill.
+        # proven_only=True declines the guess — that is the resume-probe's view, which exists
+        # to ask the SITE with the real clip rather than act on a figure nobody confirmed.
+        have = {(c["site"], c["account"]) for c in cands}
+        now = time.time()
+        if not proven_only:
+            for site in DERIVED_BALANCE_SITES:
+                for r in self.st.db.execute(
+                        "SELECT site, account, remaining, resets_at FROM credits "
+                        "WHERE site=? ORDER BY account", (site,)).fetchall():
+                    if (r["site"], r["account"]) in have:
+                        continue
+                    if self.st.cooldown_left(r["site"], r["account"]) > 0:
+                        continue                   # stepping back means stepping back
+                    if r["remaining"] <= 0 and r["resets_at"] and r["resets_at"] > now:
+                        continue                   # the SITE refused it and named its refill
+                    cands.append({"site": r["site"], "account": r["account"],
+                                  "remaining": r["remaining"] or 0, "resets_at": r["resets_at"]})
+        # The house waterfall decides the ORDER of SITES: Vids before Flow before the rest.
+        # This is a QUALITY order, not a credit order — a small Vids bucket must not lose to a
+        # fat krea one. Affordability sits ABOVE it for sites whose balance is really read; on
+        # a DERIVED_BALANCE_SITES site the figure is fiction, so affordability is assumed and
+        # the site itself refuses when it cannot carry the reel. WITHIN one site the accounts
+        # run in the owner's CHAIN (a1, a2, a3 — the rotation, below): a fixed order no ledger
+        # figure may reorder. The rotation rank is comparable only inside a site, so it sits
+        # BELOW the site order in the key — a difference of site decides first.
         rank = {}
         for site in {c["site"] for c in cands}:
             here = [c["account"] for c in cands if c["site"] == site]
@@ -232,9 +264,11 @@ if __name__ == "__main__":
     pst.set_credits("krea", "k1", remaining=50)
     pst.set_credits("kling", "a1", remaining=40)
     assert pbr.pick() == ("googlevids", "g1"), "Vids wins the waterfall even on 1 credit"
-    pst.spend_credit("googlevids", "g1", 1)                 # Vids dry
+    pst.spend_credit("googlevids", "g1", 1)                 # Vids spent out...
+    pst.mark_dry("googlevids", "g1", refill_at=time.time() + 9999)   # ...and the SITE refused
     assert pbr.pick() == ("flow", "f1"), "Flow is next after Vids"
-    pst.spend_credit("flow", "f1", 9)                       # Flow dry too
+    pst.spend_credit("flow", "f1", 9)                       # Flow spent out...
+    pst.mark_dry("flow", "f1", refill_at=time.time() + 9999)         # ...and the SITE refused
     assert pbr.pick() == ("krea", "k1"), "beyond Vids/Flow the most remaining credit wins"
     print(f"OK: consult->go, wall cools+escalates ({cd1:.0f}->{cd2:.0f}s), "
           f"scheduler routes around cooling accounts and reroutes off a dead want_site — "
@@ -247,17 +281,25 @@ if __name__ == "__main__":
     # already rendered riding on it.
     ast = State(os.path.join(tempfile.mkdtemp(), "t.db"))
     abr = Brain(ast)
-    ast.set_credits("googlevids", "g1", remaining=2)     # 1 credit/clip
+    ast.set_credits("googlevids", "g1", remaining=2)     # a GUESS of 2 — nobody can read Vids
     ast.set_credits("vibes", "v1", remaining=100)        # 25 credits/clip (measured)
     costs = types.SimpleNamespace(googlevids=types.SimpleNamespace(credit_cost=1),
                                   vibes=types.SimpleNamespace(credit_cost=25))
     cost_of = lambda site: costs.__dict__[site]          # noqa: E731
     assert abr.pick(want_site="googlevids", need=2, cost_of=cost_of) == ("googlevids", "g1"), \
         "a site that CAN finish the reel still wins on the house order"
-    assert abr.pick(want_site="googlevids", need=3, cost_of=cost_of) == ("vibes", "v1"), \
-        "a reel Vids cannot finish must open where it can — 2 clips of credit is not a source"
+    assert abr.pick(want_site="googlevids", need=3, cost_of=cost_of) == ("googlevids", "g1"), \
+        "a derived site's ledger figure cannot strand the reel — the SITE decides, not the guess"
     assert abr.pick(need=99, cost_of=cost_of) == ("googlevids", "g1"), \
         "when NO site can afford the whole reel the order is what it always was, never nothing"
+    # among sites whose balance IS really read, affordability still ranks: a site that cannot
+    # finish the reel is passed over for one that can (owner fix, 2026-10-14). Google is put
+    # out of the chain first with a recorded refusal, or its assumed affordability would win.
+    ast.mark_dry("googlevids", "g1", refill_at=time.time() + 9999)
+    ast.set_credits("kling", "k1", remaining=60)         # 25 credits/clip -> 2 clips affordable
+    costs.kling = types.SimpleNamespace(credit_cost=25)
+    assert abr.pick(want_site="kling", need=3, cost_of=cost_of) == ("vibes", "v1"), \
+        "a REAL-balance site that cannot finish the reel loses to one that can"
 
     # A DRY SITE COMES BACK AT ITS OWN REFILL TIME, not after a cooldown. The site names the
     # period in words; this turns it into a time the ledger can hold.
@@ -276,30 +318,40 @@ if __name__ == "__main__":
     print("OK: a site is ranked by the clips it can afford, and a dry one returns at the refill "
           "time it named (or stays unknown when it named none)")
 
-    # THE ACCOUNT WATERFALL (owner, 2026-10-26): three Google accounts on 'googlevids', used in
-    # order of remaining credit — the fullest is always picked, so a1 drains before a2 before a3.
+    # THE OWNER'S CHAIN (2026-10-27): three Google accounts used in ONE fixed order — a1, then
+    # a2, then a3 — and a ledger figure never reorders or gates the chain. On a site whose
+    # balance nobody can read, only the SITE's own refusal (a dry mark carrying the refill time
+    # the site named) takes a pair out of the chain.
     rst = State(os.path.join(tempfile.mkdtemp(), "t.db"))
     rbr = Brain(rst)
-    # a1 funded; a2, a3 dry (refill far in the future) -> a1 alone carries the reel
+    # a1 funded; a2, a3 refused-until-later -> a1 alone carries the reel
     rst.set_credits("googlevids", "a1", remaining=50)
     rst.set_credits("googlevids", "a2", remaining=0, resets_at=time.time() + 9999)
     rst.set_credits("googlevids", "a3", remaining=0, resets_at=time.time() + 9999)
     assert rbr.pick(want_site="googlevids") == ("googlevids", "a1"), \
         "only a1 is funded -> a1 is picked"
-    # a1 drains to 1 while a2 refills to 50: the FULLEST (a2) goes, not a1
+    # a1 drains to 1 while a2/a3 hold bigger GUESSES: the chain does not care — a1 goes first
     rst.set_credits("googlevids", "a1", remaining=1)
     rst.set_credits("googlevids", "a2", remaining=50)
     rst.set_credits("googlevids", "a3", remaining=49)
-    assert rbr.pick(want_site="googlevids") == ("googlevids", "a2"), \
-        "the fullest account goes — a2 (50) over a3 (49) over a1 (1)"
-    # all three dry -> None, so the scheduler cascades to the NEXT site (Flow)
-    rst.set_credits("googlevids", "a1", remaining=0, resets_at=time.time() + 9999)
+    assert rbr.pick(want_site="googlevids") == ("googlevids", "a1"), \
+        "the chain is a1, a2, a3 — a bigger ledger figure on a2 must not reorder it"
+    # a guess of 0 with NO recorded refusal does not gate the chain either: the pair is
+    # attempted at its turn, and the SITE is what will say yes or no
+    rst.set_credits("googlevids", "a1", remaining=0, resets_at=0)
+    assert rbr.pick(want_site="googlevids") == ("googlevids", "a1"), \
+        "a ledger 0 is a guess, not a fact — the chain still starts at a1"
+    assert rbr.pick(want_site="googlevids", strict=True, proven_only=True) == ("googlevids", "a2"), \
+        "proven_only is the resume-probe's view: the funded a2 is proven; the guess-0 a1 is not offered"
+    # all three REFUSED until a far refill -> None, so the scheduler cascades to the NEXT site
     rst.set_credits("googlevids", "a2", remaining=0, resets_at=time.time() + 9999)
     rst.set_credits("googlevids", "a3", remaining=0, resets_at=time.time() + 9999)
+    rst.set_credits("googlevids", "a1", remaining=0, resets_at=time.time() + 9999)
     assert rbr.pick(want_site="googlevids") is None, \
-        "when every Vids account is dry the waterfall returns None, cascading to Flow"
-    print("OK: the accounts run in a WATERFALL (fullest first — a1 drips to 0 before a2/a3), "
-          "and a dry site falls through (Vids1->Vids2->Vids3 then Flow)")
+        "when every account carries the site's own refusal, the waterfall returns None, cascading to Flow"
+    print("OK: the accounts run in the OWNER'S CHAIN (a1, a2, a3 — figures never reorder or "
+          "gate it; only the site's own refusal does), and a dry site falls through "
+          "(Vids1->Vids2->Vids3 then Flow)")
 
     # THE COUNT MUST BE HONEST (the owner's priority, 2026-10-22). Vids shows no balance, so
     # the count is derived: the bucket size is LEARNED from the refusal, and every generation

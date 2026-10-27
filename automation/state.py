@@ -425,18 +425,14 @@ class State:
         return f"{head}, resets={when}, used={r['used']}, source={r['source']}"
 
     def rotation(self, site: str, accounts: list) -> list:
-        """The account order this site should be used in: the fullest first.
+        """The account order this site should be used in: a1, a2, a3 — the owner's fixed chain.
 
-        The owner's rule (2026-10-26): three Google accounts, and the load falls through in a
-        WATERFALL, not a cycle — you always spend the fullest first so a1 drains to 0 before a2
-        starts, a2 before a3, matching `Vids1 -> Vids2 -> Vids3 -> Flow1 -> Flow2 -> Flow3` on
-        exhaustion. The cursor that never lies is remaining credit: the account with the most
-        credit left goes first. Reordering by credits left is the explicit change from the
-        old cycle (which used `used_at` so a1 bounced back while still funded)."""
-
-        rows = {r["account"]: r for r in self.db.execute(
-            "SELECT account, remaining FROM credits WHERE site=?", (site,)).fetchall()}
-        return sorted(accounts, key=lambda a: (-(rows[a]["remaining"] if a in rows else 0), a))
+        The owner's rule (2026-10-27): the load falls through ONE ORDER — a1 first, then a2, then
+        a3 — exactly `Vids1 -> Vids2 -> Vids3 -> Flow1 -> Flow2 -> Flow3`, and the ledger's
+        figures never decide the order (on a site that shows no counter they cannot be real;
+        only the site's own refusal is a fact). This supersedes the 2026-10-26 fullest-first
+        rule, which interleaved accounts whenever balances tied instead of draining a1 first."""
+        return sorted(accounts)
 
     def mark_dry(self, site: str, account: str, refill_at: float = 0.0):
         """The SITE told us it is empty (quota, paywall, insufficient credits) — record the fact.
