@@ -41,8 +41,14 @@ class GoogleVids(SiteAdapter):
     home = "https://vids.google.com/"
     credit_cost = 1                          # 1 AI-clip gen; ~50/month
     aspect = "9:16"
-    needs_cookie_refresh = True              # Google session cookies rotate fast — re-import
-    cookie_keywords = ["google"]             # each run (same class as Flow; expired -> account chooser)
+    needs_cookie_refresh = False             # WAS True — since 2026-10-27 every Chrome import
+    cookie_keywords = ["google"]             # yields a session the site rejects, and the refresh
+                                             # CLOBBERS the profile's working login with it (it
+                                             # destroyed all three Flow profiles that night; the
+                                             # Vids ones survive only because the reel sat on
+                                             # Flow). These profiles still hold valid sign-ins —
+                                             # protect them: re-login via login.py when a profile
+                                             # login-walls, never via the Chrome import.
 
     # text-based selectors so they survive class-name churn; CONFIRMED live 2026-09-23.
     prompt_sel = "textarea, [contenteditable='true']"     # AI-clip panel prompt box (1 match)

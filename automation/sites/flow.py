@@ -41,7 +41,13 @@ class Flow(SiteAdapter):
                                      # Lite 10 · Omni 1.1 Flash 12 · Fast 20 · Quality 100
                                      # (was 12, then 20 while the menu's Fast default rode through).
     aspect = "9:16"
-    needs_cookie_refresh = True      # Google session cookies rotate fast — re-import each run
+    needs_cookie_refresh = False     # WAS True — but since 2026-10-27 every import from Chrome
+                                     # yields a session Flow rejects (signed-out shell), and the
+                                     # refresh CLOBBERED three working profiles with it. The
+                                     # session source is now the profile's OWN login
+                                     # (login.py flow <acct>, headed, cookies persist); re-run
+                                     # that when a profile login-walls. Do not re-enable the
+                                     # Chrome import until it can be verified before install.
     cookie_keywords = ["google"]
 
     _QUOTA = re.compile(r"(reached|out of|no more|ran out|not enough|insufficient).{0,40}"
@@ -233,8 +239,15 @@ class Flow(SiteAdapter):
         if not self._select_model(session):
             raise Wall("selector",
                        f"Flow model '{self.MODEL}' could not be selected — not even via vision self-heal")
-        self._click_role(session, "Settings trigger")   # a model choice can close the menu
-        time.sleep(1.5)
+        # A model choice can close the menu, and a CLOSED menu fails every pattern click
+        # silently (2026-10-27 reel: all five logged 0 and the submit control was never
+        # reached) — so the re-open is VERIFIED by the menu's own cost line before anything
+        # is clicked inside it.
+        for _ in range(2):
+            if re.search(r"\d+\s*credits", self._body(session)):
+                break
+            self._click_role(session, "Settings trigger")
+            time.sleep(1.5)
         m = re.search(r"(\d+)\s*credits", self._body(session))
         if m and int(m.group(1)) > 0:
             self.credit_cost = int(m.group(1))            # observed like every other number
