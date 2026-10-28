@@ -701,6 +701,9 @@ def build(project_dir, clips_dir=None, absorb=True):
     name = os.path.basename(project_dir)
     clips_dir = clips_dir or os.path.join(ROOT, "clips", name)
     clips = _clips(clips_dir)
+    if not clips and os.path.isdir(os.path.join(project_dir, "clips")):
+        clips_dir = os.path.join(project_dir, "clips")
+        clips = _clips(clips_dir)
     if not clips:
         raise RuntimeError(f"no clips in {clips_dir}")
     out = os.path.join(project_dir, "final_veo.mp4")

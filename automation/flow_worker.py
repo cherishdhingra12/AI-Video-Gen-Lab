@@ -165,27 +165,47 @@ def download_poster(poster_src: str, dest: str, timeout: float = 60.0) -> str:
     if "clicked" not in res:
         raise RuntimeError(f"Could not click poster: {res}")
 
-    time.sleep(2)
+    time.sleep(2.5)
 
-    # Click download button
+    # Click download button (either direct or inside More options)
     js_click_dl = '''(function(){
         const dl = Array.from(document.querySelectorAll("button")).find(b => 
-            (b.innerText||"").includes("download") || 
+            (b.innerText||"").toLowerCase().includes("download") || 
             (b.getAttribute("aria-label")||"").toLowerCase().includes("download")
         );
         if (dl) {
             dl.click();
             return "clicked dl";
         }
+        const more = Array.from(document.querySelectorAll("button")).find(b => 
+            (b.getAttribute("aria-label")||"").toLowerCase().includes("more options")
+        );
+        if (more) {
+            more.click();
+            return "clicked more";
+        }
         return "no dl";
     })()'''
-    exec_js(js_click_dl)
-    time.sleep(1.5)
+    dl_res = exec_js(js_click_dl)
+    time.sleep(1.2)
+    if "clicked more" in dl_res:
+        js_menu_dl = '''(function(){
+            const item = Array.from(document.querySelectorAll("[role=menuitem], .mat-mdc-menu-item, button")).find(b => 
+                (b.innerText||"").toLowerCase().includes("download")
+            );
+            if (item) {
+                item.click();
+                return "clicked menu dl";
+            }
+            return "no menu dl";
+        })()'''
+        exec_js(js_menu_dl)
+        time.sleep(1.2)
 
     # Click 720p Original size
     js_click_orig = '''(function(){
         const item = Array.from(document.querySelectorAll(".mat-mdc-menu-item, [role=menuitem], button")).find(b => 
-            (b.innerText||"").includes("Original size")
+            (b.innerText||"").includes("Original size") || (b.innerText||"").includes("720p")
         );
         if (item) {
             item.click();
@@ -214,11 +234,14 @@ def download_poster(poster_src: str, dest: str, timeout: float = 60.0) -> str:
 
     # Return back to project view
     js_back = '''(function(){
-        const back = Array.from(document.querySelectorAll("button")).find(b => (b.innerText||"").includes("arrow_back"));
+        const back = Array.from(document.querySelectorAll("button")).find(b => 
+            (b.innerText||"").includes("arrow_back") || 
+            (b.getAttribute("aria-label")||"").toLowerCase().includes("back")
+        );
         if (back) back.click();
     })()'''
     exec_js(js_back)
-    time.sleep(1.5)
+    time.sleep(2)
 
     if not downloaded_file or not os.path.exists(downloaded_file):
         raise RuntimeError("Download did not complete in time")
@@ -286,4 +309,5 @@ def run_pipeline(project: str = "javni-ki-dhun"):
     st2.close()
 
 if __name__ == "__main__":
-    run_pipeline("javni-ki-dhun")
+    proj = sys.argv[1] if len(sys.argv) > 1 else "dadaji-ki-yadein"
+    run_pipeline(proj)
