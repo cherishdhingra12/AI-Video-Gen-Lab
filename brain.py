@@ -528,6 +528,40 @@ class LocalBrain:
                 break
             time.sleep(interval)
 
+    # ---- autonomous git synchronization: stage, commit, and push deliverables ----
+    def sync_git(self, project: str = None, message: str = None) -> dict:
+        """Autonomously stage, commit, and push repository changes and deliverables to remote git."""
+        import subprocess
+        try:
+            # 1. Stage changes (respecting .gitignore)
+            subprocess.run(["git", "add", "-A"], cwd=ROOT, check=True, capture_output=True)
+            # 2. Check if anything is staged
+            diff_res = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=ROOT)
+            if diff_res.returncode == 0:
+                return {"ok": True, "committed": False, "reason": "no changes to commit"}
+
+            # 3. Formulate commit message
+            if not message:
+                if project:
+                    name = os.path.basename(str(project).rstrip("/"))
+                    message = f"feat(reel): sync deliverables & learning state for {name}"
+                else:
+                    message = "chore(brain): sync learning cycle and craft state"
+
+            # 4. Commit
+            c_res = subprocess.run(["git", "commit", "-m", message], cwd=ROOT, capture_output=True, text=True)
+            if c_res.returncode != 0:
+                return {"ok": False, "error": f"commit failed: {c_res.stderr.strip()}"}
+
+            # 5. Push to current upstream branch
+            p_res = subprocess.run(["git", "push", "origin", "HEAD"], cwd=ROOT, capture_output=True, text=True)
+            if p_res.returncode != 0:
+                return {"ok": False, "committed": True, "error": f"push failed: {p_res.stderr.strip()}"}
+
+            return {"ok": True, "committed": True, "pushed": True, "commit": message}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     # ---- autonomous conversation learning: read the live transcript, extract durable CRAFT
     # lessons via the LLM, and write them straight to the brain (no approval). Advisory tier
     # (judgment/warn) so self-learning can inform every reel's checklist but never auto-BLOCK one. ----
@@ -1003,6 +1037,16 @@ def main(argv):
                 if res['promoted']:
                     print(f"  promoted {len(res['promoted'])} candidate(s): {', '.join(res['promoted'])}")
                 print(f"  active craft lessons: {res['active_lessons']}")
+        elif cmd == "sync":
+            target = argv[1] if len(argv) >= 2 else None
+            res = b.sync_git(project=target)
+            if res.get("ok"):
+                if res.get("committed"):
+                    print(f"[brain] git sync success: {res.get('commit')} -> origin")
+                else:
+                    print(f"[brain] git sync: {res.get('reason')}")
+            else:
+                print(f"[brain] git sync error: {res.get('error')}")
         elif cmd == "--json":
             print(json.dumps(b.report(), indent=2))
         else:

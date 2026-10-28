@@ -257,6 +257,13 @@ def chat(messages, max_tokens=4000, temperature=0.8, prefer=None, role=None):
                 raise ValueError("empty content")
             except Exception as e:  # noqa: BLE001 - any failure -> retry, then next gateway
                 errors.append(f"{name}[{attempt + 1}]: {e}")
+                is_timeout = any(t in str(e).lower() for t in ("timed out", "timeout"))
+                if is_timeout:
+                    # A timeout means the gateway or its upstream model is unresponsive/stalled.
+                    # Fail fast rather than burning multiple full-timeout cycles (e.g. 3x90s = 4.5m),
+                    # cool it down briefly, and let the next configured gateway take over immediately.
+                    routerhealth.note_failure(name, f"timeout ({timeout}s)")
+                    break
                 if attempt + 1 < _TRIES and _retryable(e):
                     time.sleep(1.5 * (attempt + 1))
                     continue

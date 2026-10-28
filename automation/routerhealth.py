@@ -25,8 +25,11 @@ key this on state.db instead.
 import os
 import time
 
+import os
+import time
+
 WALL = float(os.environ.get("LLM_COOLDOWN", "120"))       # 429/quota/auth: done for now
-BLIP = float(os.environ.get("LLM_BLIP_COOLDOWN", "20"))   # a timeout or a bad second
+BLIP = float(os.environ.get("LLM_BLIP_COOLDOWN", "30"))   # a timeout or a bad second
 
 # What separates a wall from a blip. Quota wording varies by gateway ("insufficient credits",
 # "rate limit", "exceeded your current quota"), so match words, not just the status code.
@@ -36,17 +39,49 @@ _WALL_WORDS = ("429", "too many requests", "rate limit", "quota", "insufficient"
 _WALLED = {}                                    # key -> (until_ts, why)
 
 
+def _get_st():
+    try:
+        from state import State
+        return State()
+    except Exception:
+        return None
+
+
 def cooling(key: str):
     """(until_ts, why) when `key` is walled RIGHT NOW, else (0.0, ""). Expiry is checked on read,
     so a spent cooldown never needs cleaning up."""
-    until, why = _WALLED.get(key, (0.0, ""))
-    return (until, why) if until > time.time() else (0.0, "")
+    now = time.time()
+    if key in _WALLED:
+        until, why = _WALLED[key]
+        return (until, why) if until > now else (0.0, "")
+
+    # If key not in in-memory dict, check persistent state.db (cross-process memory)
+    st = _get_st()
+    if st:
+        try:
+            cd = st.cooldown_left("llm:" + key, now=now)
+            if cd > 0:
+                _WALLED[key] = (now + cd, "persisted cooling in state.db")
+                return now + cd, "persisted cooling in state.db"
+        finally:
+            st.close()
+
+    return 0.0, ""
 
 
 def note_failure(key: str, err) -> float:
     """Record a failure against `key` and return the cooldown applied, in seconds."""
     secs = WALL if any(w in str(err).lower() for w in _WALL_WORDS) else BLIP
-    _WALLED[key] = (time.time() + secs, str(err)[:90])
+    now = time.time()
+    _WALLED[key] = (now + secs, str(err)[:90])
+
+    st = _get_st()
+    if st:
+        try:
+            st.record_lesson("llm:" + key, "cooldown", detail=str(err)[:90], cooldown_s=secs)
+        finally:
+            st.close()
+
     return secs
 
 
@@ -54,17 +89,31 @@ def note_success(key: str):
     """A route that answered is a route that works — clear its wall at once, or a recovered
     gateway stays skipped for the rest of its cooldown and the run quietly loses a route."""
     _WALLED.pop(key, None)
+    st = _get_st()
+    if st:
+        try:
+            st.db.execute("UPDATE lessons SET cooldown_until=0 WHERE site=?", ("llm:" + key,))
+            st.db.commit()
+        finally:
+            st.close()
 
 
 def walled() -> dict:
     """Every key cooling right now, with its reason — for the error a caller raises when it
     has nothing left. Without this the operator sees 'all gateways failed' and no hint that
     half of them were never tried."""
-    return {k: w for k, w in _WALLED.items() if cooling(k)[0]}
+    return {k: w for k, w in list(_WALLED.items()) if cooling(k)[0]}
 
 
 def clear():
     _WALLED.clear()
+    st = _get_st()
+    if st:
+        try:
+            st.db.execute("UPDATE lessons SET cooldown_until=0 WHERE site LIKE 'llm:%'")
+            st.db.commit()
+        finally:
+            st.close()
 
 
 if __name__ == "__main__":

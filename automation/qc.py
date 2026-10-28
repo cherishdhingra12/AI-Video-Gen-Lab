@@ -2043,6 +2043,15 @@ if __name__ == "__main__":
         print(f"signed off '{r.name}' cut {r.fp} by {who}" + (f" — {note}" if note else ""))
         v = run(proj, st)
         _report(v)
+        if v.get("live"):
+            try:
+                import brain
+                b = brain.LocalBrain(st=st)
+                s_res = b.sync_git(project=proj, message=f"feat(reel): sign-off and gate-pass for {r.name} by {who}")
+                if s_res.get("committed"):
+                    print(f"[brain] git auto-sync: pushed '{s_res.get('commit')}' to remote")
+            except Exception as e:
+                print(f"[brain] git auto-sync skipped ({e})")
         st.close()
         sys.exit(0 if v["live"] else 1)
     elif "--heal" in sys.argv:
