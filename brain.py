@@ -141,6 +141,13 @@ class LocalBrain:
                          f"brain.py review <project>: {', '.join(held)}")
         if pending:
             needs.append(f"{pending} proposed lesson(s) await review — brain.py candidates")
+        last_cycles = [e for e in self.st.events(limit=500) if e["kind"] == "learning_cycle"]
+        last_cycle = None
+        if last_cycles:
+            try:
+                last_cycle = json.loads(last_cycles[-1]["detail"])
+            except Exception:
+                pass
         return {
             "brain": self.name, "root": ROOT, "ts": now,
             "healthy": not needs,
@@ -149,6 +156,7 @@ class LocalBrain:
             "knowledge": {"craft_lessons": len(cl), "gating": gating,
                           "reels_fingerprinted": reels, "candidates_pending": pending},
             "deliverables": [x["project"] for x in out], "reels": out, "needs": needs,
+            "last_cycle": last_cycle,
         }
 
     # ---- mother-brain COMMAND port (defined, not wired) ----
@@ -380,6 +388,146 @@ class LocalBrain:
         """Owner rejects a candidate -> frozen, the miner won't re-nag about it."""
         return self.st.resolve_candidate(slug, "dismissed")
 
+    # ---- the cyclic learning loop: recurring closed-loop cognitive cycle -------------------
+    #
+    # Learning happens in a continuous cycle:
+    # 1. Ingest standing core rules into craft_lessons (veo narration lips, dedup, cards, pacing, edge autocrop).
+    # 2. Absorb generation layers from the target project or active projects.
+    # 3. Mine failure logs, walls and command errors via propose().
+    # 4. Auto-promote repeating high-confidence candidates to active craft lessons.
+    # 5. Reflect and consolidate event streams into durable episodic session notes.
+    # 6. Prime cortex: clear agents._brief_cache so next generation incorporates updated rules immediately.
+    # 7. Record cycle pulse telemetry in durable memory (brain_log).
+
+    CORE_LESSONS = [
+        {
+            "slug": "veo-narration-closed-lips",
+            "title": "Off-camera voiceover narration requires character lips to remain closed",
+            "why": "When 3rd-person story narration is spoken in Hindi, character must not mouth the narrator's words; lips stay gently closed with a thoughtful resting expression.",
+            "tier": "film",
+            "severity": "block",
+            "source": "owner-standing-rule",
+        },
+        {
+            "slug": "flow-md5-dedup",
+            "title": "Deduplicate downloaded clips by MD5 hash before timeline ingest",
+            "why": "Flow UI sometimes repeats poster click or download; duplicate clip bytes stall the narrative and must be aborted immediately at zero credit spend.",
+            "tier": "process",
+            "severity": "block",
+            "source": "owner-standing-rule",
+        },
+        {
+            "slug": "card-avoid-character-torso",
+            "title": "On-screen caption cards must not occlude character chest or dialogue space",
+            "why": "Cards across a speaker's chest break cinematic immersion; cards belong in safe upper/lower bands or a dedicated outro slate.",
+            "tier": "film",
+            "severity": "block",
+            "source": "owner-standing-rule",
+        },
+        {
+            "slug": "reel-engagement-pace-106",
+            "title": "House pace accelerates generated video and audio by 1.06x for viewer engagement",
+            "why": "Raw AI video runs slower than real-life motion; 1.06x speedup with pitch-locked audio eliminates drag without sounding rushed.",
+            "tier": "film",
+            "severity": "block",
+            "source": "owner-standing-rule",
+        },
+        {
+            "slug": "zero-credit-edge-autocrop",
+            "title": "Heal peripheral anomalies via zero-credit smart punch-in / crops instead of re-rendering",
+            "why": "Extra digits or frame-edge boundary artifacts should be healed via 1.1x punch-in or crop in assembly rather than wasting 30 credits on a re-render.",
+            "tier": "judgment",
+            "severity": "publish-gate",
+            "source": "owner-standing-rule",
+        },
+    ]
+
+    def cycle(self, project: str = None, auto_promote: bool = True) -> dict:
+        """The brain's cyclic learning loop:
+        1. Ingest/refresh core craft lessons into `craft_lessons` in `state.db`.
+        2. Absorb target project (or all recent projects if None), checking all required layers.
+        3. Mine failure logs and anti-ban walls via propose() to surface repeating defect patterns.
+        4. Auto-promote recurring high-confidence candidates (or owner-vetted rules).
+        5. Reflect & consolidate session event streams into episodic memory notes.
+        6. Prime cortex: invalidate cached agent brief (`agents._brief_cache = None`) so next generation immediately obeys newly learned craft rules.
+        7. Log cycle pulse telemetry to `brain_log`.
+        """
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        synced_core = []
+        for l in self.CORE_LESSONS:
+            self.learn(slug=l["slug"], title=l["title"], why=l["why"],
+                       tier=l.get("tier", "film"), severity=l.get("severity", "block"),
+                       source=l.get("source", "core-standing-rule"))
+            synced_core.append(l["slug"])
+
+        absorbed = []
+        if project:
+            r = self.absorb(project)
+            absorbed.append(r)
+        elif os.path.isdir(PROJECTS):
+            for p in sorted(os.listdir(PROJECTS)):
+                pd = os.path.join(PROJECTS, p)
+                if os.path.isdir(pd) and _final(pd):
+                    r = self.absorb(pd)
+                    absorbed.append(r)
+
+        proposed = self.propose()
+
+        promoted = []
+        if auto_promote:
+            pending = self.st.candidates(status="pending")
+            for c in pending:
+                hits = c["hits"] if "hits" in c.keys() else 0
+                if hits >= 3:
+                    try:
+                        self.promote(c["slug"], severity="warn")
+                        promoted.append(c["slug"])
+                    except Exception:
+                        pass
+
+        refl = self.reflect({})
+
+        try:
+            import agents
+            agents._brief_cache = None
+        except Exception:
+            pass
+
+        active_lessons = len(self.st.craft_lessons())
+        cycle_fact = {
+            "when": now_str,
+            "core_synced": synced_core,
+            "absorbed_count": len(absorbed),
+            "proposed_count": len(proposed),
+            "promoted_count": len(promoted),
+            "active_lessons": active_lessons,
+        }
+        self.st.log_event("learning_cycle", json.dumps(cycle_fact, ensure_ascii=False))
+
+        return {
+            "ok": True,
+            "when": now_str,
+            "core_synced": synced_core,
+            "absorbed": absorbed,
+            "proposed": proposed,
+            "promoted": promoted,
+            "active_lessons": active_lessons,
+            "reflected_events": refl.get("events", 0),
+        }
+
+    def cycle_loop(self, project: str = None, interval: float = 300.0, max_cycles: int = None):
+        """Run the cyclic learning loop repeatedly at a fixed interval."""
+        count = 0
+        print(f"[brain] starting continuous cyclic learning (interval={interval}s)...")
+        while max_cycles is None or count < max_cycles:
+            res = self.cycle(project=project)
+            count += 1
+            print(f"[brain] pulse #{count} @ {res['when']}: {res['active_lessons']} active lessons, "
+                  f"{len(res['promoted'])} promoted, {res['reflected_events']} events reflected")
+            if max_cycles is not None and count >= max_cycles:
+                break
+            time.sleep(interval)
+
     # ---- autonomous conversation learning: read the live transcript, extract durable CRAFT
     # lessons via the LLM, and write them straight to the brain (no approval). Advisory tier
     # (judgment/warn) so self-learning can inform every reel's checklist but never auto-BLOCK one. ----
@@ -506,6 +654,10 @@ def _print(r: dict):
     k = r["knowledge"]
     print(f"  learned: {k['craft_lessons']} craft lessons ({k['gating']} gating) · "
           f"{k['reels_fingerprinted']} reels fingerprinted · {k.get('candidates_pending', 0)} proposed")
+    if r.get("last_cycle"):
+        lc = r["last_cycle"]
+        print(f"  cycle:   pulse @ {lc.get('when')} ({lc.get('active_lessons')} rules, "
+              f"{lc.get('absorbed_count')} reels absorbed)")
     print("  reels:   " + (", ".join(f"{x['project']}[{x['qc']}]" for x in r.get("reels", []))
                           or "none built"))
     for n in r["needs"]:
@@ -708,6 +860,12 @@ def _selfcheck():
         "brain.learn() must reach the durable lesson set"
     print("OK: brain learn() records an owner correction into the enforced craft lessons")
 
+    c_res = b.cycle(bare)
+    assert c_res["ok"], "brain cycle executes cleanly"
+    assert "veo-narration-closed-lips" in c_res["core_synced"]
+    assert any(e["kind"] == "learning_cycle" for e in st.events(limit=100))
+    print("OK: brain cycle executes 6-phase cyclic learning loop and logs telemetry pulse")
+
     st.close()
     print("OK: report aggregates work/budget/knowledge; needs-flags fire; directive is read-only")
     print("OK: credit numbers are labelled manual vs observed with their read age")
@@ -822,6 +980,29 @@ def main(argv):
         elif cmd == "dismiss" and len(argv) >= 2:
             b.dismiss(argv[1])
             print(f"dismissed '{argv[1]}' (the miner won't re-propose it)")
+        elif cmd == "cycle":
+            target = None
+            interval = None
+            idx = 1
+            while idx < len(argv):
+                if argv[idx] == "--interval" and idx + 1 < len(argv):
+                    interval = float(argv[idx + 1])
+                    idx += 2
+                else:
+                    target = argv[idx]
+                    idx += 1
+            if interval:
+                b.cycle_loop(project=target, interval=interval)
+            else:
+                res = b.cycle(project=target)
+                print(f"[brain] cyclic learning pulse complete @ {res['when']}")
+                print(f"  core synced: {', '.join(res['core_synced'])}")
+                print(f"  absorbed {len(res['absorbed'])} project(s)")
+                if res['proposed']:
+                    print(f"  proposed {len(res['proposed'])} candidate(s): {', '.join(res['proposed'])}")
+                if res['promoted']:
+                    print(f"  promoted {len(res['promoted'])} candidate(s): {', '.join(res['promoted'])}")
+                print(f"  active craft lessons: {res['active_lessons']}")
         elif cmd == "--json":
             print(json.dumps(b.report(), indent=2))
         else:

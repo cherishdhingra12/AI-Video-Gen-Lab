@@ -32,7 +32,7 @@ from PIL import Image
 
 W, H = 720, 1280
 BOTTOM_CLEAR = 0.15          # app UI lives here (handle / caption / audio row / buttons)
-CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME = os.environ.get("CHROME_BIN", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 FACE_COST = 40.0             # the cost of one face pixel: nothing in the frame outranks a face
 FACE_SAMPLES = 6             # frames sampled across the card's window for the face boxes
 
@@ -41,6 +41,16 @@ FONTS = {
     "rounded": '"Baloo 2","Mukta Vaani","Kohinoor Devanagari",sans-serif',
     "serif": '"Rozha One","Tiro Devanagari Hindi","Devanagari Sangam MN",serif',
 }
+
+
+def _find_chrome():
+    for p in (CHROME,
+              "/usr/bin/google-chrome",
+              "/usr/bin/chromium-browser",
+              "/usr/bin/chromium"):
+        if p and os.path.exists(p):
+            return p
+    return None
 
 
 def _sample(video, t0, t1, n):
@@ -199,8 +209,6 @@ def render(lines, out, y, font="rounded", size=41, color="#FFF3D6", bg="rgba(18,
            width=560, left=None):
     """Write one card to a transparent PNG at (left, y). lines = a short list of strings —
     Devanagari or Roman Hinglish, whichever the line reads better in (WAVELENGTH.md)."""
-    if not os.path.exists(CHROME):
-        raise RuntimeError(f"Chrome not found at {CHROME} — cannot shape Devanagari")
     # A RELATIVE out path must work: it is turned into a file:// URL below, and `file://x/y.html`
     # is not a path — Chrome resolves it against a host called "x", loads nothing, and screenshots
     # an empty page over a path that was never written. `publishing.py projects/<reel>` is the
@@ -230,23 +238,45 @@ for (const p of document.querySelectorAll('p')) {{
   }}
 }}
 </script></body></html>"""
-    tmp = out + ".html"
-    with open(tmp, "w", encoding="utf-8") as f:
+
+    # 1. Try Playwright first (installed, robust, cross-platform, handles Devanagari font shaping)
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--disable-gpu", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check"]
+            )
+            page = browser.new_page(viewport={"width": W, "height": H})
+            page.set_content(html)
+            page.wait_for_timeout(100)
+            page.screenshot(path=out, omit_background=True)
+            browser.close()
+        if os.path.exists(out) and os.path.getsize(out) > 2000:
+            return out
+    except Exception:
+        pass
+
+    # 2. Subprocess Chrome fallback with unique temporary user-data-dir
+    chrome_bin = _find_chrome()
+    if not chrome_bin:
+        raise RuntimeError("Neither Playwright Chromium nor Chrome found — cannot shape Devanagari")
+
+    import tempfile
+    import shutil
+    tmp_dir = tempfile.mkdtemp(prefix="chrome_card_")
+    tmp_html = os.path.join(tmp_dir, "card.html")
+    with open(tmp_html, "w", encoding="utf-8") as f:
         f.write(html)
     try:
-        p = subprocess.run([CHROME, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+        p = subprocess.run([chrome_bin, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+                            f"--user-data-dir={tmp_dir}",
                             "--force-device-scale-factor=1", "--default-background-color=00000000",
-                            f"--window-size={W},{H}", f"--screenshot={out}", f"file://{tmp}"],
+                            f"--window-size={W},{H}", f"--screenshot={out}", f"file://{tmp_html}"],
                            check=False, capture_output=True, timeout=60)
     finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-    # Chrome's exit code is NOT the success signal. On this Mac its teardown watchdog expires
-    # about 11 s after the shot is already on disk — "[...] bytes written to file" then
-    # "Teardown watchdog expired; recording dump and terminating", exit 2. Measured 2026-10-17:
-    # 6/6 runs wrote a correct PNG, 8/10 of them exited 2, and `check=True` turned a good card
-    # into an exception that killed the whole assembly. The file is the signal; a missing or
-    # stub file is still a real failure and still raises, with Chrome's own words attached.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
     sz = os.path.getsize(out) if os.path.exists(out) else 0
     if sz <= 2000:
         raise RuntimeError(
@@ -340,8 +370,8 @@ if __name__ == "__main__":
         f"the grid-square search must stay inside the square: {sq}"
     print("OK: a cover's band can be confined to the square the IG grid keeps")
 
-    # render: a real Chrome round-trip, skipped only where Chrome is absent
-    if os.path.exists(CHROME):
+    # render: round-trip Devanagari card render
+    if True:
         out = os.path.join(d, "card.png")
         render(["हर हफ़्ते की लिस्ट पर", "एक ही चीज़…"], out, y=y2)
         im = Image.open(out)

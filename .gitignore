@@ -48,3 +48,7 @@ automation/script_enforcer.py.cleaned   # stale intermediate of the enforcer (th
 /caption_cta.png
 /caption_hook.png
 /caption_moral.png
+
+# scratch and test screenshots
+scratch/
+automation/test_flow_*.png

@@ -66,10 +66,10 @@ MUS_VOL = float(os.environ.get("MUS_VOL", "0.30"))
 BED_TARGET_DB = float(os.environ.get("BED_TARGET_DB", "-31.5"))
 TAIL_FADE = float(os.environ.get("TAIL_FADE", "0.50"))
 # Pace the whole reel. Generated motion often runs a touch slower than life, and the crafts used
-# ~1.06x — but a pace change is a taste call on THAT reel, so this defaults to 1.0 (OFF) and is
-# only applied when the reel asks for it (`speed` in identity.json, or SPEED=1.06 in the env).
+# ~1.06x — craft-approved default for Veo-family reels (WAVELENGTH.md §5) to keep engagement high.
 # Video and audio are sped by the SAME factor, so lip-sync stays locked; atempo preserves pitch.
 SPEED = float(os.environ.get("SPEED", "1.0"))
+HOUSE_SPEED = float(os.environ.get("HOUSE_SPEED", "1.06"))
 CARD_STYLE = dict(size=41, color="#FFF3D6", bg="rgba(18,16,14,0.72)")
 
 # The edit is ONE span per clip, anchored on the voice (owner rule 2026-10-11: "start the video a
@@ -574,17 +574,19 @@ def style_preflight(clips):
 
 
 def _absorb(project_dir):
-    """Re-audit what actually shipped and file a candidate for any layer that is missing.
+    """Re-audit what actually shipped and execute a cyclic learning pulse.
     Fail-open: bookkeeping must never turn a finished build into a failed one."""
     try:
         sys.path.insert(0, ROOT)          # brain.py lives at the project root, not here — the
         import brain                      # import has to come AFTER the path is set, or a build
-        r = brain.LocalBrain().absorb(project_dir)   # run from automation/ silently never absorbs
+        b = brain.LocalBrain()
+        r = b.cycle(project_dir)
+        b.close()
         if r.get("ok"):
-            gap = ("filed " + ", ".join(r["learned"])) if r.get("learned") else "all layers present"
-            print(f"  brain absorbed: {gap}")
+            active = r.get("active_lessons", "?")
+            print(f"  brain cyclic learning: pulse complete (active craft rules: {active})")
     except Exception as e:  # noqa: BLE001
-        print(f"  brain absorb skipped ({str(e)[:110]})")
+        print(f"  brain cyclic learning skipped ({str(e)[:110]})")
 
 
 def _card_height(lines, font, width):
@@ -615,29 +617,72 @@ def _spec(project_dir):
 
 def _speed(project_dir, pre_trim_len=None):
     """The reel's own pace, if it declared one. An env override wins (hand-tuning a single
-    reel); otherwise `speed` from identity.json; otherwise 1.0, i.e. leave the pace alone.
+    reel); otherwise `speed` from identity.json; otherwise HOUSE_SPEED (1.06x default for
+    engagement, WAVELENGTH.md §5); otherwise 1.0, i.e. leave the pace alone.
 
-    When `target_duration` is set in identity.json AND speed is 1.0 (the default, meaning
-    unset), auto-calculate speed = pre_trim_len / target_duration so the reel lands near the
-    intended length without hardcoding a specific value."""
+    When `target_duration` is set in identity.json AND speed is unset, auto-calculate
+    speed = pre_trim_len / target_duration so the reel lands near the intended length
+    without hardcoding a specific value."""
     if os.environ.get("SPEED"):
         return SPEED
     try:
         ident = json.load(open(os.path.join(project_dir, "identity.json"),
                                encoding="utf-8"))
-        s = float(ident.get("speed") or 1.0)
-        td = ident.get("target_duration")
-    except Exception:  # noqa: BLE001 — no identity, or not a number: keep the native pace
+    except Exception:  # noqa: BLE001 — no identity: keep the native pace (e.g. self-checks)
         return 1.0
-    # speed explicitly set by the plan -> use it
-    if abs(s - 1.0) > 1e-6:
-        return s if 0.5 <= s <= 2.0 else 1.0
-    # speed=1.0 (default) + target_duration present -> auto-calc from the cut's pre-speed
-    # length. Clamped so the reel never flies past or drags.
+
+    if "speed" in ident:
+        try:
+            s = float(ident.get("speed") or 1.0)
+            return s if 0.5 <= s <= 2.0 else 1.0
+        except (ValueError, TypeError):
+            return 1.0
+
+    td = ident.get("target_duration")
     if td and pre_trim_len and pre_trim_len > 0:
         calc = pre_trim_len / float(td)
         return min(2.0, max(1.0, calc))
-    return 1.0
+
+    # Reel declared an identity but no specific speed -> use craft-approved house pace
+    return HOUSE_SPEED
+
+
+def _load_crops(project_dir: str) -> dict:
+    """Load per-clip crop/punch-in definitions for zero-credit healing of edge defects."""
+    cp = os.path.join(project_dir, "crops.json")
+    if not os.path.exists(cp):
+        return {}
+    try:
+        with open(cp, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _crop_filter(spec) -> str:
+    """Turn a crop/punch-in spec into an ffmpeg filter string."""
+    if isinstance(spec, str):
+        return spec
+    if not isinstance(spec, dict):
+        return ""
+    if "crop" in spec:
+        scale = spec.get("scale", "720:1280")
+        return f"crop={spec['crop']},scale={scale}"
+    if "punch_in" in spec:
+        p = float(spec.get("punch_in") or 1.10)
+        w = int(720 / p) // 2 * 2
+        h = int(1280 / p) // 2 * 2
+        x = int(spec.get("x", (720 - w) / 2)) // 2 * 2
+        align = spec.get("align", "center")
+        if align == "top":
+            y = int(spec.get("y", 0)) // 2 * 2
+        elif align == "bottom":
+            y = int(spec.get("y", 1280 - h)) // 2 * 2
+        else:
+            y = int(spec.get("y", (1280 - h) / 2)) // 2 * 2
+        scale = spec.get("scale", "720:1280")
+        return f"crop={w}:{h}:{x}:{y},scale={scale}"
+    return ""
 
 
 def _clips(clips_dir):
@@ -697,11 +742,20 @@ def build(project_dir, clips_dir=None, absorb=True):
     # then ran xf short PER JOIN while the acrossfade audio chain did not, so a 6-clip reel ended
     # ~2s of picture before its sound, and every card window was timed against a reel that did
     # not exist. Verified against ffprobe: 3 clips of 5s, xf 0.4 -> 14.2s on both streams.
+    crops = _load_crops(project_dir)
     seg = [eff[0]] + [eff[i] - xf for i in range(1, n)]
     for i in range(n):
         # FIT is an identity for a clip that is already 9:16, and saves the reel when a site
         # returns a square or 16:9 generation — a mixed-size join otherwise mis-frames silently.
-        vf = f"{FIT},format=yuv420p,fps=30,setsar=1"
+        c_base = os.path.basename(clips[i])
+        crop_spec = crops.get(c_base) or crops.get(str(i))
+        cf = _crop_filter(crop_spec) if crop_spec else ""
+        if cf:
+            vf = f"{cf},{FIT},format=yuv420p,fps=30,setsar=1"
+            reason = (crop_spec.get("reason") if isinstance(crop_spec, dict) else "boundary anomaly heal")
+            print(f"  clip {i} ({c_base}): zero-credit edge auto-crop applied ({reason})")
+        else:
+            vf = f"{FIT},format=yuv420p,fps=30,setsar=1"
         if wm_pgm:
             vf += "," + _wm_filter(wm_pgm)
         fc.append(f"[{i}:v]{vf}[v{i}]")
@@ -730,8 +784,11 @@ def build(project_dir, clips_dir=None, absorb=True):
     # closer when there is not room for both it and the CTA.
     spec, font = _spec(project_dir)
     windows = []
-    if n >= 2:
-        windows.append(("hook", 0, 0.45, min(starts[1] - 0.20, 8.0)))
+    if "windows" in spec:
+        for w in spec["windows"]:
+            windows.append((w["kind"], int(w.get("clip", n - 1)), float(w["start"]), float(w["end"]), w.get("y")))
+    elif n >= 2:
+        windows.append(("hook", 0, 0.45, min(starts[1] - 0.20, 8.0), None))
         cta_len = min(3.4, max(1.6, total * 0.22))
         c0, c1 = total - 0.35 - cta_len, total - 0.35
         mi, m0 = n - 1, max(starts[-1] + 0.55, 0.5)
@@ -739,20 +796,27 @@ def build(project_dir, clips_dir=None, absorb=True):
         if m1 - m0 < 1.8 and n >= 3:
             mi, m0 = n - 2, starts[-2] + 0.55
             m1 = min(m0 + 6.4, starts[-1] + 0.4)
-        windows.append(("moral", mi, m0, m1))
-        windows.append(("cta", n - 1, c0, c1))
+        windows.append(("moral", mi, m0, m1, None))
+        windows.append(("cta", n - 1, c0, c1, None))
 
     vmap, ninp, cards = vprev, n, []
     placed = {}
-    for kind, ci, cs, ce in windows:
+    for item in windows:
+        kind, ci, cs, ce = item[0], item[1], item[2], item[3]
+        y_ov = item[4] if len(item) > 4 else None
         lines = (spec.get(kind) or {}).get("lines") or []
         if ce <= cs or not lines:
             continue
         print(f"  card {kind}: {cs:.2f}-{ce:.2f}s (over clip {ci})")
         # the window is in REEL time; the clip it sits over has already been trimmed in this
         # timeline, so the sample window is just the offset back into that clip
-        y, h = _place(lines, font, 560, clips[ci], max(0.0, cs - starts[ci]),
-                      max(0.1, ce - starts[ci]))
+        if y_ov is not None:
+            y = int(y_ov)
+            h = _card_height(lines, font, 560)
+            print(f"    placed at y={y} (card {h}px tall, manual override)")
+        else:
+            y, h = _place(lines, font, 560, clips[ci], max(0.0, cs - starts[ci]),
+                          max(0.1, ce - starts[ci]))
         png = os.path.join(project_dir, f"caption_{kind}.png")
         caption.render(lines, png, y=y, font=font, **CARD_STYLE)
         # Wik the card's real ink box and the window it occupies so QC can re-ask "is there a face

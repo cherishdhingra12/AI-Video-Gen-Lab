@@ -40,6 +40,7 @@ LIVE = ("submitting", "rendering", "downloading")
 OFF_FILM = {
     "verify-untracked-before-commit", "use-correct-db-path", "monitor-db-status-not-stdout",
     "record-standing-policy", "defer-unverified-asset-removal", "regression-assert-timing",
+    "flow-md5-dedup",
 }
 
 _SCHEMA = """

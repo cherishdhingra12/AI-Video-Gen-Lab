@@ -213,11 +213,11 @@ lines is a performance beat, not padding, and the sound is not allowed to overru
   stillness does not separate them — so the machine keeps it and the eye decides.*
 
 - **Pace (`speed`)** — a whole-reel pace adjustment, applied to picture and sound together so
-  lip-sync stays locked and the pitch holds. It is **off by default** (a reel plays at its own
-  pace) because how a reel breathes is a taste call on that reel, not a house setting. Turn it on
-  for one reel with `"speed": 1.06` in `identity.json` (or `SPEED=1.06` on the command line) when
-  the source's motion runs slow — the Veo-family reels were craft-approved at **1.06x**; 1.12x
-  read as rushed. Usable range 0.5–2.0; anything outside is ignored rather than obeyed.
+  lip-sync stays locked and the pitch holds. Because AI-generated motion runs slower than life,
+  the system defaults to **1.06x** house pace (`speed: 1.06` in `identity.json`) for higher viewer
+  engagement — craft-approved on Veo-family reels; 1.12x read as rushed. Usable range 0.5–2.0;
+  an explicit `"speed": 1.0` in `identity.json` or `SPEED=1.0` on the command line leaves the reel
+  at native 1.0x pace when desired.
 - **Silence trimming** is at the **ends of a clip only** — never an internal pause, which is a
   performance beat. Some of the pause is kept so a line never starts clipped.
 

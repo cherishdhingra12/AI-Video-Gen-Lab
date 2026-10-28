@@ -52,6 +52,7 @@ run "state (jobs/resume/credits/lessons/qc-verdicts)" "$PY" automation/state.py 
 run "learn (backoff + scheduler routing)"             "$PY" automation/learn.py --selfcheck
 run "login (credit seeding + unclear reads)"          "$PY" automation/login.py --selfcheck
 run "agents (style-anchored clip prompts)"            "$PY" agents.py --selfcheck
+run "script enforcer (STORY.md pre-credit gate)"        "$PY" automation/script_enforcer.py --selfcheck
 run "pipeline (idea -> a unique project folder)"      "$PY" pipeline.py --selfcheck
 run "runner (resume, wall->requeue, stitch, gate)"    "$PY" automation/runner.py --selfcheck
 run "stitch (xfade offsets, 9:16 normalize)"          "$PY" stitch.py
@@ -66,8 +67,16 @@ run "crisis (a stop reaches a person AND the brain)"  "$PY" automation/crisis.py
 run "site adapter base (self-heal click)"             "$PY" automation/sites/base.py
 run "brain (report/reflect/propose/harvest)"          "$PY" brain.py --selfcheck
 
-if command -v node >/dev/null 2>&1; then
-    run "opencode brain plugin (node)" node automation/test_brain_plugin.mjs
+NODE_BIN=""
+for n in /opt/homebrew/bin/node /usr/local/bin/node node; do
+    if command -v "$n" >/dev/null 2>&1 && "$n" -v >/dev/null 2>&1; then
+        NODE_BIN="$n"
+        break
+    fi
+done
+
+if [ -n "$NODE_BIN" ]; then
+    run "opencode brain plugin (node)" "$NODE_BIN" automation/test_brain_plugin.mjs
 else
     echo -e "\n== opencode brain plugin\nSKIP: node not on PATH"
 fi

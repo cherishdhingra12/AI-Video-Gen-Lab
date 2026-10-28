@@ -98,19 +98,35 @@ def main():
         sys.exit(check(args.site, args.account))
 
     home = importlib.import_module(f"sites.{args.site}").ADAPTER.home
-    print(f"Opening {args.site} ({home}) for account '{args.account}'.")
+    target_url = home
+    if args.site == "flow":
+        target_url = "https://accounts.google.com/v3/signin/identifier?continue=https://flow.google.com/&flowName=GlifWebSignIn&flowEntry=ServiceLogin"
+
+    print(f"Opening {args.site} ({target_url}) for account '{args.account}'.")
     print("Log in fully in the window. When your dashboard/prompt box is visible,")
     print("just CLOSE the browser window — this saves your login and finishes.")
-    with Session(args.site, args.account, headless=False) as s:
-        s.goto(home)
-        # No stdin here (the harness's ! prefix has no interactive input), so we
-        # wait for YOU to close the window instead of pressing Enter. 20-min safety cap.
-        deadline = time.time() + 20 * 60
-        while time.time() < deadline:
-            if s.closed():
-                break
-            time.sleep(1)
+
+    chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    profile_dir = os.path.abspath(os.path.join(_DIR, "..", "profiles", f"{args.site}__{args.account}"))
+    os.makedirs(profile_dir, exist_ok=True)
+
+    if os.path.exists(chrome_app):
+        import subprocess
+        print(f"Launching native Google Chrome (no automation flags) with profile: {profile_dir}")
+        subprocess.run([chrome_app, f"--user-data-dir={profile_dir}",
+                        "--no-first-run", "--no-default-browser-check", target_url])
         print("  window closed — saving session...")
+    else:
+        with Session(args.site, args.account, headless=False) as s:
+            s.goto(home)
+            # No stdin here (the harness's ! prefix has no interactive input), so we
+            # wait for YOU to close the window instead of pressing Enter. 20-min safety cap.
+            deadline = time.time() + 20 * 60
+            while time.time() < deadline:
+                if s.closed():
+                    break
+                time.sleep(1)
+            print("  window closed — saving session...")
     if args.credits:
         seed(args.site, args.account, args.credits, args.refill)
     print("Done. Cookies saved — the runner will reuse this login.")

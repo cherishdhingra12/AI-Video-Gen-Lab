@@ -67,6 +67,13 @@ def main(st=None):
     except Exception as e:  # noqa: BLE001 — no brain must never cost a reel
         print(f"brain preflight skipped ({str(e)[:100]})")
 
+    gw_ok, gw_msg = agents.preflight_gateway()
+    if not gw_ok:
+        import crisis
+        crisis.gateway_down(RuntimeError(gw_msg), subject=idea[:60], st=st)
+        st.close()
+        raise SystemExit(2)
+
     print("agent 1 — writing script...")
     try:
         script = agents.write_script(idea)
@@ -111,6 +118,18 @@ def main(st=None):
     # pasted into a site, so nothing is queued that has lost a guarantee — and the plan is on
     # disk first, so a refusal leaves the evidence in front of whoever re-runs it.
     plan = agents.validate_plan(shot, prompts)
+
+    try:
+        import script_enforcer
+        enf = script_enforcer.check(script, idea, require_critic=False)
+        with open(os.path.join(pdir, "script_enforcer.json"), "w", encoding="utf-8") as f:
+            json.dump(enf, f, indent=2, ensure_ascii=False)
+        for p in enf.get("problems", []):
+            plan["warn"].append(f"script-enforcer: {p}")
+        if enf.get("status") == "held":
+            print(f"  ! script-enforcer: {len(enf['problems'])} rule violation(s) flagged")
+    except Exception as e:  # noqa: BLE001
+        print(f"  ! could not run script_enforcer ({str(e)[:80]})")
     # A script that arrived incomplete (the writer ran out of room and the one continuation call did
     # not close it) is a defect in the WRITING, not in the filmability — so it warns here, where the
     # plan's own warnings are read, rather than stopping a reel that can still be filmed. It used to
@@ -148,6 +167,8 @@ def main(st=None):
     try:
         pres = agents.presentation(script, shot, prior=prior, brief=idea)
         pres["identity"]["reel"] = slug
+        if "speed" not in pres["identity"] or float(pres["identity"].get("speed") or 1.0) == 1.0:
+            pres["identity"]["speed"] = 1.06
         with open(os.path.join(pdir, "identity.json"), "w", encoding="utf-8") as f:
             json.dump(pres["identity"], f, indent=2, ensure_ascii=False)
         with open(os.path.join(pdir, "captions.json"), "w", encoding="utf-8") as f:

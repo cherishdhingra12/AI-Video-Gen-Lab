@@ -28,9 +28,12 @@ from playwright.sync_api import sync_playwright
 _DIR = os.path.dirname(os.path.abspath(__file__))
 PROFILES = os.path.join(os.path.dirname(_DIR), "profiles")
 
-# a real, current UA so we don't ship Playwright's HeadlessChrome default
+# a real, current UA so we don't ship Playwright's HeadlessChrome default — kept in
+# sync with the machine's actual Chrome (156.0.8078.48): Google's sign-in wall ("This
+# browser or app may not be secure") fires when the claimed build doesn't match the
+# client-hints fingerprint of the browser really running.
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+      "(KHTML, like Gecko) Chrome/156.0.8078.48 Safari/537.36")
 
 # strip the obvious "I am automated" signals before any page script runs
 _STEALTH = """
@@ -57,12 +60,23 @@ class Session:
     def __enter__(self):
         self._pw = sync_playwright().start()
         # persistent context = the profile dir holds cookies => login survives.
-        self._ctx = self._pw.chromium.launch_persistent_context(
-            self.profile, headless=self.headless, user_agent=UA,
-            viewport={"width": 1280, "height": 900},
-            args=["--disable-blink-features=AutomationControlled",
-                  "--no-first-run", "--no-default-browser-check"],
-        )
+        # The REAL Chrome ("channel=chrome") first: Google's sign-in wall ("This browser
+        # or app may not be secure") fires on the bundled chromium build even headed,
+        # but passes on the user's own Chrome — and the session is then issued to a
+        # fingerprint the headless runner can actually reuse. Bundled chromium is the
+        # fallback when Chrome isn't installed.
+        launch = dict(user_agent=UA, headless=self.headless,
+                      viewport={"width": 1280, "height": 900},
+                      args=["--disable-blink-features=AutomationControlled",
+                            "--no-first-run", "--no-default-browser-check"],
+                      ignore_default_args=["--enable-automation"])
+        try:
+            self._ctx = self._pw.chromium.launch_persistent_context(self.profile,
+                                                                    channel="chrome",
+                                                                    **launch)
+        except Exception:
+            self._ctx = self._pw.chromium.launch_persistent_context(self.profile,
+                                                                    **launch)
         self._ctx.add_init_script(_STEALTH)
         self.page = self._ctx.pages[0] if self._ctx.pages else self._ctx.new_page()
         return self

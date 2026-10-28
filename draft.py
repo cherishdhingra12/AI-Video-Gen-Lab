@@ -43,10 +43,15 @@ def main(argv=None):
     script = agents.write_script(a.idea, seconds=a.seconds)
     crit = dict(agents.LAST_CRITIQUE)
 
+    import script_enforcer
+    enf = script_enforcer.check(script, a.idea, require_critic=False)
+
     with open(os.path.join(out, "script.md"), "w", encoding="utf-8") as f:
         f.write(f"IDEA: {a.idea}\n\n{script}")
     with open(os.path.join(out, "script_critique.json"), "w", encoding="utf-8") as f:
         json.dump(crit, f, indent=2, ensure_ascii=False)
+    with open(os.path.join(out, "script_enforcer.json"), "w", encoding="utf-8") as f:
+        json.dump(enf, f, indent=2, ensure_ascii=False)
 
     print(f"\n{out}/script.md")
     if crit.get("could_not_run"):
@@ -55,6 +60,10 @@ def main(argv=None):
         print(f"  {i}. {p}")
     if not crit.get("problems") and crit.get("rounds"):
         print("  the critic found nothing to change")
+    if enf.get("problems"):
+        print(f"\nscript enforcer ({enf['status']}):")
+        for i, p in enumerate(enf["problems"], 1):
+            print(f"  * {p}")
     return 0
 
 

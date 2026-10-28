@@ -81,6 +81,19 @@ def _picks() -> dict:
     return _picks_cache[1]
 
 
+def preflight_gateway() -> tuple[bool, str]:
+    """Check whether at least one LLM gateway has credentials configured.
+    Returns (ok, message). If neither has a URL and KEY, returns (False, reason)."""
+    configured = []
+    for name in _ORDER:
+        url, key, model, timeout = _GATEWAYS.get(name, (None, None, None, 30))
+        if url and key:
+            configured.append(name)
+    if not configured:
+        return False, f"no LLM gateway route configured in .env (checked: {', '.join(_ORDER)})"
+    return True, f"gateways ready: {', '.join(configured)}"
+
+
 # measurement-only pin. measure.py sets it to score ONE candidate at a time (no failover: a
 # candidate that falls back is not the candidate being measured). Never set in a normal run.
 _PIN = None
@@ -956,6 +969,26 @@ def _fit(lead: str, body: str, tail: str, chars: int, sep: str, floor: str = "")
     return seg[:chars - 1].rsplit(" ", 1)[0] + "."
 
 
+_NARRATION_MARKERS = re.compile(
+    r'(?:दादाजी|दादी|बाबूजी|नाना|नानी|बुजुर्ग|वह|उसने|उनका|उनकी|उन्हें|बैठे थे|बैठी थीं|गाना बजा|शुरू हुआ|आँखों में चमक|दिलों में नया|यादों को)',
+    re.UNICODE
+)
+
+
+def _is_narration(text: str, clip: dict = None) -> bool:
+    """Identify if a line is 3rd-person descriptive voiceover narration or on-camera dialogue."""
+    clip = clip or {}
+    st = (clip.get("speech_type") or "").strip().lower()
+    if st in ("narration", "voiceover", "vo"):
+        return True
+    if st in ("dialogue", "speech", "onscreen"):
+        return False
+    t = text.strip()
+    if re.search(r'\b(बेटा|सुनो|कहो|पसंद आया|मेरी|मेरा|मुझे|मुझको|मैं)\b', t):
+        return False
+    return bool(_NARRATION_MARKERS.search(t))
+
+
 def clip_prompts(shot: dict, site: str = "") -> list:
     """Materialize the final per-clip prompts. This is what gets pasted into each site.
     Kept here so the runner/pipeline stay dumb.
@@ -1027,18 +1060,28 @@ def clip_prompts(shot: dict, site: str = "") -> list:
         says = (c.get("dialogue") or "").strip()
         if says:
             # Narration must come OUT of the clip (WAVELENGTH.md §3), so the line is written into
-            # the generation prompt for a character to SPEAK — never laid over at assembly.
-            # NOT AS A QUOTED LINE, THOUGH. A quoted Hindi string next to "speaks this line" is
-            # read as a CAPTION: dadi-ki-dhansuchi came back with its dialogue burned into the
-            # frame as garbled Devanagari subtitles in all four clips — the quote defeated three
-            # separate no-text clauses sitting in the same prompt. So the words are handed over as
-            # SPEECH the voice carries and the render must never draw: unquoted, and marked as
-            # sound. The code-level rules NO_TEXT and _no_text() exist for this same reason —
-            # text is kept out by construction, not by the model remembering not to.
-            says = ('the character speaks these words aloud in Hindi, on camera, with natural '
-                    'lip-sync — no narrator, no voiceover. They are SOUND the voice carries and '
-                    'must never be written anywhere: ' + says)
+            # the generation prompt — never laid over at assembly.
+            # Differentiate third-person voiceover narration (where characters must NOT lip-sync)
+            # from direct character dialogue (where on-camera character speaks with lip-sync).
+            if _is_narration(says, c):
+                says = ('spoken as warm off-camera background voiceover narration in Hindi. '
+                        'The on-screen character does NOT speak or lip-sync; their lips remain '
+                        'gently closed with a natural, subtle, thoughtful resting facial expression. '
+                        'No mouth movement on camera. Spoken narration audio: ' + says)
+            else:
+                says = ('the character speaks these words aloud in Hindi, on camera, with natural '
+                        'lip-sync — no narrator, no voiceover. They are SOUND the voice carries and '
+                        'must never be written anywhere: ' + says)
         action = _no_text(_p)
+        guardrails = []
+        if re.search(r'\b(hand|hands|finger|fingers|touch|tap|hold|holding)\b', _p, re.IGNORECASE):
+            guardrails.append("anatomically correct hands, exactly 5 fingers per hand, no extra digits, no polydactyly")
+        if re.search(r'\b(tear|tears|crying|weep|weeping)\b', _p, re.IGNORECASE):
+            guardrails.append("subtle natural tear sheen, natural wet eyes, no blue plastic tear drops")
+        if re.search(r'\b(tablet|screen|phone|display)\b', _p, re.IGNORECASE):
+            guardrails.append("textured retro display screen, soft glowing UI, no blank white glare rectangle")
+        if guardrails:
+            action = f"{action} ({', '.join(guardrails)}.)"
         if veo:
             body = [f"SCENE AND CAST (identical in every clip): {world}" if world else "",
                     f"ACTION AND CAMERA: {action}" if action else "",
@@ -1092,12 +1135,27 @@ def validate_plan(shot: dict, prompts: list = None) -> dict:
         bad.append("the LAST clip has no spoken line — every reel ends on a closing voiceover "
                    "spoken in the scene (a character to camera, in Hindi). A card cannot carry "
                    "this: the closing line has to be HEARD.")
+    # LINT_CONSECUTIVE_REDUNDANCY: Warn if consecutive shots describe redundant visual setups
+    for i in range(len(clips) - 1):
+        p1 = (clips[i].get("prompt") or "").lower()
+        p2 = (clips[i+1].get("prompt") or "").lower()
+        w1 = set(re.findall(r'\b[a-z]{3,}\b', p1))
+        w2 = set(re.findall(r'\b[a-z]{3,}\b', p2))
+        if w1 and w2:
+            sim = len(w1 & w2) / len(w1 | w2)
+            if sim > 0.65:
+                warn.append(f"consecutive clips {i} and {i+1} have high visual overlap ({sim:.0%}) — risk of visual freeze/redundancy")
     prompts = clip_prompts(shot) if prompts is None else prompts
     if len(prompts) != len(clips):
         bad.append(f"{len(prompts)} prompts built for {len(clips)} clips")
     else:
         lock = _char_lock(shot)
         for i, pr in enumerate(prompts):
+            _c = clips[i]
+            _dlg = (_c.get("dialogue") or "").strip()
+            if _dlg and _is_narration(_dlg, _c):
+                if "natural lip-sync — no narrator, no voiceover" in pr:
+                    bad.append(f"clip {i}: third-person narration commanded on-camera lip-sync ('no narrator, no voiceover') — must be off-camera voiceover")
             if not pr.startswith(MEDIUM_REQUIREMENT[:40]) and not pr.startswith("REQUIRED OUTPUT: PIXAR"):
                 bad.append(f"clip {i}: the 3-D medium requirement is gone from the prompt")
             if _DISASTER.search(clips[i].get("prompt") or "") and \
@@ -1128,7 +1186,8 @@ _PRESENTATION_SCHEMA = """{
     "structure": "the shape, e.g. 'object-reveal -> montage -> gut-punch -> silent reunion'",
     "ending": "how it lands",
     "moral": "the moral in one line, English is fine here (this field is documentation, not on-screen text)",
-    "motif": "the single recurring object or image"
+    "motif": "the single recurring object or image",
+    "speed": 1.06
   },
   "captions": {
     "font": "rounded or serif",
@@ -1287,6 +1346,8 @@ def presentation(script: str, shot: dict, prior: list = None, brief: str = "") -
         if _os.path.exists(p):
             obj["_caption_cards"].append(p)
     obj["_caption_place_template"] = place
+    if isinstance(obj.get("identity"), dict):
+        obj["identity"].setdefault("speed", 1.06)
 
     _presentation_selfcheck(obj)            # a repair that overflows a card is no repair
     return obj
